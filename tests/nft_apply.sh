@@ -586,10 +586,10 @@ for proto in udp tcp; do
   assert_contains "$NFT_LOG" "$prefix"$'_ip_ports\t{ 192.0.2.0/24 . 50008 }' "$proto IPv4 port import"
   assert_contains "$NFT_LOG" "$prefix"$'_ip6_ports\t{ 2001:db8::/32 . 50008 }' "$proto IPv6 port import"
   if [ "$proto" = udp ]; then
-    if grep -Fq $'tachyon_rule_inline_no_ports_ip_ports\t{' "$NFT_LOG" || grep -Fq $'tachyon_rule_inline_no_ports_ip6_ports\t{' "$NFT_LOG"; then
+    if grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_ip_ports\t{' "$NFT_LOG" || grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_ip6_ports\t{' "$NFT_LOG"; then
       fail "UDP ruleset populated TCP priority sets"
     fi
-  elif grep -Fq $'tachyon_rule_inline_no_ports_udp_ip_ports\t{' "$NFT_LOG" || grep -Fq $'tachyon_rule_inline_no_ports_udp_ip6_ports\t{' "$NFT_LOG"; then
+  elif grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_udp_ip_ports\t{' "$NFT_LOG" || grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_udp_ip6_ports\t{' "$NFT_LOG"; then
     fail "TCP ruleset populated UDP priority sets"
   fi
 done
