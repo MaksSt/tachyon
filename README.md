@@ -318,6 +318,14 @@ wget -O /tmp/tachyon-uninstall.sh https://gh-proxy.com/raw.githubusercontent.com
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>
 
+## Передача прав на мои вклады
+
+Я, [MaksSt](https://github.com/MaksSt), согласен безвозмездно передать автору проекта [Dushnilin](https://github.com/Dushnilin) все принадлежащие мне исключительные права на мои уже предоставленные этому проекту вклады. Работаю за идею и оплаты за эти вклады не требую.
+
+<p align="center">
+  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+</p>
+
 ## 🤝 Оригинальные проекты и благодарности
 
 Tachyon опирается на фундаментальные разработки открытого сообщества:
