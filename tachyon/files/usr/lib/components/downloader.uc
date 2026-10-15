@@ -40,7 +40,11 @@ function http_get_once(url, output_path, proxy_address, timeout) {
     timeout = as_string(timeout || "30");
 
     if (command_exists("curl")) {
-        let args = [ "curl", "--connect-timeout", "4", "-m", timeout, "-fsSL", "-H", "User-Agent: Tachyon-OpenWrt" ];
+        let args = [
+            "curl", "--connect-timeout", "4", "-m", timeout,
+            "-y", "6", "-Y", "32768",
+            "-fsSL", "-H", "User-Agent: Tachyon-OpenWrt"
+        ];
         if (proxy_address != "") {
             push(args, "-x");
             push(args, "http://" + proxy_address);
@@ -68,8 +72,19 @@ function http_get(url, timeout) {
         return "";
 
     let t = as_string(timeout || "12");
+    let proxy_address = helpers.service_proxy_address();
 
-    // 1. Direct (always first — fastest and most reliable when reachable)
+    // 1. Through configured proxy section first if available
+    if (proxy_address != "") {
+        if (http_get_once(url, output_path, proxy_address, t)) {
+            let data = read_file(output_path);
+            remove_file(output_path);
+            return data;
+        }
+        remove_file(output_path);
+    }
+
+    // 2. Direct fallback
     if (http_get_once(url, output_path, "", t)) {
         let data = read_file(output_path);
         remove_file(output_path);
@@ -77,37 +92,23 @@ function http_get(url, timeout) {
     }
     remove_file(output_path);
 
-    // 2. Through configured proxy section (if sing-box is running with one)
-    let proxy_address = helpers.service_proxy_address();
-    if (proxy_address != "") {
-        helpers.updates_log("HTTP direct failed for " + as_string(url) + "; retrying via proxy section", "warn");
-        if (http_get_once(url, output_path, proxy_address, t)) {
-            let data = read_file(output_path);
-            remove_file(output_path);
-            return data;
-        }
-        remove_file(output_path);
-        helpers.updates_log("HTTP via proxy section also failed for " + as_string(url), "warn");
-    }
-
     return "";
 }
 
 function download_file_once(url, output_path) {
-    // 1. Direct
-    if (http_get_once(url, output_path, "", "120"))
-        return true;
-    remove_file(output_path);
-
-    // 2. Through configured proxy section
     let proxy_address = helpers.service_proxy_address();
+
+    // 1. Through configured proxy section first if available
     if (proxy_address != "") {
-        helpers.updates_log("Download direct failed for " + as_string(url) + "; retrying via proxy section", "warn");
-        if (http_get_once(url, output_path, proxy_address, "120"))
+        if (http_get_once(url, output_path, proxy_address, "30"))
             return true;
         remove_file(output_path);
-        helpers.updates_log("Download via proxy section also failed for " + as_string(url), "warn");
     }
+
+    // 2. Direct fallback
+    if (http_get_once(url, output_path, "", "30"))
+        return true;
+    remove_file(output_path);
 
     return false;
 }
@@ -117,6 +118,16 @@ function download_with_retry(url, output_path, label) {
     let candidates = url_mod && type(url_mod.download_candidates) == "function" ? url_mod.download_candidates(url) : [ url ];
     let proxy_address = helpers.service_proxy_address();
 
+    // 1. If proxy section is configured, try primary URL via proxy FIRST!
+    if (proxy_address != "") {
+        helpers.updates_log("Downloading " + as_string(label) + " via proxy section");
+        if (http_get_once(url, output_path, proxy_address, "30") && file_nonempty(output_path))
+            return true;
+        remove_file(output_path);
+        helpers.updates_log("Download via proxy section failed for " + as_string(url) + "; trying direct and mirrors", "warn");
+    }
+
+    // 2. Direct first, then mirrors
     for (let attempt = 0; attempt < length(candidates); attempt++) {
         let current_url = candidates[attempt];
         if (attempt == 0) {
@@ -125,14 +136,14 @@ function download_with_retry(url, output_path, label) {
             helpers.updates_log("Retrying " + as_string(label) + " via mirror (attempt " + as_string(attempt + 1) + "/" + as_string(length(candidates)) + ")", "warn");
         }
 
-        // Direct first for every candidate
-        if (http_get_once(current_url, output_path, "", "120") && file_nonempty(output_path))
+        // Direct
+        if (http_get_once(current_url, output_path, "", "30") && file_nonempty(output_path))
             return true;
         remove_file(output_path);
 
-        // Then through proxy section if available
-        if (proxy_address != "") {
-            if (http_get_once(current_url, output_path, proxy_address, "120") && file_nonempty(output_path)) {
+        // Through proxy section for mirror if direct failed
+        if (proxy_address != "" && attempt > 0) {
+            if (http_get_once(current_url, output_path, proxy_address, "30") && file_nonempty(output_path)) {
                 helpers.updates_log("Downloaded " + as_string(label) + " via proxy section (" + current_url + ")");
                 return true;
             }
@@ -146,20 +157,167 @@ function download_with_retry(url, output_path, label) {
 // GitHub API
 // ============================================================================
 
+// The same GET, but without curl -f, so an HTTP error keeps its body and
+// status instead of collapsing into a bare failure. That body is the only way
+// to tell "GitHub refused us because the budget ran out" from "GitHub is
+// unreachable", and the two call for completely different follow-ups.
+function http_get_with_body(url, timeout, proxy_address) {
+    helpers.init_tmp_dir();
+    let output_path = helpers.make_tmp_file("http");
+    if (output_path == "")
+        return { body: "", status: "000" };
+
+    let t = as_string(timeout || "12");
+    let args = [
+        "curl", "--connect-timeout", "4", "-m", t, "-sSL",
+        "-y", "6", "-Y", "32768",
+        "-H", "User-Agent: Tachyon-OpenWrt"
+    ];
+    if (as_string(proxy_address) != "") {
+        push(args, "-x", "http://" + as_string(proxy_address));
+    }
+    push(args, "-o", output_path, "-w", "%{http_code}", as_string(url));
+
+    let status = trim(command_output_from_args(args));
+    let body = file_nonempty(output_path) ? read_file(output_path) : "";
+    remove_file(output_path);
+    return { body: as_string(body), status: as_string(status || "000") };
+}
+
 // Fetch a URL that is expected to return valid JSON checked by github-response-ok.
 // Priority: direct → proxy section → mirrors from url.uc (gh-proxy etc.)
+//
+// GitHub's unauthenticated API budget is 60 requests per hour per IP, and a
+// component sweep spends many of them. Once the budget is gone the API answers
+// 403 with a rate-limit body instead of JSON, and the mirror walk would fire
+// anyway: a dozen more requests that cannot succeed on networks where those
+// mirrors are unreachable, which is most of them. So the direct attempt keeps
+// its body, and a rate-limit answer ends the sweep right there.
+function github_response_is_rate_limited(body) {
+    return match(as_string(body), /API rate limit exceeded/) != null ||
+           match(as_string(body), /rate limit exceeded/i) != null ||
+           match(as_string(body), /exceeded a secondary rate limit/) != null;
+}
+
+function github_rate_limit_reset_hint(body) {
+    let at = match(as_string(body), /"reset": *([0-9]+)/);
+    if (at == null)
+        return "";
+    let wait = int(at[1] || "0") - time();
+    return wait > 0 ? sprintf(" (resets in %ds)", wait) : " (window already reset)";
+}
+
+let release_notes_by_key = {};
+let last_release_notes = "";
+
+function normalize_release_notes(raw_body) {
+    let notes = trim(replace(as_string(raw_body || ""), /\r/g, ""));
+    if (length(notes) > 3500)
+        notes = substr(notes, 0, 3500) + "\n...";
+    return notes;
+}
+
+function remember_release_json(raw_json) {
+    if (as_string(raw_json) == "")
+        return;
+    try {
+        let parsed = json(raw_json);
+        if (type(parsed) == "object") {
+            let notes = normalize_release_notes(parsed.body);
+            if (notes != "") {
+                last_release_notes = notes;
+                let html_url = trim(as_string(parsed.html_url || ""));
+                let tag = trim(as_string(parsed.tag_name || ""));
+                if (html_url != "")
+                    release_notes_by_key[html_url] = notes;
+                if (tag != "") {
+                    release_notes_by_key[tag] = notes;
+                    if (substr(tag, 0, 1) == "v")
+                        release_notes_by_key[substr(tag, 1)] = notes;
+                    else
+                        release_notes_by_key["v" + tag] = notes;
+                }
+            }
+        } else if (type(parsed) == "array") {
+            for (let r in parsed) {
+                if (type(r) != "object")
+                    continue;
+                let notes = normalize_release_notes(r.body);
+                if (notes == "")
+                    continue;
+                if (last_release_notes == "")
+                    last_release_notes = notes;
+                let html_url = trim(as_string(r.html_url || ""));
+                let tag = trim(as_string(r.tag_name || ""));
+                if (html_url != "" && !release_notes_by_key[html_url])
+                    release_notes_by_key[html_url] = notes;
+                if (tag != "" && !release_notes_by_key[tag]) {
+                    release_notes_by_key[tag] = notes;
+                    if (substr(tag, 0, 1) == "v")
+                        release_notes_by_key[substr(tag, 1)] = notes;
+                    else
+                        release_notes_by_key["v" + tag] = notes;
+                }
+            }
+        }
+    } catch (e) {}
+}
+
+function get_release_notes(release_url, tag) {
+    release_url = trim(as_string(release_url || ""));
+    tag = trim(as_string(tag || ""));
+    if (release_url != "" && release_notes_by_key[release_url])
+        return release_notes_by_key[release_url];
+    if (tag != "" && release_notes_by_key[tag])
+        return release_notes_by_key[tag];
+    return last_release_notes;
+}
+
 function fetch_github_json(url, timeout) {
     let url_mod = core_url_module_or_null();
     let candidates = url_mod && type(url_mod.download_candidates) == "function"
         ? url_mod.download_candidates(url) : [ url ];
+    let proxy_address = helpers.service_proxy_address();
+
+    // 1. Through proxy section first if available
+    if (proxy_address != "") {
+        let proxy_resp = http_get_with_body(url, timeout, proxy_address);
+        if (proxy_resp.status == "200" && proxy_resp.body != "" &&
+            helpers.helper_success_input(proxy_resp.body, "github-response-ok", [])) {
+            helpers.updates_log("Fetched GitHub JSON via proxy section: " + url);
+            remember_release_json(proxy_resp.body);
+            return proxy_resp.body;
+        }
+    }
 
     for (let i = 0; i < length(candidates); i++) {
         let candidate = candidates[i];
-        // http_get already does: direct → section; skip to next mirror on failure
-        let response = http_get(candidate, timeout);
+        let response;
+
+        if (i == 0) {
+            // GitHub itself: keep the error body so a rate-limit answer is
+            // recognisable. Only a mirror follows the same order after this.
+            let direct = http_get_with_body(candidate, timeout, "");
+            if (github_response_is_rate_limited(direct.body)) {
+                helpers.updates_log("GitHub API rate limit exhausted" + github_rate_limit_reset_hint(direct.body) +
+                    "; skipping mirrors, they cannot lift it", "warn");
+                return "";
+            }
+            if (direct.status != "200" || direct.body == "") {
+                // Genuinely unreachable or refused. The proxy section is still
+                // worth one attempt, then the mirrors take over as before.
+                response = http_get(candidate, timeout);
+            }
+            else
+                response = direct.body;
+        }
+        else
+            response = http_get(candidate, timeout);
+
         if (response != "" && helpers.helper_success_input(response, "github-response-ok", [])) {
             if (i > 0)
                 helpers.updates_log("Fetched GitHub JSON via mirror: " + candidate);
+            remember_release_json(response);
             return response;
         }
     }
@@ -188,8 +346,10 @@ function fetch_github_tag_commit_sha(owner, repo, tag) {
     return response != "" ? trim(helpers.helper_output_input(response, "commit-object-sha", [])) : "";
 }
 
-function fetch_github_releases_json(owner, repo, per_page) {
+function fetch_github_releases_json(owner, repo, per_page, page) {
     let url = "https://api.github.com/repos/" + as_string(owner) + "/" + as_string(repo) + "/releases?per_page=" + as_string(per_page || "10");
+    if (page != null && int(page) > 1)
+        url += "&page=" + as_string(page);
     return fetch_github_json(url, "8");
 }
 
@@ -281,12 +441,9 @@ function module_exports() {
         fetch_github_tag_commit_sha,
         fetch_github_releases_json,
         fetch_github_release_tag_fallback,
+        get_release_notes,
         url_exists
     };
 }
 
-if ((sourcepath(1) != null && sourcepath(1) != "") || ARGV[0] == null)
-    return module_exports();
-
-print("Usage: components/downloader.uc (library module, no CLI)\n");
-exit(1);
+return module_exports();

@@ -68,6 +68,7 @@ let command_output = common.command_output;
 let command_output_from_args = common.command_output_from_args;
 let write_json = common.write_json;
 let write_file = common.write_file;
+let copy_file_stream = common.copy_file_stream;
 let bounded_command = common.bounded_command;
 let kill_matching_command = common.kill_matching_command;
 
@@ -180,6 +181,11 @@ function updates_response(success, component, action, message, current_version, 
         status: as_string(status),
         release_url: as_string(release_url)
     };
+    let notes = (cmp_dl && type(cmp_dl.get_release_notes) == "function")
+        ? as_string(cmp_dl.get_release_notes(release_url, latest_version) || "")
+        : "";
+    if (notes != "")
+        obj.release_notes = notes;
     // Merge optional extra fields (e.g. current_sha, latest_sha) without breaking existing callers
     if (type(extra) == "object") {
         for (let k, v in extra)
@@ -311,7 +317,7 @@ function fetch_github_tag_commit_sha(owner, repo, tag) { return cmp_dl.fetch_git
 
 function format_fingerprint_human(fp) { return cmp_verify.format_fingerprint_human(fp); }
 
-function fetch_github_releases_json(owner, repo, per_page) { return cmp_dl.fetch_github_releases_json(owner, repo, per_page); }
+function fetch_github_releases_json(owner, repo, per_page, page) { return cmp_dl.fetch_github_releases_json(owner, repo, per_page, page); }
 
 
 // Delegated to components/catalog.uc (branch 4 god-module split).
@@ -382,13 +388,15 @@ function managed_sing_box_service_text() {
         "    config_get config_file \"main\" \"conffile\" \"/etc/sing-box/config.json\"\n" +
         "    config_get working_directory \"main\" \"workdir\" \"/usr/share/sing-box\"\n" +
         "    config_get_bool log_stderr \"main\" \"log_stderr\" \"1\"\n\n" +
+        "    mkdir -p /tmp/sing-box 2>/dev/null\n" +
+        "    : > /tmp/sing-box/sing-box.log 2>/dev/null\n\n" +
         "    procd_open_instance\n" +
         "    procd_set_param command \"$PROG\" run -c \"$config_file\" -D \"$working_directory\"\n" +
         "    procd_set_param file \"$config_file\"\n" +
         "    procd_set_param stderr \"$log_stderr\"\n" +
         "    procd_set_param limits core=\"unlimited\"\n" +
         "    procd_set_param limits nofile=\"1000000 1000000\"\n" +
-        "    procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\"\n" +
+        "    procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\"\n" +
         "    procd_set_param term_timeout 15\n" +
         "    procd_set_param respawn\n" +
         "    procd_close_instance\n" +
@@ -510,9 +518,161 @@ function stop_tachyon_before_sing_box_change() {
     prepare_sing_box_service_disabled();
 }
 
-function wait_tachyon_running_after_sing_box_change() {
-    if (!tachyon_was_running)
+function sing_box_family_of_variant(variant) {
+    variant = as_string(variant);
+    if (variant == "tachyon-core" || index(variant, "tachyon") >= 0)
+        return "tachyon-core";
+    if (variant == "lx" || index(variant, "lx") >= 0)
+        return "lx";
+    if (variant == "extended" || variant == "extended-compressed" || index(variant, "extended") >= 0)
+        return "extended";
+    if (variant == "tiny" || variant == "stable" || variant == "upstream")
+        return "upstream";
+    return variant;
+}
+
+function should_clear_sing_box_cache_on_change(prev_var, next_var) {
+    prev_var = as_string(prev_var);
+    next_var = as_string(next_var);
+    if (prev_var == "" || prev_var == "not-installed" || next_var == "" || next_var == "not-installed")
         return true;
+    let prev_fam = sing_box_family_of_variant(prev_var);
+    let next_fam = sing_box_family_of_variant(next_var);
+    if (prev_fam != next_fam)
+        return true;
+    if (index(prev_var, "compressed") >= 0 || index(next_var, "compressed") >= 0)
+        return prev_var != next_var;
+    return false;
+}
+
+function get_sing_box_cache_paths() {
+    let paths = [];
+    let seen = {};
+    let add_path = function(p) {
+        p = as_string(p);
+        if (p != "" && !seen[p]) {
+            seen[p] = true;
+            push(paths, p);
+        }
+    };
+
+    if (uci_core.available()) {
+        try {
+            let configured = uci_core.get(TACHYON_CONFIG_NAME, "settings", "cache_path");
+            if (configured)
+                add_path(configured);
+        } catch (e) {}
+    }
+
+    add_path("/tmp/sing-box/cache.db");
+    add_path("/usr/share/sing-box/cache.db");
+    add_path("/etc/sing-box/cache.db");
+    add_path("/var/run/sing-box/cache.db");
+    return paths;
+}
+
+function clear_sing_box_cache_files(reason) {
+    let cleared = 0;
+    let paths = get_sing_box_cache_paths();
+    for (let p in paths) {
+        if (file_exists(p)) {
+            remove_file(p);
+            cleared++;
+        }
+        if (file_exists(p + "-lock"))
+            remove_file(p + "-lock");
+        if (file_exists(p + ".lock"))
+            remove_file(p + ".lock");
+        if (file_exists(p + "-journal"))
+            remove_file(p + "-journal");
+    }
+    for (let dir in [ "/tmp/sing-box", "/etc/sing-box", "/usr/share/sing-box", "/var/run/sing-box" ]) {
+        if (file_exists(dir)) {
+            try {
+                let matches = fs.glob(dir + "/cache.db*");
+                if (matches) {
+                    for (let item in matches) {
+                        let s = as_string(item);
+                        if (length(s) >= 13 && substr(s, length(s) - 13) == ".rollback-bak")
+                            continue;
+                        remove_file(s);
+                        cleared++;
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+    updates_log("Cleared sing-box cache database" + (reason ? " (" + reason + ")" : ""), "info");
+    return cleared;
+}
+
+function backup_sing_box_cache_files() {
+    let backed_up = 0;
+    for (let p in get_sing_box_cache_paths()) {
+        if (file_exists(p)) {
+            remove_file(p + ".rollback-bak");
+            if (fs.rename(p, p + ".rollback-bak"))
+                backed_up++;
+        }
+    }
+    return backed_up;
+}
+
+function restore_sing_box_cache_backup() {
+    let paths = get_sing_box_cache_paths();
+    let has_backup = false;
+    for (let p in paths) {
+        if (file_exists(p + ".rollback-bak")) {
+            has_backup = true;
+            break;
+        }
+    }
+    if (!has_backup)
+        return 0;
+
+    clear_sing_box_cache_files("rollback cleanup");
+    let restored = 0;
+    for (let p in paths) {
+        if (file_exists(p + ".rollback-bak")) {
+            remove_file(p);
+            if (fs.rename(p + ".rollback-bak", p))
+                restored++;
+        }
+    }
+    if (restored > 0)
+        updates_log("Restored previous sing-box cache database after variant rollback", "info");
+    return restored;
+}
+
+function cleanup_sing_box_cache_backup() {
+    let cleaned = 0;
+    for (let p in get_sing_box_cache_paths()) {
+        if (file_exists(p + ".rollback-bak")) {
+            remove_file(p + ".rollback-bak");
+            cleaned++;
+        }
+    }
+    return cleaned;
+}
+
+function clear_sing_box_cache_if_needed(prev_var, next_var) {
+    if (should_clear_sing_box_cache_on_change(prev_var, next_var)) {
+        if (prev_var != "" && prev_var != "not-installed")
+            backup_sing_box_cache_files();
+        let prev_fam = sing_box_family_of_variant(prev_var);
+        let next_fam = sing_box_family_of_variant(next_var);
+        let reason = "core variant changed from " + (prev_var != "" ? prev_var : "none") + " to " + (next_var != "" ? next_var : "none");
+        if (prev_fam != next_fam)
+            reason = "core family changed from " + prev_fam + " to " + next_fam;
+        clear_sing_box_cache_files(reason);
+    }
+}
+
+function wait_tachyon_running_after_sing_box_change() {
+    if (!tachyon_was_running) {
+        cleanup_sing_box_cache_backup();
+        return true;
+    }
     if (!file_exists(BIN_PATH))
         return false;
 
@@ -520,8 +680,10 @@ function wait_tachyon_running_after_sing_box_change() {
     while (waited < 120) {
         if (tachyon_status_running_with_timeout()) {
             command_success_from_args([ "sleep", "8" ]);
-            if (tachyon_status_running_with_timeout())
+            if (tachyon_status_running_with_timeout()) {
+                cleanup_sing_box_cache_backup();
                 return true;
+            }
         }
         command_success_from_args([ "sleep", "4" ]);
         waited += 4;
@@ -1132,12 +1294,55 @@ function remove_optional_component(component, package_name, label, runtime_modul
     action_success(component, "remove", label + " package has been removed", current_version, "", 1);
 }
 
+// steer is not an optional provider, so remove_optional_component does not fit
+// it: there is no providers/steer/runtime.uc to verify leftovers against, and
+// the install is not one package. 2.0.0 ships a core plus feature modules named
+// steer-<module>, and the modules depend on the core, so they go first. The core
+// carries either of two names depending on how the router got there.
+function steer_packages_to_remove() {
+    let packages = [];
+
+    for (let module_name in cmp_cat.steer_module_names())
+        if (pkg_is_installed("steer-" + module_name))
+            push(packages, "steer-" + module_name);
+
+    for (let core in [ STEER_CORE_PACKAGE, "steer", "steer-extended" ])
+        if (pkg_is_installed(core))
+            push(packages, core);
+
+    return packages;
+}
+
+function remove_steer(component, label) {
+    let active = engine.get_active();
+    if (active == component)
+        action_fail(component, "remove", label + " is the active engine. Switch to sing-box first, then remove it.");
+
+    let packages = steer_packages_to_remove();
+    if (length(packages) == 0) {
+        if (engine.binary_present(component))
+            action_fail(component, "remove", label + " exists outside the package manager and was not removed automatically");
+        action_success(component, "remove", label + " is already removed", "", "", 0);
+    }
+
+    let current_version = installed_steer_version() || "";
+    for (let package_name in packages)
+        if (!run_logged_pkg_remove_sing_box_conflict(package_name, "Removing " + package_name))
+            action_fail(component, "remove", "Failed to remove " + label + " package", current_version);
+
+    clear_version_caches();
+    if (engine.binary_present(component))
+        action_fail(component, "remove", label + " packages were removed, but the engine binary is still present", current_version);
+    restart_tachyon_after_successful_change();
+    action_success(component, "remove", label + " has been removed", current_version, "", 1);
+}
+
 // Delegated to components/* modules (branch 4 god-module split).
 function extract_sing_box_version_from_output(output) { return cmp_ver.extract_sing_box_version_from_output(output); }
 function read_sing_box_binary_version(binary, library_dir) { return cmp_ver.read_sing_box_binary_version(binary, library_dir); }
 function verify_binary_post_install(binary_path, expected_version, version_cmd_args) { return cmp_verify.verify_binary_post_install(binary_path, expected_version, version_cmd_args); }
 function validate_sing_box_extended_binary(binary, library_dir, compressed) { return cmp_verify.validate_sing_box_extended_binary(binary, library_dir, compressed); }
-function check_sing_box_config_with_binary(binary, config_path, library_dir) { return cmp_verify.check_sing_box_config_with_binary(binary, config_path, library_dir); }
+function check_sing_box_config_with_binary(binary, config_path, library_dir, target_variant) { return cmp_verify.check_sing_box_config_with_binary(binary, config_path, library_dir, target_variant); }
 
 
 function move_file_portable(source_path, target_path) {
@@ -1224,6 +1429,14 @@ function restore_sing_box_service_from_marker(marker) {
         return install_managed_sing_box_service_script();
     remove_managed_sing_box_service_script();
     return true;
+}
+
+// tachyon-core ships Rust target-triple names (aarch64-musl), not GOARCH names
+// (arm64), so it cannot share the sing-box-extended resolver.
+function resolve_tachyon_core_arch_suffix() {
+    let host_arch = trim(command_output_from_args([ "uname", "-m" ]));
+    let distrib_arch = read_openwrt_release_value("DISTRIB_ARCH");
+    return trim(helper_output("tachyon-core-arch-suffix", [ host_arch, distrib_arch ]));
 }
 
 function resolve_sing_box_extended_arch_suffix() {
@@ -1376,6 +1589,77 @@ function set_sing_box_lx_release_from_json(release_json, allow_prerelease) {
         asset_url,
         asset_name: common.path_basename(asset_url)
     };
+}
+
+// Tachyon's own core, from Dushnilin/tachyon-core.
+//
+// Three things differ from the sing-box variants and each one is a trap if it is
+// copied from them: the archive holds a binary called tachyon-core-<arch>-<ver>,
+// not sing-box, so a member lookup for "sing-box" finds nothing; there is no
+// libcronet to extract; and the arch sits in the middle of the asset name, so the
+// suffix matcher the other variants use does not apply.
+const TACHYON_CORE_OWNER = "Dushnilin";
+const TACHYON_CORE_REPO = "tachyon-core";
+const TACHYON_CORE_LABEL = "tachyon-core";
+
+function set_tachyon_core_release_from_json(release_json, allow_prerelease) {
+    if (as_string(release_json) == "")
+        return null;
+    let tag = trim(helper_output_input(release_json, "object-get-default", [ "tag_name", "" ]));
+    let lowered = lc(tag);
+    if (!allow_prerelease && (tag == "" || index(lowered, "alpha") >= 0 || index(lowered, "beta") >= 0 || index(lowered, "rc") >= 0))
+        return null;
+
+    let arch_suffix = resolve_tachyon_core_arch_suffix();
+    if (arch_suffix == "")
+        return null;
+    let asset_url = trim(helper_output_input(release_json, "tachyon-core-asset-url", [ arch_suffix ]));
+    if (asset_url == "")
+        return null;
+
+    return {
+        tag,
+        release_url: trim(helper_output_input(release_json, "object-get-default", [ "html_url", "" ])),
+        asset_url,
+        asset_name: common.path_basename(asset_url)
+    };
+}
+
+function resolve_tachyon_core_release(target_tag) {
+    if (target_tag != null && target_tag != "") {
+        let release_json = fetch_github_release_by_tag_json(TACHYON_CORE_OWNER, TACHYON_CORE_REPO, target_tag);
+        let resolved = set_tachyon_core_release_from_json(release_json, true);
+        if (resolved != null)
+            return resolved;
+
+        // No API answer: the asset name is derivable, so the download URL can be
+        // built directly. Better than refusing, and the download reports the real
+        // failure if the tag or the arch is wrong.
+        let arch_suffix = resolve_tachyon_core_arch_suffix();
+        if (arch_suffix == "")
+            return null;
+        // The tag goes in whole: the released assets are named
+        // tachyon-core-aarch64-musl-v0.0.1.tar.gz, so stripping the "v" here
+        // built a URL for a file the release does not have.
+        let asset_name = TACHYON_CORE_LABEL + "-" + arch_suffix + "-" + as_string(target_tag) + ".tar.gz";
+        return {
+            tag: target_tag,
+            release_url: "https://github.com/" + TACHYON_CORE_OWNER + "/" + TACHYON_CORE_REPO + "/releases/tag/" + target_tag,
+            asset_url: "https://github.com/" + TACHYON_CORE_OWNER + "/" + TACHYON_CORE_REPO + "/releases/download/" + target_tag + "/" + asset_name,
+            asset_name
+        };
+    }
+
+    let release_json = fetch_github_release_json(TACHYON_CORE_OWNER, TACHYON_CORE_REPO);
+    let resolved = set_tachyon_core_release_from_json(release_json, false);
+    if (resolved != null)
+        return resolved;
+
+    let releases_json = fetch_github_releases_json(TACHYON_CORE_OWNER, TACHYON_CORE_REPO, "30");
+    let tag = trim(helper_output_input(releases_json, "tachyon-core-release-tag", []));
+    if (tag == "")
+        return null;
+    return resolve_tachyon_core_release(tag);
 }
 
 function resolve_sing_box_lx_release(target_tag) {
@@ -1532,6 +1816,7 @@ function restore_sing_box_after_failed_extended_install(previous_variant, backup
     if (!restore_sing_box_install_backup(previous_variant, backup_binary))
         restore_status = false;
     restore_sing_box_variant_state(previous_marker, previous_version_state);
+    restore_sing_box_cache_backup();
     restore_sing_box_service_from_marker(previous_marker);
     clear_version_caches();
     return restore_status;
@@ -1548,6 +1833,7 @@ function restore_sing_box_after_failed_extended_package_install(previous_variant
             command_success_from_args([ "chmod", "0644", "/usr/lib/libcronet.so" ]);
     }
     restore_sing_box_variant_state(previous_marker, previous_version_state);
+    restore_sing_box_cache_backup();
     restore_sing_box_service_from_marker(previous_marker);
     clear_version_caches();
     return restore_status;
@@ -1563,6 +1849,7 @@ function restore_sing_box_after_failed_package_install(target_package, previous_
             restore_status = false;
     }
     restore_sing_box_variant_state(previous_marker, previous_version_state);
+    restore_sing_box_cache_backup();
     if (!restore_sing_box_service_from_marker(previous_marker))
         restore_status = false;
     if (restore_status) {
@@ -1678,7 +1965,7 @@ function install_sing_box_extended_package(action, target_tag) {
         action_fail("sing_box", action, "Installed sing-box-extended package failed validation and previous sing-box variant could not be restored", current_version, latest_version);
     }
 
-    let config_check = check_sing_box_config_with_binary("/usr/bin/sing-box", "/etc/sing-box/config.json", "/usr/lib");
+    let config_check = check_sing_box_config_with_binary("/usr/bin/sing-box", "/etc/sing-box/config.json", "/usr/lib", "extended");
     if (!config_check.ok) {
         if (restore_sing_box_after_failed_extended_package_install(current_variant, backup_binary, backup_cronet, previous_marker, previous_version_state, package_file, cronet_touched))
             action_fail("sing_box", action, "Installed sing-box-extended package is incompatible with current configuration: " + config_check.reason + "; previous sing-box variant was restored", current_version, latest_version);
@@ -1688,6 +1975,7 @@ function install_sing_box_extended_package(action, target_tag) {
     write_sing_box_variant_state("extended", new_version);
     if (target_tag != null && target_tag != "")
         write_file("/etc/tachyon/sing-box-version", target_tag + "\n");
+    clear_sing_box_cache_if_needed(current_variant, "extended");
     restart_tachyon_after_successful_change();
     if (!wait_tachyon_running_after_sing_box_change()) {
         updates_log("sing-box-extended package did not start cleanly; restoring previous sing-box variant", "error");
@@ -1783,7 +2071,8 @@ function install_sing_box_extended(action, compressed, target_tag) {
         action_fail("sing_box", action, "Downloaded " + label + " failed validation", current_version, latest_version);
     }
 
-    let config_check = check_sing_box_config_with_binary(tmp_binary, "/etc/sing-box/config.json", cmp.tmp_dir_path());
+    let target_var = compressed ? "extended-compressed" : "extended";
+    let config_check = check_sing_box_config_with_binary(tmp_binary, "/etc/sing-box/config.json", cmp.tmp_dir_path(), target_var);
     if (!config_check.ok) {
         remove_file(tmp_binary);
         remove_file(tmp_cronet);
@@ -1867,6 +2156,7 @@ function install_sing_box_extended(action, compressed, target_tag) {
     write_sing_box_variant_state("extended-compressed", new_version);
     if (target_tag != null && target_tag != "")
         write_file("/etc/tachyon/sing-box-version", target_tag + "\n");
+    clear_sing_box_cache_if_needed(current_variant, "extended-compressed");
     restart_tachyon_after_successful_change();
     if (!wait_tachyon_running_after_sing_box_change()) {
         updates_log(label + " did not start cleanly; restoring previous sing-box binary", "error");
@@ -1885,6 +2175,153 @@ function install_sing_box_extended(action, compressed, target_tag) {
     clear_version_caches();
     updates_log("Installed " + label + " " + (new_version != "" ? new_version : "unknown"));
     action_success("sing_box", action, label + " has been installed", new_version, latest_version, 1, "latest", release.release_url);
+}
+
+// A downloaded core has to be proven to be the core before it is put in place of
+// the running engine. The check is not "it printed something": a stock sing-box,
+// an lx build or a truncated download would all satisfy a bare exit code, and
+// installing one of those over the core would leave Tachyon generating a config
+// for a binary that is not there.
+function validate_tachyon_core_binary(binary, library_dir) {
+    binary = as_string(binary);
+    if (binary == "" || !file_exists(binary)) {
+        updates_log("tachyon-core binary not found at " + binary, "warn");
+        return "";
+    }
+
+    command_success_from_args([ "chmod", "0755", binary ]);
+
+    let command = command_from_args([ binary, "version" ]);
+    let lib_path = as_string(library_dir || "");
+    if (lib_path != "") {
+        if (lib_path == "/usr/lib")
+            lib_path = "/usr/lib:/lib";
+        else
+            lib_path = lib_path + ":/usr/lib:/lib";
+        command = command_env({ LD_LIBRARY_PATH: lib_path }) + " " + command;
+    }
+
+    let raw_output = command_output_lenient("(" + command + ") 2>&1");
+    let is_core = index(raw_output, "tachyon-core") >= 0 || index(raw_output, "-tachyon.") >= 0;
+    if (!is_core) {
+        let trimmed_output = trim(raw_output);
+        let status = command_status_from_args([ binary, "version" ]);
+        if (status == 132) {
+            updates_log("Downloaded binary crashed with SIGILL (Illegal instruction) - your CPU lacks required AVX2/x86-64-v3 instructions (if on Proxmox/KVM VM, set CPU type to 'host')", "error");
+        } else if (status > 128) {
+            updates_log("Downloaded binary crashed with signal " + (status - 128) + (trimmed_output != "" ? "; output: " + trimmed_output : ""), "error");
+        } else if (trimmed_output == "") {
+            updates_log("Downloaded binary exited with code " + status + " without output", "warn");
+        } else {
+            updates_log("Downloaded binary does not identify as tachyon-core; output: " + trimmed_output, "warn");
+        }
+        return "";
+    }
+
+    let version = extract_sing_box_version_from_output(raw_output);
+    if (version == "") {
+        let candidate = trim(helper_output_input(raw_output, "stdin-first-line-last-field", []));
+        if (match(candidate, /^[vV]?[0-9]+/))
+            version = candidate;
+    }
+    if (version == "") {
+        updates_log("Failed to parse tachyon-core version from binary " + binary + "; output: " + trim(raw_output), "warn");
+        return "";
+    }
+
+    updates_log("validated " + TACHYON_CORE_LABEL + " build " + version + " from " + binary, "info");
+    return version;
+}
+
+function install_tachyon_core(action, target_tag) {
+    init_tmp_dir() || action_fail("sing_box", action, "Failed to create temporary directory");
+    let label = TACHYON_CORE_LABEL;
+    let current_version = sing_box_runtime_output("version", []);
+    let current_variant = sing_box_runtime_output("variant", []);
+    let previous_marker = sing_box_runtime_output("read-variant-marker", []);
+    let previous_version_state = sing_box_runtime_output("read-version-state", []);
+    let release = resolve_tachyon_core_release(target_tag);
+    if (release == null)
+        action_fail("sing_box", action, "Failed to resolve " + label + " release", current_version);
+    let latest_version = normalize_sing_box_version(release.tag);
+
+    if (action == "check_update") {
+        if (current_version == "" || !sing_box_runtime_success("is-foreign-core", [ current_version ]) || !sing_box_runtime_success("marker-is", [ label ]))
+            action_success("sing_box", action, label + " is not installed", current_version, latest_version, 0, "", release.release_url);
+        else
+            check_success("sing_box", normalize_sing_box_version(current_version), normalize_sing_box_version(latest_version), release.release_url);
+    }
+
+    ensure_sing_box_dependencies();
+
+    let archive_file = cmp.tmp_dir_path() + "/" + release.asset_name;
+    if (!download_with_retry(release.asset_url, archive_file, release.asset_name))
+        action_fail("sing_box", action, "Failed to download " + label, current_version, latest_version);
+
+    // The member is named after the build, not "sing-box", so it is found by
+    // prefix. Anything with a dot in the name is skipped: that is the .sha256
+    // sidecar, and extracting it over the binary would produce a core that cannot
+    // start.
+    let binary_path = trim(helper_output_input(
+        command_output_from_args([ "tar", "-tzf", archive_file ]),
+        "updates-archive-member-prefix",
+        [ label ]
+    ));
+    if (binary_path == "") {
+        remove_file(archive_file);
+        action_fail("sing_box", action, "core binary was not found in the downloaded archive", current_version, latest_version);
+    }
+
+    let extract_error = cmp.tmp_dir_path() + "/tachyon-core-extract.err";
+    let tmp_binary = cmp.tmp_dir_path() + "/tachyon-core." + owner_pid();
+    if (!command_success(command_from_args([ "tar", "-xzf", archive_file, "-O", binary_path ]) + " >" + shell_quote(tmp_binary) + " 2>" + shell_quote(extract_error)) ||
+        !file_nonempty(tmp_binary) ||
+        !command_success_from_args([ "chmod", "0755", tmp_binary ])) {
+        for (let line in split(read_file(extract_error), "\n"))
+            if (trim(as_string(line)) != "")
+                updates_log(line);
+        remove_file(tmp_binary);
+        remove_file(archive_file);
+        action_fail("sing_box", action, "Failed to extract " + label, current_version, latest_version);
+    }
+    remove_file(archive_file);
+
+    let new_version = validate_tachyon_core_binary(tmp_binary, cmp.tmp_dir_path());
+    if (new_version == "") {
+        remove_file(tmp_binary);
+        action_fail("sing_box", action, "Downloaded " + label + " is not a tachyon-core build", current_version, latest_version);
+    }
+
+    // Refuse before installing: a core that rejects the current config would
+    // leave the router with no working engine at all, which is the failure this
+    // check exists to prevent.
+    let config_check = check_sing_box_config_with_binary(tmp_binary, "/etc/sing-box/config.json", cmp.tmp_dir_path(), "tachyon-core");
+    if (!config_check.ok) {
+        remove_file(tmp_binary);
+        action_fail("sing_box", action, "Downloaded " + label + " is incompatible with current configuration: " + config_check.reason, current_version, latest_version);
+    }
+
+    stop_tachyon_before_sing_box_change();
+
+    let backup_binary = cmp.tmp_dir_path() + "/sing-box.backup." + owner_pid();
+    copy_file_stream("/usr/bin/sing-box", backup_binary);
+
+    if (!install_staged_file(tmp_binary, "/usr/bin/sing-box", "0755")) {
+        remove_file(tmp_binary);
+        if (file_exists(backup_binary))
+            install_staged_file(backup_binary, "/usr/bin/sing-box", "0755");
+        restart_tachyon_after_successful_change();
+        action_fail("sing_box", action, "Failed to install " + label, current_version, latest_version);
+    }
+    remove_file(tmp_binary);
+
+    write_sing_box_variant_state(label, new_version);
+    install_managed_sing_box_service_script();
+    clear_sing_box_cache_if_needed(current_variant, label);
+    restart_tachyon_after_successful_change();
+    remove_file(backup_binary);
+
+    action_success("sing_box", action, label, new_version, latest_version, 1, "", release.release_url);
 }
 
 function install_sing_box_lx(action, target_tag) {
@@ -1957,7 +2394,7 @@ function install_sing_box_lx(action, target_tag) {
         action_fail("sing_box", action, "Downloaded " + label + " failed validation", current_version, latest_version);
     }
 
-    let config_check = check_sing_box_config_with_binary(tmp_binary, "/etc/sing-box/config.json", cmp.tmp_dir_path());
+    let config_check = check_sing_box_config_with_binary(tmp_binary, "/etc/sing-box/config.json", cmp.tmp_dir_path(), "lx");
     if (!config_check.ok) {
         remove_file(tmp_binary);
         remove_file(tmp_cronet);
@@ -2041,6 +2478,7 @@ function install_sing_box_lx(action, target_tag) {
     write_sing_box_variant_state("lx", new_version);
     if (target_tag != null && target_tag != "")
         write_file("/etc/tachyon/sing-box-version", target_tag + "\n");
+    clear_sing_box_cache_if_needed(current_variant, "lx");
     restart_tachyon_after_successful_change();
     if (!wait_tachyon_running_after_sing_box_change()) {
         updates_log(label + " did not start cleanly; restoring previous sing-box binary", "error");
@@ -2067,11 +2505,11 @@ function install_package_sing_box(action, tiny) {
     let label = tiny ? "tiny sing-box" : "stable sing-box";
     let package_version = installed_package_version(package_name);
     let binary_version = sing_box_runtime_output("version", []);
-    let current_version = package_version;
-    if (sing_box_runtime_success("is-extended", [ binary_version ]))
-        current_version = binary_version;
-    if (current_version == "")
-        current_version = binary_version;
+    // What actually runs is the binary, not what apk believes it installed: the
+    // two drift whenever the binary was replaced by hand or came from a newer
+    // snapshot (issue #108). Falling back to the package version keeps the
+    // "not installed" case working when there is no binary to ask.
+    let current_version = binary_version != "" ? binary_version : package_version;
     let latest_version = available_package_version(package_name);
     if (latest_version == "")
         latest_version = installed_package_version(package_name);
@@ -2117,6 +2555,22 @@ function install_package_sing_box(action, tiny) {
     let previous_variant = sing_box_runtime_output("variant", []);
     let previous_marker = sing_box_runtime_output("read-variant-marker", []);
     let previous_version_state = sing_box_runtime_output("read-version-state", []);
+
+    // The package variants can only ever install what the repository carries. If
+    // the running binary is newer than that, a plain install rolls the router back
+    // to the packaged version without saying so (issue #108). Refuse instead, and
+    // only within the same family: switching family on purpose - extended down to
+    // tiny, say - is a legitimate request even though the versions differ.
+    if (action != "check_update" && binary_version != "" && latest_version != "" &&
+        previous_variant == (tiny ? "tiny" : "stable")) {
+        let downgrade = compare_versions(binary_version, latest_version);
+        if (downgrade != null && downgrade > 0)
+            action_fail("sing_box", action, label + " would be downgraded: the running binary is " +
+                binary_version + " but the repository only carries " + latest_version +
+                ". Install the newer build as lx/extended, or leave " + label + " as it is",
+                binary_version, latest_version);
+    }
+
     stop_tachyon_before_sing_box_change();
 
     let backup_binary = "";
@@ -2156,12 +2610,14 @@ function install_package_sing_box(action, tiny) {
         fail_package_sing_box_install(action, tiny, "package was installed, but the active binary is still sing-box-extended", new_version, latest_version,
             package_name, previous_variant, backup_binary, backup_cronet, previous_marker, previous_version_state, cronet_touched);
 
-    let config_check = check_sing_box_config_with_binary("/usr/bin/sing-box", "/etc/sing-box/config.json", "");
+    let target_var = tiny ? "tiny" : "stable";
+    let config_check = check_sing_box_config_with_binary("/usr/bin/sing-box", "/etc/sing-box/config.json", "", target_var);
     if (!config_check.ok)
         fail_package_sing_box_install(action, tiny, "installed package is incompatible with current configuration: " + config_check.reason, new_version, latest_version,
             package_name, previous_variant, backup_binary, backup_cronet, previous_marker, previous_version_state, cronet_touched);
 
     write_sing_box_variant_state(tiny ? "tiny" : "stable", new_version);
+    clear_sing_box_cache_if_needed(previous_variant, tiny ? "tiny" : "stable");
     restart_tachyon_after_successful_change();
     if (!wait_tachyon_running_after_sing_box_change())
         fail_package_sing_box_install(action, tiny, "was installed, but Tachyon did not start cleanly", new_version, latest_version,
@@ -2415,6 +2871,10 @@ function install_tachyon_version(target_tag) {
 }
 
 function dispatch_sing_box(action, target_tag) {
+    if (action == "install_tachyon_core") {
+        install_tachyon_core(action, target_tag);
+        return;
+    }
     if (action == "install_extended") {
         install_sing_box_extended(action, false, target_tag);
         return;
@@ -2437,7 +2897,9 @@ function dispatch_sing_box(action, target_tag) {
     }
 
     let variant = sing_box_runtime_output("variant", []);
-    if (variant == "lx")
+    if (variant == "tachyon-core")
+        install_tachyon_core(action, target_tag);
+    else if (variant == "lx")
         install_sing_box_lx(action, target_tag);
     else if (variant == "extended-compressed")
         install_sing_box_extended(action, true, target_tag);
@@ -2801,13 +3263,17 @@ function rollback_component(component) {
     }
 }
 
-function list_component_releases(component, count) {
+function list_component_releases(component, count, page) {
     component = normalize_component_name(component);
-    count = int(count || 3);
+    count = int(count || 5);
     if (count < 1) count = 1;
-    if (count > 10) count = 10;
+    if (count > 30) count = 30;
+    page = int(page || 1);
+    if (page < 1) page = 1;
 
-    let cache_file = "/tmp/tachyon-releases-" + component + ".json";
+    let cache_file = (page == 1)
+        ? ("/tmp/tachyon-releases-v2-" + component + ".json")
+        : ("/tmp/tachyon-releases-v2-" + component + "-p" + page + ".json");
     let cached_stat = fs.stat(cache_file);
     if (cached_stat != null && (time() - cached_stat.mtime) < 600) {
         let cached_data = read_file(cache_file);
@@ -2829,6 +3295,7 @@ function list_component_releases(component, count) {
         let variant = sing_box_runtime_output("variant", []);
         if (variant == "lx") { owner = "Leadaxe"; repo = "sing-box-lx"; }
         else if (variant == "extended" || variant == "extended-compressed") { owner = "shtorm-7"; repo = "sing-box-extended"; }
+        else if (variant == "tachyon-core") { owner = TACHYON_CORE_OWNER; repo = TACHYON_CORE_REPO; }
         else { owner = "SagerNet"; repo = "sing-box"; }
     } else if (component == "zapret") {
         owner = "remittor"; repo = "zapret-openwrt";
@@ -2848,12 +3315,12 @@ function list_component_releases(component, count) {
         print("[]\n"); return;
     }
 
-    let releases_json = fetch_github_releases_json(owner, repo, per_page);
+    let releases_json = fetch_github_releases_json(owner, repo, per_page, page);
     if ((releases_json == "" || releases_json == "[]") && (component == "wdtt" || component == "olcrtc" || component == "fptn")) {
         if (component == "wdtt") { owner = "SpaceNeuroX"; repo = "qwdtt-openwrt"; }
         else if (component == "olcrtc") { owner = "alekvol"; repo = "openwrt-olcrtc"; }
         else if (component == "fptn") { owner = "fptn-project"; repo = "fptn"; }
-        releases_json = fetch_github_releases_json(owner, repo, per_page);
+        releases_json = fetch_github_releases_json(owner, repo, per_page, page);
     }
     if (releases_json == "" || releases_json == "[]") { print("[]\n"); return; }
 
@@ -2866,9 +3333,12 @@ function list_component_releases(component, count) {
                 let name = trim(as_string(r.name || tag));
                 let published = trim(as_string(r.published_at || r.created_at || ""));
                 let html_url = trim(as_string(r.html_url || ""));
+                let body = trim(replace(as_string(r.body || ""), /\r/g, ""));
+                if (length(body) > 3500)
+                    body = substr(body, 0, 3500) + "\n...";
                 if (tag == "") continue;
                 let prerelease = !!r.prerelease;
-                push(releases, { tag, name, published, prerelease, release_url: html_url });
+                push(releases, { tag, name, published, prerelease, release_url: html_url, body });
             }
         }
     } catch (e) {}
@@ -2897,11 +3367,11 @@ function install_component_version(component, tag) {
     // (issue #108). Refuse before create_component_backup so nothing is touched.
     if (component == "sing_box") {
         let variant = sing_box_runtime_output("variant", []);
-        if (index([ "lx", "extended", "extended-compressed" ], variant) < 0)
+        if (index([ "lx", "extended", "extended-compressed", "tachyon-core" ], variant) < 0)
             action_fail("sing_box", "install_version",
-                "Installing a specific version is only supported for the lx/extended sing-box variants; " +
+                "Installing a specific version is only supported for the lx/extended/tachyon-core variants; " +
                 "the current variant (" + variant + ") is installed from the OpenWrt repository and ignores " +
-                "the selected tag. Switch to lx/extended or install the binary manually",
+                "the selected tag. Switch to lx/extended/tachyon-core or install the binary manually",
                 sing_box_runtime_output("version", []), tag);
     }
 
@@ -2930,6 +3400,23 @@ function install_component_version(component, tag) {
     } else {
         action_fail(component, "install_version", "Component " + component + " does not support version installation");
     }
+}
+
+// FPTN transport choice: with tachyon-core and the fptn-client component both
+// present, only one of them may own the tunnel. The resolver in
+// config.connections reads this setting for both the generator and the
+// provider runtime.
+function set_fptn_mode(action) {
+    let mode = action == "set_native_mode" ? "native" : "component";
+    let cursor = uci_core.cursor();
+    cursor.load("tachyon");
+    cursor.set("tachyon", "settings", "fptn_mode", mode);
+    cursor.commit("tachyon");
+
+    remove_file(SYSTEM_INFO_CACHE_FILE);
+    restart_tachyon_after_successful_change();
+
+    action_success("fptn", action, "FPTN transport set to " + mode, mode, mode, 1);
 }
 
 function set_direct_bypass(action) {
@@ -3015,7 +3502,9 @@ function set_torrserver_direct(action) {
 function switch_engine_component(target) {
     target = engine.normalize_engine(target);
     updates_log("Switching routing engine to " + target);
-    let engine_rt = require("service.engine_runtime");
+    // The library, not the CLI shim: requiring service/engine_runtime.uc would run
+    // its main() with this process's arguments and then exit the interpreter.
+    let engine_rt = require("service.engine_runtime_lib");
     let result = engine_rt.switch_engine(target, { allow_install: true });
     if (!result.ok)
         action_fail("engine", "switch", "Engine switch failed: " + as_string(result.reason || "unknown"), "", "", as_string(result.reason || ""));
@@ -3056,7 +3545,9 @@ function component_action(component, action, extra) {
         return;
     }
 
-    if (action != "check_update" && action != "remove" && component != "direct_bypass" && component != "torrserver_direct" && component != "engine") {
+    if (action != "check_update" && action != "remove" &&
+        action != "set_native_mode" && action != "set_component_mode" &&
+        component != "direct_bypass" && component != "torrserver_direct" && component != "engine") {
         create_component_backup(component);
     }
 
@@ -3069,6 +3560,7 @@ function component_action(component, action, extra) {
     else if (component == "sing_box" && (action == "check_update" || action == "install" ||
         action == "install_extended" || action == "install_extended_compressed" ||
         action == "install_lx" ||
+        action == "install_tachyon_core" ||
         action == "install_tiny" || action == "install_stable"))
         dispatch_sing_box(action);
     else if (component == "zapret" && (action == "check_update" || action == "install"))
@@ -3095,10 +3587,16 @@ function component_action(component, action, extra) {
         install_fptn(action);
     else if (component == "fptn" && action == "remove")
         remove_optional_component("fptn", "fptn-client", "FPTN", LIB_DIR + "/providers/fptn/runtime.uc");
+    else if (component == "fptn" && (action == "set_native_mode" || action == "set_component_mode"))
+        set_fptn_mode(action);
     else if (component == "steer" && (action == "check_update" || action == "install"))
         install_steer(action, extra, false);
     else if (component == "steer-extended" && (action == "check_update" || action == "install"))
         install_steer(action, extra, true);
+    else if (component == "steer" && action == "remove")
+        remove_steer(component, "steer");
+    else if (component == "steer-extended" && action == "remove")
+        remove_steer(component, "steer-extended");
     else if (component == "tailscale" && (action == "check_update" || action == "install"))
         install_tailscale(action);
     else if (component == "tailscale" && action == "remove")
@@ -3117,13 +3615,17 @@ if (mode == "component-action") {
     try {
         component_action(ARGV[1], ARGV[2], ARGV[3]);
     } catch (e) {
+        if (e && e.stacktrace) {
+            for (let frame in e.stacktrace)
+                updates_log("  at " + frame.filename + ":" + frame.line, "error");
+        }
         let err_str = as_string(e);
         updates_log("Unhandled component action error: " + err_str, "error");
         action_fail(ARGV[1] || "unknown", ARGV[2] || "unknown", "Unexpected error: " + err_str);
     }
 }
 else if (mode == "list-component-releases")
-    list_component_releases(ARGV[1], ARGV[2]);
+    list_component_releases(ARGV[1], ARGV[2], ARGV[3]);
 else if (mode == "install-component-version") {
     try {
         component_action(ARGV[1], "install_version", ARGV[2]);
@@ -3141,6 +3643,16 @@ else if (mode == "tachyon-release-metadata")
     print(fetch_tachyon_latest_release_metadata(), "\n");
 else if (mode == "pkg-install-files-command")
     print(pkg_install_files_command(slice(ARGV, 2), ARGV[1] == "1"), "\n");
+else if (mode == "clear-sing-box-cache")
+    exit(clear_sing_box_cache_files(ARGV[1] || "manual") >= 0 ? 0 : 1);
+else if (mode == "backup-sing-box-cache")
+    exit(backup_sing_box_cache_files() >= 0 ? 0 : 1);
+else if (mode == "restore-sing-box-cache-backup")
+    exit(restore_sing_box_cache_backup() >= 0 ? 0 : 1);
+else if (mode == "cleanup-sing-box-cache-backup")
+    exit(cleanup_sing_box_cache_backup() >= 0 ? 0 : 1);
+else if (mode == "should-clear-sing-box-cache")
+    exit(should_clear_sing_box_cache_on_change(ARGV[1], ARGV[2]) ? 0 : 1);
 else {
     warn("Usage: components/action.uc <component-action|list-component-releases|install-component-version|latest-tachyon-version|tachyon-release-metadata> ...\n");
     exit(1);

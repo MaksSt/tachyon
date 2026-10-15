@@ -1,5 +1,6 @@
 #!/usr/bin/env ucode
 
+let fs = require("fs");
 let common = require("core.common");
 let uci_core = require("core.uci");
 
@@ -329,7 +330,7 @@ function is_remote_proxy_action(action) {
     action = as_string(action);
     return is_connections_action(action) ||
         action == "awg" || action == "warp" ||
-        action == "anytls" || action == "snell" || action == "mieru" || action == "sudoku" ||
+        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
         action == "masque" || action == "openvpn" ||
         action == "wdtt" || action == "olcrtc" || action == "fptn";
 }
@@ -376,6 +377,61 @@ function fptn_sections() {
     return result;
 }
 
+// How FPTN traffic leaves the box.
+//
+//   component - the external fptn-client owns tun-fptn and the fwmark route.
+//   native    - tachyon-core dials FPTN from the generated config itself.
+//
+// "native" only exists on tachyon-core; every other engine is component mode.
+// With no explicit setting the current behaviour is preserved: an installed
+// component keeps the component path, a core-only box gets the native one.
+// The explicit choice exists only so the two tunnels cannot fight when both
+// are possible.
+function fptn_transport_mode() {
+    let variant = trim(as_string(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant") || ""));
+    let version = trim(as_string(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version") || ""));
+    if (variant != "tachyon-core" && match(version, /-tachyon\./) == null)
+        return "component";
+
+    let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+    let mode = trim(as_string(common.option(settings, "fptn_mode", "") || ""));
+    if (mode == "native" || mode == "component")
+        return mode;
+
+    let has_binary = fs.stat("/usr/bin/fptn-client-cli") != null || fs.stat("/usr/bin/fptn-client") != null;
+    return has_binary ? "component" : "native";
+}
+
+// The token an FPTN section dials with: the explicit access_token when there
+// is one, otherwise the first fptn:// link pasted into the section URL list.
+// One resolver so the generator, the provider runtime and the validator can
+// never disagree about where the token comes from.
+function fptn_section_token(section) {
+    let token = trim(as_string(option(section, "access_token", "")));
+    if (token != "")
+        return token;
+    let links = raw_option(section, "selector_proxy_links");
+    if (links == null || links == "")
+        links = [];
+    if (type(links) != "array")
+        links = [links];
+    // The text variant of the same field, kept for configs that carry it.
+    let text = option(section, "selector_proxy_links_text", "");
+    if (text != "") {
+        for (let line in split(text, /[\r\n]+/)) {
+            line = trim(line);
+            if (line != "" && match(line, /^[^#\s]/))
+                push(links, line);
+        }
+    }
+    for (let link in links) {
+        link = trim(as_string(link));
+        if (substr(link, 0, 6) == "fptnb:" || substr(link, 0, 5) == "fptn:")
+            return link;
+    }
+    return "";
+}
+
 function normalize_action(action) {
     action = as_string(action);
     return is_connections_action(action) ? "connection" : action;
@@ -385,8 +441,25 @@ function action(section) {
     return normalize_action(option(section, "action", ""));
 }
 
+// Imported .conf entries. Shared by the connection path (each entry becomes a
+// vpn:// link) and the AmneziaWG path (each entry becomes its own endpoint).
+function amnezia_configs(section) {
+    let configs = raw_option(section, "selector_amnezia_configs");
+    if (configs == null || configs == "")
+        return [];
+    if (type(configs) != "array")
+        configs = [configs];
+    return configs;
+}
+
 function connection_urls(section) {
     let links = whitespace_list_value(section, "selector_proxy_links");
+    let importer = require("subscription.amnezia_config");
+    for (let value in amnezia_configs(section)) {
+        let item = importer.parse(value);
+        if (item == null) die("Invalid imported Amnezia configuration");
+        push(links, item.link);
+    }
     let text = option(section, "selector_proxy_links_text", "");
     if (text != "") {
         for (let line in split(text, /[\r\n]+/)) {
@@ -916,6 +989,19 @@ function urltest_child(section, value) {
 function urltest_settings(section, value) {
     let child = urltest_child(section, value);
     return child != null ? child : item_settings(section, "urltest_settings", value);
+}
+
+// Whether a single subscription URL takes part at all. Distinct from
+// subscription_update_enabled: that one only governs the automatic refresh,
+// while this one must keep the source out of the download, the cache and the
+// generated outbounds entirely. Defaulting to true keeps every configuration
+// written before the flag existed behaving exactly as it did.
+function subscription_url_enabled(section, value) {
+    let child = child_item_by_value(section, "subscription_url", "url", value);
+    if (child != null)
+        return child_bool(child, "enabled", true);
+    return item_bool(section, "subscription_url_settings", value, "enabled",
+        bool_option(section, "enabled", true));
 }
 
 function subscription_update_enabled(section, value) {
@@ -1686,6 +1772,7 @@ return {
     subscription_url_settings,
     interface_settings,
     urltest_settings,
+    subscription_url_enabled,
     subscription_update_enabled,
     subscription_update_interval,
     subscription_dashboard_metadata_enabled,
@@ -1789,11 +1876,14 @@ return {
     routed_dns_enabled,
     routed_dns_type,
     routed_dns_servers,
+    amnezia_configs,
     item_index_from_cursor,
     cli_delete_section,
     wdtt_sections,
     olcrtc_sections,
     fptn_sections,
+    fptn_section_token,
+    fptn_transport_mode,
     is_wdtt_action,
     is_olcrtc_action,
     is_fptn_action,

@@ -327,6 +327,538 @@ function validateOutboundJson(value, usedTags = []) {
   return { valid: true, message: _("Valid") };
 }
 
+// src/tachyon/tabs/diagnostic/helpers/getCheckTitle.ts
+function getCheckTitle(name) {
+  return `${name} ${_("checks")}`;
+}
+
+// src/tachyon/tabs/diagnostic/checks/constants.ts
+var DIAGNOSTICS_CHECKS = /* @__PURE__ */ ((DIAGNOSTICS_CHECKS2) => {
+  DIAGNOSTICS_CHECKS2["DNS"] = "DNS";
+  DIAGNOSTICS_CHECKS2["SINGBOX"] = "SINGBOX";
+  DIAGNOSTICS_CHECKS2["STEER"] = "STEER";
+  DIAGNOSTICS_CHECKS2["NFT"] = "NFT";
+  DIAGNOSTICS_CHECKS2["ZAPRET"] = "ZAPRET";
+  DIAGNOSTICS_CHECKS2["ZAPRET2"] = "ZAPRET2";
+  DIAGNOSTICS_CHECKS2["BYEDPI"] = "BYEDPI";
+  DIAGNOSTICS_CHECKS2["FAKEIP"] = "FAKEIP";
+  DIAGNOSTICS_CHECKS2["OUTBOUNDS"] = "OUTBOUNDS";
+  DIAGNOSTICS_CHECKS2["INBOUNDS"] = "INBOUNDS";
+  return DIAGNOSTICS_CHECKS2;
+})(DIAGNOSTICS_CHECKS || {});
+var DIAGNOSTICS_CHECKS_MAP = {
+  ["DNS" /* DNS */]: {
+    order: 1,
+    title: getCheckTitle("DNS"),
+    code: "DNS" /* DNS */
+  },
+  ["SINGBOX" /* SINGBOX */]: {
+    order: 2,
+    title: getCheckTitle("Sing-box"),
+    code: "SINGBOX" /* SINGBOX */
+  },
+  ["STEER" /* STEER */]: {
+    order: 2,
+    title: getCheckTitle("Steer"),
+    code: "STEER" /* STEER */
+  },
+  ["NFT" /* NFT */]: {
+    order: 4,
+    title: getCheckTitle("Nftables"),
+    code: "NFT" /* NFT */
+  },
+  ["ZAPRET" /* ZAPRET */]: {
+    order: 5,
+    title: getCheckTitle("Zapret"),
+    code: "ZAPRET" /* ZAPRET */
+  },
+  ["BYEDPI" /* BYEDPI */]: {
+    order: 7,
+    title: getCheckTitle("ByeDPI"),
+    code: "BYEDPI" /* BYEDPI */
+  },
+  ["ZAPRET2" /* ZAPRET2 */]: {
+    order: 6,
+    title: getCheckTitle("Zapret2"),
+    code: "ZAPRET2" /* ZAPRET2 */
+  },
+  ["OUTBOUNDS" /* OUTBOUNDS */]: {
+    order: 8,
+    title: getCheckTitle("Outbounds"),
+    code: "OUTBOUNDS" /* OUTBOUNDS */
+  },
+  ["FAKEIP" /* FAKEIP */]: {
+    order: 9,
+    title: getCheckTitle("FakeIP"),
+    code: "FAKEIP" /* FAKEIP */
+  },
+  ["INBOUNDS" /* INBOUNDS */]: {
+    order: 3,
+    title: getCheckTitle("Inbounds"),
+    code: "INBOUNDS" /* INBOUNDS */
+  }
+};
+
+// src/tachyon/tabs/diagnostic/diagnostic.store.ts
+function isSteerEngine(engine) {
+  return engine === "steer" || engine === "steer-extended";
+}
+function getEngineCheckCode(engine) {
+  if (isSteerEngine(engine)) return "STEER" /* STEER */;
+  return "SINGBOX" /* SINGBOX */;
+}
+function createDiagnosticCheck(code, description) {
+  const meta = DIAGNOSTICS_CHECKS_MAP[code];
+  return {
+    code,
+    title: meta.title,
+    order: meta.order,
+    description,
+    items: [],
+    state: "skipped"
+  };
+}
+function getDiagnosticsChecks(description, options = {}) {
+  const engineCheck = getEngineCheckCode(options.activeEngine);
+  const checks = ["DNS" /* DNS */, engineCheck];
+  if (options.includeInbounds === true) {
+    checks.push("INBOUNDS" /* INBOUNDS */);
+  }
+  checks.push("NFT" /* NFT */);
+  if (options.includeZapret) {
+    checks.push("ZAPRET" /* ZAPRET */);
+  }
+  if (options.includeZapret2) {
+    checks.push("ZAPRET2" /* ZAPRET2 */);
+  }
+  if (options.includeByedpi) {
+    checks.push("BYEDPI" /* BYEDPI */);
+  }
+  checks.push("OUTBOUNDS" /* OUTBOUNDS */, "FAKEIP" /* FAKEIP */);
+  return checks.map((code) => createDiagnosticCheck(code, description));
+}
+function getLoadingDiagnosticsChecks(options = {}) {
+  return {
+    diagnosticsChecks: getDiagnosticsChecks(_("Pending"), options)
+  };
+}
+var initialDiagnosticStore = {
+  diagnosticsSystemInfo: {
+    loading: true,
+    loaded: false,
+    providerInfoLoaded: false,
+    tachyon_version: "loading",
+    tachyon_commit_sha: "",
+    tachyon_latest_version: "loading",
+    luci_app_version: "loading",
+    sing_box_version: "loading",
+    sing_box_extended: 0,
+    sing_box_tiny: 0,
+    sing_box_compressed: 0,
+    sing_box_lx: 0,
+    sing_box_tachyon_core: 0,
+    sing_box_fptn: 0,
+    sing_box_tailscale: 1,
+    sing_box_cert_pin: 0,
+    sing_box_repo_url: "",
+    sing_box_backup_version: "",
+    sing_box_backup_time: 0,
+    steer_version: "loading",
+    steer_installed: 0,
+    steer_extended: 0,
+    steer_repo_url: "https://github.com/xyzmean/steer",
+    steer_backup_version: "",
+    steer_backup_time: 0,
+    active_engine: "sing-box",
+    zapret_version: "loading",
+    zapret_installed: 0,
+    zapret_backup_version: "",
+    zapret_backup_time: 0,
+    zapret2_version: "loading",
+    zapret2_installed: 0,
+    zapret2_backup_version: "",
+    zapret2_backup_time: 0,
+    byedpi_version: "loading",
+    byedpi_installed: 0,
+    byedpi_backup_version: "",
+    byedpi_backup_time: 0,
+    wdtt_version: "loading",
+    wdtt_installed: 0,
+    wdtt_backup_version: "",
+    wdtt_backup_time: 0,
+    olcrtc_version: "loading",
+    olcrtc_installed: 0,
+    olcrtc_backup_version: "",
+    olcrtc_backup_time: 0,
+    tailscale_version: "loading",
+    tailscale_installed: 0,
+    tailscale_backup_version: "",
+    tailscale_backup_time: 0,
+    fptn_version: "loading",
+    fptn_installed: 0,
+    fptn_mode: "component",
+    fptn_backup_version: "",
+    fptn_backup_time: 0,
+    server_inbounds_enabled_count: -1,
+    direct_bypass_enabled: 0,
+    direct_bypass_address: "",
+    direct_bypass_port: "",
+    torrserver_running: 0,
+    torrserver_direct_available: 0,
+    torrserver_direct_enabled: 0,
+    torrserver_direct_active: 0,
+    openwrt_version: "loading",
+    device_model: "loading"
+  },
+  diagnosticsActions: {
+    restart: {
+      loading: false
+    },
+    start: {
+      loading: false
+    },
+    stop: {
+      loading: false
+    },
+    enable: {
+      loading: false
+    },
+    disable: {
+      loading: false
+    },
+    globalCheck: {
+      loading: false
+    },
+    doctor: {
+      loading: false
+    },
+    aiDoctor: {
+      loading: false
+    },
+    viewLogs: {
+      loading: false
+    },
+    showSingBoxConfig: {
+      loading: false
+    },
+    generateBugReport: {
+      loading: false
+    },
+    checkServices: {
+      loading: false
+    }
+  },
+  diagnosticsRunAction: { loading: false },
+  diagnosticsChecks: getDiagnosticsChecks(_("Not running")),
+  updatesActions: {
+    tachyonCheck: { loading: false },
+    tachyonInstall: { loading: false },
+    tachyonReinstall: { loading: false },
+    tachyonRollback: { loading: false },
+    singBoxCheck: { loading: false },
+    singBoxInstall: { loading: false },
+    singBoxRollback: { loading: false },
+    singBoxInstallExtended: { loading: false },
+    singBoxInstallExtendedCompressed: { loading: false },
+    singBoxInstallLx: { loading: false },
+    singBoxInstallTachyonCore: { loading: false },
+    singBoxInstallTiny: { loading: false },
+    singBoxInstallStable: { loading: false },
+    zapretCheck: { loading: false },
+    zapretInstall: { loading: false },
+    zapretRemove: { loading: false },
+    zapretRollback: { loading: false },
+    zapret2Check: { loading: false },
+    zapret2Install: { loading: false },
+    zapret2Remove: { loading: false },
+    zapret2Rollback: { loading: false },
+    byedpiCheck: { loading: false },
+    byedpiInstall: { loading: false },
+    byedpiRemove: { loading: false },
+    byedpiRollback: { loading: false },
+    wdttCheck: { loading: false },
+    wdttInstall: { loading: false },
+    wdttRemove: { loading: false },
+    wdttRollback: { loading: false },
+    olcrtcCheck: { loading: false },
+    olcrtcInstall: { loading: false },
+    olcrtcRemove: { loading: false },
+    olcrtcRollback: { loading: false },
+    fptnCheck: { loading: false },
+    fptnInstall: { loading: false },
+    fptnRemove: { loading: false },
+    fptnRollback: { loading: false },
+    fptnSetNativeMode: { loading: false },
+    fptnSetComponentMode: { loading: false },
+    tailscaleCheck: { loading: false },
+    tailscaleInstall: { loading: false },
+    tailscaleRemove: { loading: false },
+    tailscaleRollback: { loading: false },
+    steerCheck: { loading: false },
+    steerInstall: { loading: false },
+    steerRemove: { loading: false },
+    steerRollback: { loading: false },
+    directBypassEnable: { loading: false },
+    directBypassDisable: { loading: false },
+    torrserverDirectEnable: { loading: false },
+    torrserverDirectDisable: { loading: false },
+    engineSwitch: { loading: false }
+  },
+  updatesChecks: {
+    tachyon: { status: null, latest_version: "", release_url: "" },
+    sing_box: { status: null, latest_version: "", release_url: "" },
+    zapret: { status: null, latest_version: "", release_url: "" },
+    zapret2: { status: null, latest_version: "", release_url: "" },
+    byedpi: { status: null, latest_version: "", release_url: "" },
+    wdtt: { status: null, latest_version: "", release_url: "" },
+    olcrtc: { status: null, latest_version: "", release_url: "" },
+    fptn: { status: null, latest_version: "", release_url: "" },
+    tailscale: { status: null, latest_version: "", release_url: "" },
+    steer: { status: null, latest_version: "", release_url: "" },
+    "steer-extended": { status: null, latest_version: "", release_url: "" },
+    direct_bypass: { status: null, latest_version: "", release_url: "" },
+    torrserver_direct: { status: null, latest_version: "", release_url: "" },
+    engine: { status: null, latest_version: "", release_url: "" }
+  }
+};
+
+// src/tachyon/services/store.service.ts
+function jsonStableStringify(obj) {
+  return JSON.stringify(obj, (_2, value) => {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return Object.keys(value).sort().reduce(
+        (acc, key) => {
+          acc[key] = value[key];
+          return acc;
+        },
+        {}
+      );
+    }
+    return value;
+  });
+}
+function jsonEqual(a, b) {
+  try {
+    return jsonStableStringify(a) === jsonStableStringify(b);
+  } catch {
+    return false;
+  }
+}
+var StoreService = class {
+  constructor(initial) {
+    this.listeners = /* @__PURE__ */ new Set();
+    this.value = initial;
+    this.initial = structuredClone(initial);
+  }
+  get() {
+    return this.value;
+  }
+  set(next) {
+    const prev = this.value;
+    const diff = {};
+    for (const key in next) {
+      if (next[key] === prev[key]) continue;
+      if (!jsonEqual(next[key], prev[key])) diff[key] = next[key];
+    }
+    if (Object.keys(diff).length === 0) {
+      return;
+    }
+    const merged = { ...prev, ...next };
+    this.value = merged;
+    this.listeners.forEach((cb) => cb(this.value, prev, diff));
+  }
+  reset(keys) {
+    const prev = this.value;
+    const next = structuredClone(this.value);
+    if (keys && keys.length > 0) {
+      keys.forEach((key) => {
+        next[key] = structuredClone(this.initial[key]);
+      });
+    } else {
+      Object.assign(next, structuredClone(this.initial));
+    }
+    if (jsonEqual(prev, next)) return;
+    this.value = next;
+    const diff = {};
+    for (const key in next) {
+      if (!jsonEqual(next[key], prev[key])) diff[key] = next[key];
+    }
+    this.listeners.forEach((cb) => cb(this.value, prev, diff));
+  }
+  subscribe(cb) {
+    this.listeners.add(cb);
+    cb(this.value, this.value, {});
+    return () => this.listeners.delete(cb);
+  }
+  unsubscribe(cb) {
+    this.listeners.delete(cb);
+  }
+  patch(key, value) {
+    this.set({ [key]: value });
+  }
+  getKey(key) {
+    return this.value[key];
+  }
+  subscribeKey(key, cb) {
+    let prev = this.value[key];
+    const wrapper = (val) => {
+      if (!jsonEqual(val[key], prev)) {
+        prev = val[key];
+        cb(val[key]);
+      }
+    };
+    this.listeners.add(wrapper);
+    return () => this.listeners.delete(wrapper);
+  }
+};
+var initialStore = {
+  tabService: {
+    current: "",
+    all: []
+  },
+  activeEngine: "sing-box",
+  bandwidthWidget: {
+    loading: true,
+    failed: false,
+    data: { up: 0, down: 0 }
+  },
+  trafficTotalWidget: {
+    loading: true,
+    failed: false,
+    data: { downloadTotal: 0, uploadTotal: 0 }
+  },
+  systemInfoWidget: {
+    loading: true,
+    failed: false,
+    data: { connections: 0, memory: 0 }
+  },
+  servicesInfoWidget: {
+    loading: true,
+    failed: false,
+    data: {
+      singbox: 0,
+      tachyonRunning: 0,
+      tachyonEnabled: 0,
+      tachyonStatus: "",
+      watchdogRunning: 0
+    }
+  },
+  tailscaleWidget: {
+    loading: true,
+    failed: false,
+    data: null
+  },
+  sectionsWidget: {
+    loading: true,
+    failed: false,
+    latencyFetchingSections: {},
+    latencyProgressSections: {},
+    selectorSwitchingSections: {},
+    subscriptionUpdatingSections: {},
+    data: []
+  },
+  ...initialDiagnosticStore
+};
+var store = new StoreService(initialStore);
+
+// src/validators/validateVpnUrl.ts
+function supportsVpnUrl() {
+  const state = store.get();
+  const info = state.diagnosticsSystemInfo || {};
+  const engine = state.activeEngine || info.active_engine || "sing-box";
+  return engine === "sing-box" && (Number(info.sing_box_lx) === 1 || Number(info.sing_box_tachyon_core) === 1 || /-lx(?:[.-]|$)/.test(String(info.sing_box_version || "")) || /-tachyon(?:[.-]|$)/.test(String(info.sing_box_version || "")));
+}
+function validateVpnUrl(url) {
+  const invalid2 = () => ({
+    valid: false,
+    message: _("Invalid vpn:// link; use a WG/AWG .conf or Amnezia export")
+  });
+  const key32 = (value) => {
+    try {
+      const key = String(value || "").replace(/ /g, "+");
+      return /^[A-Za-z0-9+/]{43}=$/.test(key) && atob(key).length === 32;
+    } catch (_e) {
+      return false;
+    }
+  };
+  try {
+    if (url.startsWith("vpn://")) {
+      let payload = decodeURIComponent(url.slice(6).split("#")[0]);
+      if (payload.length > 131072 || !/^[A-Za-z0-9+/_-]*={0,2}$/.test(payload) || payload.length % 4 === 1)
+        return invalid2();
+      payload = payload.replace(/-/g, "+").replace(/_/g, "/");
+      while (payload.length % 4) payload += "=";
+      let text = atob(payload);
+      if (text.length >= 12 && text.charCodeAt(0) === 0) {
+        const size = text.charCodeAt(0) * 16777216 + text.charCodeAt(1) * 65536 + text.charCodeAt(2) * 256 + text.charCodeAt(3);
+        const cmf = text.charCodeAt(4), flg = text.charCodeAt(5);
+        if (!size || size > 65536 || (cmf & 15) !== 8 || cmf >> 4 > 7 || flg & 32 || (cmf * 256 + flg) % 31)
+          return invalid2();
+        return {
+          valid: true,
+          message: _("Amnezia export; full validation before apply")
+        };
+      }
+      if (text.length > 65536 || text.includes("\0")) return invalid2();
+      if (text.trim().startsWith("{")) {
+        const data = JSON.parse(text);
+        if (!Array.isArray(data.containers) || !data.containers.length || data.containers.length > 16)
+          return invalid2();
+        const choices = [];
+        for (const container of data.containers) {
+          if (!container || typeof container !== "object") return invalid2();
+          const kind = container.container;
+          const proto = ["amnezia-awg", "amnezia-awg2"].includes(kind) ? "awg" : kind === "amnezia-wireguard" ? "wireguard" : null;
+          if (!proto) continue;
+          let settings = container[proto];
+          if (typeof settings === "string") settings = JSON.parse(settings);
+          let last = settings?.last_config;
+          if (typeof last === "string") last = JSON.parse(last);
+          if (!last || typeof last.config !== "string") return invalid2();
+          choices.push({ kind, text: last.config });
+        }
+        const preferred = choices.filter(
+          (c) => c.kind === data.defaultContainer
+        );
+        if (!preferred.length && typeof data.defaultContainer === "string" && data.defaultContainer)
+          return invalid2();
+        if (preferred.length > 1 || !preferred.length && choices.length !== 1)
+          return invalid2();
+        text = (preferred[0] || choices[0]).text;
+        if (text.length > 65536 || text.includes("\0")) return invalid2();
+      }
+      let block = "", peers = 0, interfaces = 0;
+      const fields = {};
+      for (const raw of text.split("\n")) {
+        const line = raw.trim();
+        if (!line || line.startsWith("#")) continue;
+        if (line === "[Interface]") {
+          block = "interface";
+          interfaces++;
+          continue;
+        }
+        if (line === "[Peer]") {
+          block = "peer";
+          peers++;
+          continue;
+        }
+        if (line.startsWith("[")) return invalid2();
+        const eq = line.indexOf("=");
+        if (block && eq > 0)
+          fields[line.slice(0, eq).trim().toLowerCase()] = line.slice(eq + 1).trim();
+      }
+      const endpoint = (fields.endpoint || "").match(
+        /^(\[[^\]]+\]|[^:\s]+):(\d+)$/
+      );
+      if (interfaces !== 1 || peers !== 1 || !key32(fields.privatekey) || !key32(fields.publickey) || !fields.address || !endpoint || Number(endpoint[2]) < 1 || Number(endpoint[2]) > 65535 || fields.presharedkey && !key32(fields.presharedkey))
+        return invalid2();
+    }
+    return { valid: true, message: _("Valid") };
+  } catch (_e) {
+    return invalid2();
+  }
+}
+
 // src/validators/validateShadowsocksUrl.ts
 function validateShadowsocksUrl(url) {
   if (!url || !url.startsWith("ss://")) {
@@ -982,8 +1514,40 @@ function validateHttpProxyUrl(url) {
   return { valid: true, message: _("Valid") };
 }
 
+// src/validators/validateFptnUrl.ts
+function validateFptnUrl(url) {
+  const trimmed = url.trim();
+  const prefixes = ["fptnb://", "fptn://", "fptnb:", "fptn:"];
+  const prefix = prefixes.find((p) => trimmed.startsWith(p));
+  if (!prefix) {
+    return {
+      valid: false,
+      message: _("Invalid FPTN URL: must start with fptn: or fptnb:")
+    };
+  }
+  const body = trimmed.slice(prefix.length).split("#")[0].trim();
+  if (!body) {
+    return {
+      valid: false,
+      message: _("Invalid FPTN URL: missing token body")
+    };
+  }
+  const cleaned = body.replace(/[\s=]/g, "");
+  if (cleaned.length % 4 === 1 || !/^[A-Za-z0-9+/_-]+$/.test(cleaned)) {
+    return {
+      valid: false,
+      message: _("Invalid FPTN URL: invalid base64 token payload")
+    };
+  }
+  return { valid: true, message: _("Valid") };
+}
+
 // src/validators/validateProxyUrl.ts
 var DISPATCH = [
+  {
+    prefixes: ["fptnb://", "fptn://", "fptnb:", "fptn:"],
+    validate: validateFptnUrl
+  },
   { prefixes: ["ss://"], validate: validateShadowsocksUrl },
   { prefixes: ["vless://"], validate: validateVlessUrl },
   { prefixes: ["vmess://"], validate: validateVmessUrl },
@@ -998,6 +1562,14 @@ var DISPATCH = [
 ];
 function validateProxyUrl(url) {
   const trimmedUrl = url.trim();
+  if (trimmedUrl.startsWith("vpn://")) {
+    if (!supportsVpnUrl())
+      return {
+        valid: false,
+        message: _("vpn:// is available only with sing-box LX")
+      };
+    return validateVpnUrl(trimmedUrl);
+  }
   for (const { prefixes, validate } of DISPATCH) {
     for (const prefix of prefixes) {
       if (trimmedUrl.startsWith(prefix)) {
@@ -1008,8 +1580,8 @@ function validateProxyUrl(url) {
   return {
     valid: false,
     message: _(
-      "URL must start with vless://, vmess://, ss://, trojan://, socks4://, socks4a://, socks5://, http://, https://, hysteria2://, hy2://, or tuic://"
-    )
+      "URL must start with vless://, vmess://, ss://, trojan://, socks4://, socks4a://, socks5://, http://, https://, hysteria2://, hy2://, tuic://, fptn://, or fptn:"
+    ) + (supportsVpnUrl() ? "; vpn:// (LX)" : "")
   };
 }
 
@@ -1038,6 +1610,267 @@ function getProxyUrlName(url) {
 }
 
 // src/helpers/formatOutboundType.ts
+var BASE_PREFIX_PALETTES = [
+  { name: "Blue", bg: "#2563eb", color: "#ffffff", border: "#3b82f6" },
+  { name: "Green", bg: "#16a34a", color: "#ffffff", border: "#22c55e" },
+  { name: "Purple", bg: "#9333ea", color: "#ffffff", border: "#a855f7" },
+  { name: "Orange", bg: "#ea580c", color: "#ffffff", border: "#f97316" },
+  { name: "Cyan", bg: "#0891b2", color: "#ffffff", border: "#06b6d4" },
+  { name: "Rose", bg: "#e11d48", color: "#ffffff", border: "#f43f5e" },
+  { name: "Amber", bg: "#d97706", color: "#ffffff", border: "#f59e0b" },
+  { name: "Indigo", bg: "#4f46e5", color: "#ffffff", border: "#6366f1" },
+  { name: "Teal", bg: "#0d9488", color: "#ffffff", border: "#14b8a6" },
+  { name: "Dark", bg: "#1e293b", color: "#f8fafc", border: "#475569" }
+];
+var BASE_TEXT_COLORS = [
+  { name: "White", color: "#ffffff" },
+  { name: "Light Blue", color: "#bfdbfe" },
+  { name: "Light Green", color: "#bbf7d0" },
+  { name: "Light Yellow", color: "#fef08a" },
+  { name: "Light Pink", color: "#fbcfe8" },
+  { name: "Cyan", color: "#a5f3fc" },
+  { name: "Orange", color: "#fed7aa" },
+  { name: "Dark", color: "#0f172a" }
+];
+function getPrefixCustomColors() {
+  try {
+    return JSON.parse(
+      localStorage.getItem("tachyon_prefix_colors_v1") || "{}"
+    );
+  } catch {
+    return {};
+  }
+}
+function setPrefixCustomColor(prefix, style) {
+  try {
+    const map = getPrefixCustomColors();
+    if (!style) {
+      delete map[prefix];
+    } else {
+      map[prefix] = style;
+    }
+    localStorage.setItem("tachyon_prefix_colors_v1", JSON.stringify(map));
+  } catch {
+  }
+}
+function resolvePrefixBadgeStyle(prefix) {
+  const customMap = getPrefixCustomColors();
+  const key = (prefix || "").trim();
+  const uciMap = typeof window !== "undefined" && window.__tachyonUciPrefixStyles ? window.__tachyonUciPrefixStyles[key] : void 0;
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) {
+    hash = hash * 31 + key.charCodeAt(i) >>> 0;
+  }
+  const base = BASE_PREFIX_PALETTES[hash % BASE_PREFIX_PALETTES.length];
+  const localCustom = customMap[key];
+  if (localCustom && (localCustom.bg || localCustom.color)) {
+    return {
+      name: "Custom",
+      bg: localCustom.bg || uciMap?.bg || base.bg,
+      color: localCustom.color || uciMap?.color || base.color,
+      border: localCustom.border || localCustom.bg || uciMap?.bg || base.border
+    };
+  }
+  if (uciMap && (uciMap.bg || uciMap.color)) {
+    return {
+      name: "UCI",
+      bg: uciMap.bg || base.bg,
+      color: uciMap.color || base.color,
+      border: uciMap.bg || base.border
+    };
+  }
+  return base;
+}
+function openPrefixColorPickerModal(prefix, event) {
+  if (event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+  const key = (prefix || "").trim();
+  if (!key || typeof ui === "undefined" || !ui.showModal) return;
+  const current = resolvePrefixBadgeStyle(key);
+  let selectedBg = current.bg;
+  let selectedColor = current.color;
+  const previewBadge = E(
+    "span",
+    {
+      class: "tachyon_dashboard-page__outbound-grid__item__prefix-badge",
+      style: `background: ${selectedBg}; color: ${selectedColor}; border: 1px solid ${selectedBg}; font-size: 13px; padding: 3px 10px; font-weight: 600;`
+    },
+    key
+  );
+  const bgInput = E("input", {
+    type: "color",
+    value: selectedBg.startsWith("#") ? selectedBg : "#2563eb",
+    style: "width: 44px; height: 30px; padding: 0; border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; cursor: pointer;",
+    change: (ev) => {
+      selectedBg = ev.target.value;
+      updatePreview();
+    }
+  });
+  const colorInput = E("input", {
+    type: "color",
+    value: selectedColor.startsWith("#") ? selectedColor : "#ffffff",
+    style: "width: 44px; height: 30px; padding: 0; border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; cursor: pointer;",
+    change: (ev) => {
+      selectedColor = ev.target.value;
+      updatePreview();
+    }
+  });
+  function updatePreview() {
+    previewBadge.style.background = selectedBg;
+    previewBadge.style.color = selectedColor;
+    previewBadge.style.borderColor = selectedBg;
+  }
+  function applyLiveToDom(bg, color) {
+    document.querySelectorAll(
+      ".tachyon_dashboard-page__outbound-grid__item__prefix-badge"
+    ).forEach((el) => {
+      if ((el.textContent || "").trim() === key) {
+        const htmlEl = el;
+        htmlEl.style.background = bg;
+        htmlEl.style.color = color;
+        htmlEl.style.borderColor = bg;
+      }
+    });
+  }
+  ui.showModal(_("Customize prefix color:") + " " + key, [
+    E(
+      "div",
+      {
+        style: "margin-bottom: 14px; display: flex; align-items: center; gap: 10px;"
+      },
+      [E("span", { style: "font-weight: 500;" }, _("Preview:")), previewBadge]
+    ),
+    E("div", { style: "margin-bottom: 12px;" }, [
+      E(
+        "div",
+        { style: "font-weight: 500; margin-bottom: 6px;" },
+        _("Background color presets:")
+      ),
+      E(
+        "div",
+        { style: "display: flex; flex-wrap: wrap; gap: 6px;" },
+        BASE_PREFIX_PALETTES.map(
+          (p) => E(
+            "button",
+            {
+              type: "button",
+              class: "btn",
+              style: `background: ${p.bg}; color: ${p.color}; border: 1px solid ${p.border}; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer;`,
+              click: () => {
+                selectedBg = p.bg;
+                selectedColor = p.color;
+                bgInput.value = p.bg;
+                colorInput.value = p.color;
+                updatePreview();
+              }
+            },
+            p.name
+          )
+        )
+      )
+    ]),
+    E("div", { style: "margin-bottom: 12px;" }, [
+      E(
+        "div",
+        { style: "font-weight: 500; margin-bottom: 6px;" },
+        _("Text color presets:")
+      ),
+      E(
+        "div",
+        { style: "display: flex; flex-wrap: wrap; gap: 6px;" },
+        BASE_TEXT_COLORS.map(
+          (t) => E(
+            "button",
+            {
+              type: "button",
+              class: "btn",
+              style: `background: #334155; color: ${t.color}; border: 1px solid rgba(255,255,255,0.2); padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer;`,
+              click: () => {
+                selectedColor = t.color;
+                colorInput.value = t.color;
+                updatePreview();
+              }
+            },
+            t.name
+          )
+        )
+      )
+    ]),
+    E(
+      "div",
+      {
+        style: "display: flex; align-items: center; gap: 16px; margin-bottom: 16px;"
+      },
+      [
+        E(
+          "label",
+          {
+            style: "display: flex; align-items: center; gap: 6px; cursor: pointer;"
+          },
+          [_("Background:"), bgInput]
+        ),
+        E(
+          "label",
+          {
+            style: "display: flex; align-items: center; gap: 6px; cursor: pointer;"
+          },
+          [_("Text:"), colorInput]
+        )
+      ]
+    ),
+    E(
+      "div",
+      {
+        class: "right",
+        style: "display: flex; justify-content: flex-end; gap: 8px;"
+      },
+      [
+        E(
+          "button",
+          {
+            type: "button",
+            class: "btn",
+            click: () => {
+              setPrefixCustomColor(key, null);
+              const def = resolvePrefixBadgeStyle(key);
+              applyLiveToDom(def.bg, def.color);
+              ui.hideModal();
+            }
+          },
+          _("Reset to default")
+        ),
+        E(
+          "button",
+          {
+            type: "button",
+            class: "btn",
+            click: () => ui.hideModal()
+          },
+          _("Cancel")
+        ),
+        E(
+          "button",
+          {
+            type: "button",
+            class: "btn cbi-button-action important",
+            click: () => {
+              setPrefixCustomColor(key, {
+                bg: selectedBg,
+                color: selectedColor,
+                border: selectedBg
+              });
+              applyLiveToDom(selectedBg, selectedColor);
+              ui.hideModal();
+            }
+          },
+          _("Save")
+        )
+      ]
+    )
+  ]);
+}
 function formatOutboundType(type, transport) {
   const cleanType = (type || "").trim();
   const cleanTransport = (transport || "").trim().toUpperCase();
@@ -1051,6 +1884,86 @@ function formatOutboundType(type, transport) {
     return cleanType;
   }
   return `${cleanType} (${cleanTransport})`;
+}
+function parseNodeProtocolBreakdown(type, transport, details) {
+  const base = formatOutboundType(type, transport);
+  const rawParts = (details || "").split("·").map((s) => s.trim()).filter(Boolean);
+  const rows = [];
+  const proto = (type || "").trim().toUpperCase();
+  if (proto) {
+    rows.push({ label: "Protocol", value: proto });
+  }
+  const seen = /* @__PURE__ */ new Set();
+  for (const part of rawParts) {
+    const low = part.toLowerCase();
+    if (seen.has(low)) continue;
+    seen.add(low);
+    if (low === proto.toLowerCase()) continue;
+    if (low === "reality" || low === "tls" || low === "none" || low.startsWith("reality")) {
+      rows.push({ label: "Security", value: part.toUpperCase() });
+    } else if (low.startsWith("xtls-") || low.startsWith("flow:")) {
+      rows.push({ label: "Flow", value: part.replace(/^flow:\s*/i, "") });
+    } else if (low.startsWith("xhttp") || low === "ws" || low === "grpc" || low === "http" || low === "httpupgrade" || low === "quic" || low === "tcp") {
+      rows.push({ label: "Transport", value: part });
+    } else if (low.startsWith("xmux")) {
+      rows.push({
+        label: "XMUX",
+        value: part.replace(/^xmux\s*\((.*)\)$/i, "$1")
+      });
+    } else if (low.startsWith("utls:")) {
+      rows.push({ label: "uTLS Fingerprint", value: part.slice(5).trim() });
+    } else if (low.startsWith("alpn:")) {
+      rows.push({ label: "ALPN", value: part.slice(5).trim() });
+    } else if (low.startsWith("sni:")) {
+      rows.push({ label: "SNI / Host", value: part.slice(4).trim() });
+    } else if (low.startsWith("pin:")) {
+      rows.push({ label: "Pinning", value: part.slice(4).trim() });
+    } else if (low.startsWith("mux:")) {
+      rows.push({ label: "Multiplex", value: part.slice(4).trim() });
+    } else if (low.startsWith(":")) {
+      rows.push({ label: "Port", value: part.slice(1).trim() });
+    } else {
+      rows.push({ label: "Info", value: part });
+    }
+  }
+  if (!rows.some((r) => r.label === "Transport") && transport && transport.toLowerCase() !== proto.toLowerCase()) {
+    rows.push({ label: "Transport", value: transport.toUpperCase() });
+  }
+  return { base, rows };
+}
+function formatOutboundTypeTooltip(type, transport, details) {
+  const { base, rows } = parseNodeProtocolBreakdown(type, transport, details);
+  if (!rows.length) return base;
+  return [base, ...rows.map((r) => `${r.label}: ${r.value}`)].join("\n");
+}
+function renderProtocolPopoverNodes(type, transport, details) {
+  const { base, rows } = parseNodeProtocolBreakdown(type, transport, details);
+  if (rows.length <= 1 && !details) {
+    return null;
+  }
+  return E("div", { class: "tachyon_proto-popover" }, [
+    E("div", { class: "tachyon_proto-popover__header" }, base),
+    ...rows.map(
+      (r) => E("div", { class: "tachyon_proto-popover__row" }, [
+        E("span", { class: "tachyon_proto-popover__label" }, `${r.label}:`),
+        E("span", { class: "tachyon_proto-popover__val" }, r.value)
+      ])
+    )
+  ]);
+}
+function renderOutboundTypeWithPopover(type, transport, details, className, extraSuffix) {
+  const baseType = formatOutboundType(type, transport);
+  const labelText = extraSuffix ? `${baseType} ${extraSuffix}` : baseType;
+  const popover = renderProtocolPopoverNodes(type, transport, details);
+  const tooltip = formatOutboundTypeTooltip(type, transport, details);
+  return E(
+    "span",
+    {
+      class: [className || "", popover ? "tachyon_proto-popover-trigger" : ""].filter(Boolean).join(" "),
+      title: popover ? void 0 : tooltip
+    },
+    [E("span", {}, labelText), ...popover ? [popover] : []]
+  );
 }
 
 // src/helpers/getProxyUrlTransport.ts
@@ -1373,11 +2286,11 @@ function getTarget(target) {
 }
 async function onMount(target) {
   return new Promise((resolve) => {
-    let observer = null;
+    let observer2 = null;
     const resolveIfMountedAndVisible = () => {
       const mountedTarget = getTarget(target);
       if (mountedTarget && mountedTarget.isConnected && mountedTarget.offsetParent !== null) {
-        observer?.disconnect();
+        observer2?.disconnect();
         resolve(mountedTarget);
         return true;
       }
@@ -1386,10 +2299,10 @@ async function onMount(target) {
     if (resolveIfMountedAndVisible()) {
       return;
     }
-    observer = new MutationObserver(() => {
+    observer2 = new MutationObserver(() => {
       resolveIfMountedAndVisible();
     });
-    observer.observe(document.body, {
+    observer2.observe(document.body, {
       childList: true,
       subtree: true,
       attributes: true,
@@ -1442,7 +2355,7 @@ function insertIf(condition, elements) {
 }
 
 // src/helpers/isCopyableProxyLink.ts
-var COPYABLE_PROXY_URI_RE = /^(vless|vmess|trojan|ss|ssr|hysteria2|hy2|tuic|socks4|socks4a|socks5|http|https):\/\//i;
+var COPYABLE_PROXY_URI_RE = /^(vless|vmess|trojan|ss|ssr|hysteria2|hy2|tuic|anytls|shadowtls|naive|socks4|socks4a|socks5|http|https|vpn):\/\/|^fptn[b]?(:|\/\/)/i;
 function isCopyableProxyLink(link) {
   return COPYABLE_PROXY_URI_RE.test((link || "").trim());
 }
@@ -1833,6 +2746,7 @@ var CONNECTION_ACTION_LABELS = {
   anytls: "AnyTLS",
   snell: "Snell",
   mieru: "Mieru",
+  naive: "NaiveProxy",
   sudoku: "Sudoku",
   masque: "MASQUE",
   openvpn: "OpenVPN",
@@ -2029,109 +2943,124 @@ function renderDefaultState({
     "anytls",
     "snell",
     "mieru",
+    "naive",
     "sudoku",
     "masque",
     "openvpn"
   ].includes(section.action || "");
-  const isServiceNode = ["zapret", "zapret2", "byedpi", "wdtt", "olcrtc", "fptn"].includes(
+  const isServiceNode = ["zapret", "zapret2", "byedpi", "wdtt", "olcrtc"].includes(
     section.action || ""
   ) || Boolean(section.serviceStatus);
   if (isServiceNode) {
     const ss = section.serviceStatus;
-    const serviceType = ss?.serviceType || (["zapret", "zapret2", "byedpi", "wdtt", "olcrtc", "fptn"].includes(
+    const serviceType = ss?.serviceType || (["zapret", "zapret2", "byedpi", "wdtt", "olcrtc"].includes(
       section.action || ""
     ) ? section.action : "zapret");
     const typeLabel = serviceType === "zapret" ? "Zapret" : serviceType === "zapret2" ? "Zapret2" : serviceType === "byedpi" ? "ByeDPI" : serviceType === "wdtt" ? "WDTT" : serviceType === "olcrtc" ? "OlcRTC" : "FPTN";
     const statusColor = ss ? ss.ready ? "var(--success-color-medium, green)" : ss.conflict ? "var(--error-color-medium, red)" : ss.configured ? "var(--warn-color-medium, orange)" : "var(--primary-color-low, lightgray)" : "var(--primary-color-low, lightgray)";
     const statusText = ss ? ss.ready ? _("Running") : ss.conflict ? _("Conflict") : ss.configured ? _("Stopped") : _("Not configured") : _("Unknown");
-    return E("div", { class: "tachyon_dashboard-page__outbound-section" }, [
-      E(
-        "div",
-        {
-          class: "tachyon_dashboard-page__outbound-section__title-section",
-          style: "cursor: default;"
-        },
-        [
-          E(
-            "div",
-            {
-              class: "tachyon_dashboard-page__outbound-section__title-section__title",
-              style: "display: flex; align-items: center; gap: 8px;"
-            },
-            [
-              E("span", {}, section.displayName),
-              E(
-                "span",
-                {
-                  style: "font-size: 12px; opacity: 0.6; font-weight: normal;"
-                },
-                typeLabel
-              )
-            ]
-          )
-        ]
-      ),
-      E(
-        "div",
-        {
-          style: "display: flex; flex-wrap: wrap; gap: 16px; padding: 8px 16px 12px;"
-        },
-        [
-          E("div", { style: "display: flex; align-items: center; gap: 6px;" }, [
+    return E(
+      "div",
+      {
+        class: [
+          "tachyon_dashboard-page__outbound-section",
+          section.configError ? "tachyon_dashboard-page__outbound-section--error" : ""
+        ].filter(Boolean).join(" ")
+      },
+      [
+        E(
+          "div",
+          {
+            class: "tachyon_dashboard-page__outbound-section__title-section",
+            style: "cursor: default;"
+          },
+          [
             E(
-              "span",
-              { style: "opacity: 0.7; font-size: 13px;" },
-              _("Status") + ":"
-            ),
-            E(
-              "span",
+              "div",
               {
-                style: `font-size: 13px; font-weight: 500; color: ${statusColor};`
+                class: "tachyon_dashboard-page__outbound-section__title-section__title",
+                style: "display: flex; align-items: center; gap: 8px;"
               },
-              statusText
+              [
+                E("span", {}, section.displayName),
+                renderConfigErrorBadge(section),
+                E(
+                  "span",
+                  {
+                    style: "font-size: 12px; opacity: 0.6; font-weight: normal;"
+                  },
+                  typeLabel
+                )
+              ]
             )
-          ]),
-          ss && ss.restartCount > 0 ? E(
-            "div",
-            { style: "display: flex; align-items: center; gap: 6px;" },
-            [
-              E(
-                "span",
-                { style: "opacity: 0.7; font-size: 13px;" },
-                _("Restarts") + ":"
-              ),
-              E(
-                "span",
-                {
-                  style: "font-size: 13px; font-weight: 500; color: var(--warn-color-medium, orange);"
-                },
-                `${ss.restartCount}`
-              )
-            ]
-          ) : "",
-          ss && ss.unstable ? E(
-            "div",
-            { style: "display: flex; align-items: center; gap: 6px;" },
-            [
-              E(
-                "span",
-                {
-                  style: "font-size: 13px; font-weight: 500; color: var(--error-color-medium, red);"
-                },
-                _("Unstable")
-              )
-            ]
-          ) : ""
-        ]
-      ),
-      ss?.statusMessage ? E(
-        "div",
-        {
-          style: "padding: 0 16px 8px; font-size: 12px; opacity: 0.6; word-break: break-word;"
-        },
-        formatServiceStatusMessage(ss.statusMessage)
-      ) : ""
-    ]);
+          ]
+        ),
+        E(
+          "div",
+          {
+            style: "display: flex; flex-wrap: wrap; gap: 16px; padding: 8px 16px 12px;"
+          },
+          [
+            E(
+              "div",
+              { style: "display: flex; align-items: center; gap: 6px;" },
+              [
+                E(
+                  "span",
+                  { style: "opacity: 0.7; font-size: 13px;" },
+                  _("Status") + ":"
+                ),
+                E(
+                  "span",
+                  {
+                    style: `font-size: 13px; font-weight: 500; color: ${statusColor};`
+                  },
+                  statusText
+                )
+              ]
+            ),
+            ss && ss.restartCount > 0 ? E(
+              "div",
+              { style: "display: flex; align-items: center; gap: 6px;" },
+              [
+                E(
+                  "span",
+                  { style: "opacity: 0.7; font-size: 13px;" },
+                  _("Restarts") + ":"
+                ),
+                E(
+                  "span",
+                  {
+                    style: "font-size: 13px; font-weight: 500; color: var(--warn-color-medium, orange);"
+                  },
+                  `${ss.restartCount}`
+                )
+              ]
+            ) : "",
+            ss && ss.unstable ? E(
+              "div",
+              { style: "display: flex; align-items: center; gap: 6px;" },
+              [
+                E(
+                  "span",
+                  {
+                    style: "font-size: 13px; font-weight: 500; color: var(--error-color-medium, red);"
+                  },
+                  _("Unstable")
+                )
+              ]
+            ) : ""
+          ]
+        ),
+        ss?.statusMessage ? E(
+          "div",
+          {
+            style: "padding: 0 16px 8px; font-size: 12px; opacity: 0.6; word-break: break-word;"
+          },
+          formatServiceStatusMessage(ss.statusMessage)
+        ) : ""
+      ]
+    );
   }
   function testLatency() {
     if (section.withTagSelect) {
@@ -2251,8 +3180,8 @@ function renderDefaultState({
     const isManualUrlTest = Boolean(outbound.urlTestInfo?.isManualSelection);
     const isManualPriority = Boolean(outbound.priorityInfo?.isManualSelection);
     const activeServerName = outbound.urlTestInfo?.selectedName || outbound.priorityInfo?.selectedName || "";
-    const baseType = formatOutboundType(outbound.type, outbound.transport);
-    const typeLabel = isManualUrlTest || isManualPriority ? `${baseType} (${_("Manual")})` : outbound.urlTestInfo || outbound.priorityInfo ? `${baseType} (${_("Auto")})` : baseType;
+    const modeSuffix = isManualUrlTest || isManualPriority ? `(${_("Manual")})` : outbound.urlTestInfo || outbound.priorityInfo ? `(${_("Auto")})` : "";
+    const prefixStyle = outbound.prefix ? resolvePrefixBadgeStyle(outbound.prefix) : null;
     return E(
       "div",
       {
@@ -2289,10 +3218,13 @@ function renderDefaultState({
               },
               [
                 E("b", {}, renderFlagEmojis(outbound.displayName)),
-                outbound.prefix ? E(
+                outbound.prefix && prefixStyle ? E(
                   "span",
                   {
-                    class: "tachyon_dashboard-page__outbound-grid__item__prefix-badge"
+                    class: "tachyon_dashboard-page__outbound-grid__item__prefix-badge",
+                    style: `background: ${prefixStyle.bg}; color: ${prefixStyle.color}; border: 1px solid ${prefixStyle.border}; font-weight: 600; cursor: pointer;`,
+                    title: _("Click to customize prefix colors"),
+                    click: (event) => openPrefixColorPickerModal(outbound.prefix, event)
                   },
                   renderFlagEmojis(outbound.prefix)
                 ) : ""
@@ -2363,10 +3295,12 @@ function renderDefaultState({
           "div",
           { class: "tachyon_dashboard-page__outbound-grid__item__footer" },
           [
-            E(
-              "div",
-              { class: "tachyon_dashboard-page__outbound-grid__item__type" },
-              typeLabel
+            renderOutboundTypeWithPopover(
+              outbound.type,
+              outbound.transport,
+              outbound.details,
+              "tachyon_dashboard-page__outbound-grid__item__type",
+              modeSuffix
             ),
             E(
               "div",
@@ -2403,178 +3337,202 @@ function renderDefaultState({
     onUpdateSubscription
   );
   const canTestLatency = !isServiceNode && (section.withTagSelect || section.outbounds && section.outbounds.length > 0);
-  return E("div", { class: "tachyon_dashboard-page__outbound-section" }, [
-    // Title with test latency
-    E(
-      "div",
-      {
-        class: "tachyon_dashboard-page__outbound-section__title-section",
-        click: (e) => {
-          if (e.target && e.target.closest("button")) return;
-          onToggleCollapse?.();
+  return E(
+    "div",
+    {
+      class: [
+        "tachyon_dashboard-page__outbound-section",
+        section.configError ? "tachyon_dashboard-page__outbound-section--error" : ""
+      ].filter(Boolean).join(" ")
+    },
+    [
+      // Title with test latency
+      E(
+        "div",
+        {
+          class: "tachyon_dashboard-page__outbound-section__title-section",
+          click: (e) => {
+            if (e.target && e.target.closest("button")) return;
+            onToggleCollapse?.();
+          },
+          style: "cursor: pointer; user-select: none;"
         },
-        style: "cursor: pointer; user-select: none;"
-      },
-      [
-        E(
-          "div",
-          {
-            class: "tachyon_dashboard-page__outbound-section__title-section__title",
-            style: "display: flex; align-items: center; gap: 8px;"
-          },
-          [
-            svgEl(
-              "svg",
-              {
-                width: "16",
-                height: "16",
-                viewBox: "0 0 24 24",
-                fill: "none",
-                stroke: "currentColor",
-                "stroke-width": "2",
-                "stroke-linecap": "round",
-                "stroke-linejoin": "round",
-                style: `transition: transform 0.2s; transform: rotate(${isCollapsed ? "-90deg" : "0deg"})`
-              },
-              [svgEl("polyline", { points: "6 9 12 15 18 9" })]
-            ),
-            E("span", {}, section.displayName),
-            isCollapsed ? (() => {
-              const selectedOutbound = section.outbounds.find(
-                (o) => o.selected
-              );
-              if (!selectedOutbound) return "";
-              const isConnectionNode2 = [
-                "vpn",
-                "awg",
-                "warp",
-                "anytls",
-                "snell",
-                "mieru",
-                "sudoku",
-                "masque",
-                "openvpn"
-              ].includes(section.action || "");
-              const connectionTitle = section.action && CONNECTION_ACTION_LABELS[section.action] || selectedOutbound.displayName;
-              function getLatencyColor() {
-                if (isConnectionNode2) {
-                  if (latencyFetching)
-                    return "var(--warn-color-medium, orange)";
-                  if (selectedOutbound.latency === -1)
-                    return "var(--error-color-medium, red)";
-                  if (selectedOutbound.latency && selectedOutbound.latency > 0) {
-                    if (selectedOutbound.latency < 800)
-                      return "var(--success-color-medium, green)";
-                    if (selectedOutbound.latency < 1500)
+        [
+          E(
+            "div",
+            {
+              class: "tachyon_dashboard-page__outbound-section__title-section__title",
+              style: "display: flex; align-items: center; gap: 8px;"
+            },
+            [
+              svgEl(
+                "svg",
+                {
+                  width: "16",
+                  height: "16",
+                  viewBox: "0 0 24 24",
+                  fill: "none",
+                  stroke: "currentColor",
+                  "stroke-width": "2",
+                  "stroke-linecap": "round",
+                  "stroke-linejoin": "round",
+                  style: `transition: transform 0.2s; transform: rotate(${isCollapsed ? "-90deg" : "0deg"})`
+                },
+                [svgEl("polyline", { points: "6 9 12 15 18 9" })]
+              ),
+              E("span", {}, section.displayName),
+              renderConfigErrorBadge(section),
+              isCollapsed ? (() => {
+                const selectedOutbound = section.outbounds.find(
+                  (o) => o.selected
+                );
+                if (!selectedOutbound) return "";
+                const isConnectionNode2 = [
+                  "vpn",
+                  "awg",
+                  "warp",
+                  "anytls",
+                  "snell",
+                  "mieru",
+                  "naive",
+                  "sudoku",
+                  "masque",
+                  "openvpn"
+                ].includes(section.action || "");
+                const connectionTitle = section.action && CONNECTION_ACTION_LABELS[section.action] || selectedOutbound.displayName;
+                function getLatencyColor() {
+                  if (isConnectionNode2) {
+                    if (latencyFetching)
                       return "var(--warn-color-medium, orange)";
-                    return "var(--error-color-medium, red)";
-                  }
-                  return selectedOutbound.runtimeAvailable ? "var(--success-color-medium, green)" : "var(--error-color-medium, red)";
-                }
-                if (!selectedOutbound.latency)
-                  return "var(--primary-color-low, lightgray)";
-                if (selectedOutbound.latency === -1 || selectedOutbound.latency < 0)
-                  return "var(--error-color-medium, red)";
-                if (selectedOutbound.latency < 800)
-                  return "var(--success-color-medium, green)";
-                if (selectedOutbound.latency < 1500)
-                  return "var(--warn-color-medium, orange)";
-                return "var(--error-color-medium, red)";
-              }
-              let latencyText = "";
-              if (isConnectionNode2) {
-                latencyText = latencyFetching ? _("Checking...") : selectedOutbound.latency && selectedOutbound.latency > 0 ? `${selectedOutbound.latency}ms` : selectedOutbound.latency === -1 || selectedOutbound.latency < 0 ? _("Not responding") : selectedOutbound.runtimeAvailable ? _("Connected") : _("Not connected");
-              } else {
-                latencyText = selectedOutbound.latency && selectedOutbound.latency > 0 ? `${selectedOutbound.latency}ms` : selectedOutbound.latency === -1 || selectedOutbound.latency < 0 ? _("Not responding") : "";
-              }
-              return E(
-                "span",
-                {
-                  style: "font-size: 13px; font-weight: normal; margin-left: 8px; display: inline-flex; align-items: center; gap: 6px;"
-                },
-                [
-                  E(
-                    "span",
-                    { style: "opacity: 0.7;" },
-                    isConnectionNode2 ? connectionTitle : selectedOutbound.prefix || selectedOutbound.displayName
-                  ),
-                  latencyText ? E(
-                    "span",
-                    { style: `color: ${getLatencyColor()};` },
-                    latencyText
-                  ) : ""
-                ]
-              );
-            })() : isConnectionNode ? (() => {
-              const selectedOutbound = section.outbounds.find(
-                (o) => o.selected
-              );
-              if (!selectedOutbound) return "";
-              const connectionTitle = section.action && CONNECTION_ACTION_LABELS[section.action] || selectedOutbound.displayName;
-              if (section.displayName.toLowerCase().trim() === connectionTitle.toLowerCase().trim()) {
-                return "";
-              }
-              return E(
-                "span",
-                {
-                  style: "font-size: 13px; font-weight: normal; margin-left: 8px; opacity: 0.7;"
-                },
-                connectionTitle
-              );
-            })() : ""
-          ]
-        ),
-        E(
-          "div",
-          {
-            class: "tachyon_dashboard-page__outbound-section__title-section__actions"
-          },
-          [
-            ...subscriptionUpdateAction ? [subscriptionUpdateAction] : [],
-            ...canTestLatency ? [
-              E(
-                "button",
-                {
-                  type: "button",
-                  class: "btn dashboard-sections-grid-item-test-latency",
-                  "data-latency-section": section.sectionName,
-                  disabled: latencyFetching ? true : void 0,
-                  click: (event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    if (latencyFetching) {
-                      return;
+                    if (selectedOutbound.latency === -1)
+                      return "var(--error-color-medium, red)";
+                    if (selectedOutbound.latency && selectedOutbound.latency > 0) {
+                      if (selectedOutbound.latency < 800)
+                        return "var(--success-color-medium, green)";
+                      if (selectedOutbound.latency < 1500)
+                        return "var(--warn-color-medium, orange)";
+                      return "var(--error-color-medium, red)";
                     }
-                    testLatency();
+                    return selectedOutbound.runtimeAvailable ? "var(--success-color-medium, green)" : "var(--error-color-medium, red)";
                   }
-                },
-                latencyFetching ? [
-                  renderLoaderCircleIcon24(),
-                  E(
+                  if (!selectedOutbound.latency)
+                    return "var(--primary-color-low, lightgray)";
+                  if (selectedOutbound.latency === -1 || selectedOutbound.latency < 0)
+                    return "var(--error-color-medium, red)";
+                  if (selectedOutbound.latency < 800)
+                    return "var(--success-color-medium, green)";
+                  if (selectedOutbound.latency < 1500)
+                    return "var(--warn-color-medium, orange)";
+                  return "var(--error-color-medium, red)";
+                }
+                let latencyText = "";
+                if (isConnectionNode2) {
+                  latencyText = latencyFetching ? _("Checking...") : selectedOutbound.latency && selectedOutbound.latency > 0 ? `${selectedOutbound.latency}ms` : selectedOutbound.latency === -1 || selectedOutbound.latency < 0 ? _("Not responding") : selectedOutbound.runtimeAvailable ? _("Connected") : _("Not connected");
+                } else {
+                  latencyText = selectedOutbound.latency && selectedOutbound.latency > 0 ? `${selectedOutbound.latency}ms` : selectedOutbound.latency === -1 || selectedOutbound.latency < 0 ? _("Not responding") : "";
+                }
+                return E(
+                  "span",
+                  {
+                    style: "font-size: 13px; font-weight: normal; margin-left: 8px; display: inline-flex; align-items: center; gap: 6px;"
+                  },
+                  [
+                    E(
+                      "span",
+                      { style: "opacity: 0.7;" },
+                      isConnectionNode2 ? connectionTitle : selectedOutbound.prefix || selectedOutbound.displayName
+                    ),
+                    latencyText ? E(
+                      "span",
+                      { style: `color: ${getLatencyColor()};` },
+                      latencyText
+                    ) : ""
+                  ]
+                );
+              })() : isConnectionNode ? (() => {
+                const selectedOutbound = section.outbounds.find(
+                  (o) => o.selected
+                );
+                if (!selectedOutbound) return "";
+                const connectionTitle = section.action && CONNECTION_ACTION_LABELS[section.action] || selectedOutbound.displayName;
+                if (section.displayName.toLowerCase().trim() === connectionTitle.toLowerCase().trim()) {
+                  return "";
+                }
+                return E(
+                  "span",
+                  {
+                    style: "font-size: 13px; font-weight: normal; margin-left: 8px; opacity: 0.7;"
+                  },
+                  connectionTitle
+                );
+              })() : ""
+            ]
+          ),
+          E(
+            "div",
+            {
+              class: "tachyon_dashboard-page__outbound-section__title-section__actions"
+            },
+            [
+              ...subscriptionUpdateAction ? [subscriptionUpdateAction] : [],
+              ...canTestLatency ? [
+                E(
+                  "button",
+                  {
+                    type: "button",
+                    class: "btn dashboard-sections-grid-item-test-latency",
+                    "data-latency-section": section.sectionName,
+                    disabled: latencyFetching ? true : void 0,
+                    click: (event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      if (latencyFetching) {
+                        return;
+                      }
+                      testLatency();
+                    }
+                  },
+                  latencyFetching ? [
+                    renderLoaderCircleIcon24(),
+                    E(
+                      "span",
+                      {
+                        class: "dashboard-sections-grid-item-test-latency__label"
+                      },
+                      isConnectionNode ? _("Checking...") : getLatencyTestLabel(latencyProgress)
+                    )
+                  ] : E(
                     "span",
                     {
                       class: "dashboard-sections-grid-item-test-latency__label"
                     },
-                    isConnectionNode ? _("Checking...") : getLatencyTestLabel(latencyProgress)
+                    isConnectionNode ? _("Check Connection") : _("Test latency")
                   )
-                ] : E(
-                  "span",
-                  {
-                    class: "dashboard-sections-grid-item-test-latency__label"
-                  },
-                  isConnectionNode ? _("Check Connection") : _("Test latency")
                 )
-              )
-            ] : []
-          ]
-        )
-      ]
-    ),
-    !isCollapsed ? E("div", { class: "tachyon_dashboard-page__outbound-grid" }, [
-      ...metadataNodes,
-      ...section.outbounds.map((outbound) => renderOutbound(outbound))
-    ]) : ""
-  ]);
+              ] : []
+            ]
+          )
+        ]
+      ),
+      !isCollapsed ? E("div", { class: "tachyon_dashboard-page__outbound-grid" }, [
+        ...metadataNodes,
+        ...section.outbounds.map((outbound) => renderOutbound(outbound))
+      ]) : ""
+    ]
+  );
+}
+function renderConfigErrorBadge(section) {
+  if (!section.configError) {
+    return "";
+  }
+  return E(
+    "span",
+    {
+      class: "tachyon_dashboard-page__outbound-section__config-error-badge",
+      title: section.configError
+    },
+    _("Has errors")
+  );
 }
 function renderSections(props) {
   if (props.failed) {
@@ -3112,12 +4070,15 @@ var Tachyon;
     AvailableMethods2["FUZZER_STRATEGIES"] = "fuzzer_strategies";
     AvailableMethods2["FUZZER_UPDATE_PRESETS"] = "fuzzer_update_presets";
     AvailableMethods2["GENERATE_REALITY_KEYPAIR"] = "generate_reality_keypair";
+    AvailableMethods2["GENERATE_TLS_KEYPAIR"] = "generate_tls_keypair";
     AvailableMethods2["GENERATE_WARP"] = "generate_warp";
+    AvailableMethods2["GENERATE_WG_KEYPAIR"] = "generate_wg_keypair";
     AvailableMethods2["GET_BYEDPI_STATUS"] = "get_byedpi_status";
     AvailableMethods2["GET_ENGINE_STATUS"] = "get_engine_status";
     AvailableMethods2["GET_FPTN_STATUS"] = "get_fptn_status";
     AvailableMethods2["GET_OLCRTC_STATUS"] = "get_olcrtc_status";
     AvailableMethods2["GET_OUTBOUND_METADATA"] = "get_outbound_metadata";
+    AvailableMethods2["GET_ROUTER_NETWORK_ENV"] = "get_router_network_env";
     AvailableMethods2["GET_SERVER_CAPABILITIES"] = "get_server_capabilities";
     AvailableMethods2["GET_SING_BOX_STATUS"] = "get_sing_box_status";
     AvailableMethods2["GET_STATUS"] = "get_status";
@@ -3189,6 +4150,9 @@ var Tachyon;
     AvailableMethods2["SHOW_SING_BOX_VERSION"] = "show_sing_box_version";
     AvailableMethods2["SHOW_VERSION"] = "show_version";
     AvailableMethods2["SNAPSHOT_DELETE"] = "snapshot_delete";
+    AvailableMethods2["SNAPSHOT_DIFF"] = "snapshot_diff";
+    AvailableMethods2["SNAPSHOT_EXPORT"] = "snapshot_export";
+    AvailableMethods2["SNAPSHOT_IMPORT"] = "snapshot_import";
     AvailableMethods2["SNAPSHOT_LIST"] = "snapshot_list";
     AvailableMethods2["SNAPSHOT_RESTORE"] = "snapshot_restore";
     AvailableMethods2["SNAPSHOT_SAVE"] = "snapshot_save";
@@ -3546,9 +4510,13 @@ var TachyonShellMethods = {
   globalCheck: async (masked = true) => callBaseMethod(Tachyon.AvailableMethods.GLOBAL_CHECK, [
     masked ? "masked" : "raw"
   ]),
-  doctor: async () => callBaseMethod(Tachyon.AvailableMethods.DOCTOR, [], {
-    timeout: 3e4
-  }),
+  doctor: async (fix = false) => callBaseMethod(
+    Tachyon.AvailableMethods.DOCTOR,
+    fix ? ["--fix"] : [],
+    {
+      timeout: 6e4
+    }
+  ),
   aiDoctor: async () => callBaseMethod(Tachyon.AvailableMethods.AI_DOCTOR, [], {
     timeout: 6e4
   }),
@@ -3794,14 +4762,18 @@ var TachyonShellMethods = {
   componentUpdateCheckCache: async () => callBaseMethod(
     Tachyon.AvailableMethods.COMPONENT_UPDATE_CHECK_CACHE
   ),
-  componentListReleases: async (component, count = 3) => {
+  componentListReleases: async (component, count = 5, page = 1) => {
+    const args = [
+      Tachyon.AvailableMethods.COMPONENT_LIST_RELEASES,
+      component,
+      String(count)
+    ];
+    if (page > 1) {
+      args.push(String(page));
+    }
     const response = await executeShellCommand({
       command: "/usr/bin/tachyon",
-      args: [
-        Tachyon.AvailableMethods.COMPONENT_LIST_RELEASES,
-        component,
-        String(count)
-      ],
+      args,
       timeout: 25e3
     });
     const parsed = parseJsonArrayOutput(
@@ -4573,6 +5545,7 @@ var TachyonShellMethods = {
 
 // src/tachyon/methods/custom/getDashboardSections.ts
 var DASHBOARD_SECTION_CACHE_DIR = "/var/run/tachyon/section-cache";
+var SECTION_ERRORS_FILE = "/var/run/tachyon/section-errors.json";
 var CLASH_API_FETCH_TIMEOUT_MS = 2500;
 var directClashApiFailedAt = 0;
 var DIRECT_CLASH_API_COOLDOWN_MS = 1e4;
@@ -4666,6 +5639,10 @@ function hydrateConfigSections(configSections) {
           return;
         }
         settings[item.url] = {
+          // Carried so the dashboard can tell a disabled source from an enabled
+          // one. `enabled` is absent on sections written before the flag existed,
+          // which means enabled - the same default the backend applies.
+          enabled: item.enabled,
           subscription_update_enabled: item.subscription_update_enabled,
           subscription_update_interval: item.subscription_update_interval,
           download_via_proxy_enabled: item.download_via_proxy_enabled,
@@ -4684,6 +5661,8 @@ function hydrateConfigSections(configSections) {
           show_dashboard_metadata: item.show_dashboard_metadata,
           prefix_nodes: item.prefix_nodes,
           node_prefix: item.node_prefix,
+          node_prefix_bg: item.node_prefix_bg,
+          node_prefix_color: item.node_prefix_color,
           include_urltest_groups: item.include_urltest_groups,
           hide_urltest_group_outbounds: item.hide_urltest_group_outbounds,
           hide_detour_outbounds: item.hide_detour_outbounds
@@ -4778,6 +5757,7 @@ var SINGLE_ENDPOINT_ACTIONS = /* @__PURE__ */ new Set([
   "anytls",
   "snell",
   "mieru",
+  "naive",
   "sudoku",
   "masque",
   "openvpn"
@@ -4788,6 +5768,7 @@ var ACTION_DISPLAY_NAMES = {
   anytls: "AnyTLS",
   snell: "Snell",
   mieru: "Mieru",
+  naive: "NaiveProxy",
   sudoku: "Sudoku",
   masque: "MASQUE",
   openvpn: "OpenVPN",
@@ -4795,14 +5776,12 @@ var ACTION_DISPLAY_NAMES = {
 };
 function isConnectionAction(action) {
   return Boolean(
-    action && (SINGLE_ENDPOINT_ACTIONS.has(action) || ["connection", "proxy", "outbound"].includes(action))
+    action && (SINGLE_ENDPOINT_ACTIONS.has(action) || ["connection", "proxy", "outbound", "fptn"].includes(action))
   );
 }
 function isServiceAction(action) {
   return Boolean(
-    action && ["zapret", "zapret2", "byedpi", "wdtt", "olcrtc", "fptn"].includes(
-      action
-    )
+    action && ["zapret", "zapret2", "byedpi", "wdtt", "olcrtc"].includes(action)
   );
 }
 function hasSubscriptionSources(section) {
@@ -4837,7 +5816,7 @@ function isNaOutbound(outbound) {
   return !outbound.latency && outbound.latency !== -1;
 }
 function shouldUseProxyGroup(section) {
-  return getManualProxyLinks(section).length > 0 || hasSubscriptionSources(section) || getConnectionInterfaces(section).length > 0 || getJsonOutbounds(section).length > 0 || isUrlTestEnabled(section) || hasConfiguredPriorityList(section);
+  return section.action === "fptn" || Boolean(section.access_token) || getManualProxyLinks(section).length > 0 || hasSubscriptionSources(section) || getConnectionInterfaces(section).length > 0 || getJsonOutbounds(section).length > 0 || isUrlTestEnabled(section) || hasConfiguredPriorityList(section);
 }
 function getSectionProxyConfigType(section) {
   if (hasSubscriptionSources(section)) {
@@ -4847,6 +5826,9 @@ function getSectionProxyConfigType(section) {
     return "urltest";
   }
   if (getManualProxyLinks(section).length > 0) {
+    return "selector";
+  }
+  if (section.action === "fptn") {
     return "selector";
   }
   if (getJsonOutbounds(section).length > 0) {
@@ -4876,6 +5858,16 @@ function buildManualLinkByCode(section) {
       link
     ])
   );
+}
+function findManualLink(manualLinkByCode, code) {
+  const direct = manualLinkByCode.get(code);
+  if (direct) return direct;
+  for (const [tag, link] of manualLinkByCode.entries()) {
+    if (code === tag || code.startsWith(`${tag}/`)) {
+      return link;
+    }
+  }
+  return "";
 }
 function getProxyEntryByCode(proxies) {
   return new Map(proxies.map((proxy) => [proxy.code, proxy]));
@@ -5121,6 +6113,18 @@ async function readDashboardSectionCache(sectionName) {
     return void 0;
   }
 }
+async function readSectionErrors() {
+  try {
+    const raw = await fs.read(SECTION_ERRORS_FILE);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return objectMap(parsed);
+  } catch (_error) {
+    return {};
+  }
+}
 function getUrlTestGroups(dashboardCache) {
   const groups = dashboardCache?.urltestGroups;
   if (!groups || typeof groups !== "object" || Array.isArray(groups)) {
@@ -5149,6 +6153,34 @@ function getConfiguredSubscriptionPrefixes(section) {
   }
   return prefixes;
 }
+function getConfiguredSubscriptionPrefixStyles(section) {
+  const settings = itemSettingsMap(section.subscription_url_settings);
+  const styles7 = {};
+  for (const url of Object.keys(settings)) {
+    const item = settings[url];
+    if (item && item.prefix_nodes === "1") {
+      const p = typeof item.node_prefix === "string" ? item.node_prefix.trim() : "";
+      if (p) {
+        const bg = typeof item.node_prefix_bg === "string" ? item.node_prefix_bg.trim() : "";
+        const color = typeof item.node_prefix_color === "string" ? item.node_prefix_color.trim() : "";
+        if (bg || color) {
+          styles7[p] = { bg: bg || void 0, color: color || void 0 };
+        }
+      }
+    }
+  }
+  if (typeof window !== "undefined" && Object.keys(styles7).length > 0) {
+    const win = window;
+    win.__tachyonUciPrefixStyles = {
+      ...win.__tachyonUciPrefixStyles || {},
+      ...styles7
+    };
+  }
+  return styles7;
+}
+function dashboardOutboundType(code, runtimeType, outboundMetadata) {
+  return outboundMetadata?.protocols?.[code] === "amneziawg" ? "AmneziaWG" : runtimeType || "";
+}
 function resolveOutboundNameAndPrefix({
   code,
   entry,
@@ -5157,13 +6189,16 @@ function resolveOutboundNameAndPrefix({
   preferMetadata = false,
   configuredPrefixes = []
 }) {
+  const isFptn = link.startsWith("fptn:") || link.startsWith("fptnb:") || link.startsWith("fptn://") || link.startsWith("fptnb://");
   const metadataName = outboundMetadata?.names?.[code];
-  const rawName = (preferMetadata ? metadataName : getProxyUrlName(link)) || (preferMetadata ? getProxyUrlName(link) : metadataName) || entry?.value?.name || code;
+  const proxyUrlName = isFptn ? "" : getProxyUrlName(link);
+  const fallbackServerName = code.includes("/") ? code.split("/").pop() : void 0;
+  const rawName = (preferMetadata ? metadataName : proxyUrlName) || (preferMetadata ? proxyUrlName : metadataName) || entry?.value?.name || fallbackServerName || code;
   let prefix = outboundMetadata?.prefixes?.[code]?.trim() || "";
   if (!prefix && configuredPrefixes.length > 0) {
     for (const p of configuredPrefixes) {
       if (!p) continue;
-      if (rawName.startsWith(p + " ") || rawName.startsWith(p + "-") || code.startsWith(p + " ") || code.startsWith(p + "-") || entry?.value?.name?.startsWith(p + " ") || entry?.value?.name?.startsWith(p + "-")) {
+      if (rawName.startsWith(p + " ") || rawName.startsWith(p + "-") || rawName.startsWith(p + "/") || code.startsWith(p + " ") || code.startsWith(p + "-") || code.startsWith(p + "/") || entry?.value?.name?.startsWith(p + " ") || entry?.value?.name?.startsWith(p + "-") || entry?.value?.name?.startsWith(p + "/")) {
         prefix = p;
         break;
       }
@@ -5181,6 +6216,17 @@ function resolveOutboundNameAndPrefix({
       if (stripped) {
         displayName = stripped;
       }
+    } else if (displayName.startsWith(prefix + "/")) {
+      const stripped = displayName.slice(prefix.length + 1).trim();
+      if (stripped) {
+        displayName = stripped;
+      }
+    }
+  } else if (/^[A-Za-z0-9_-]+\//.test(displayName)) {
+    const parts = displayName.split("/");
+    if (parts.length > 1 && parts[parts.length - 1].trim()) {
+      prefix = parts.slice(0, -1).join("/");
+      displayName = parts[parts.length - 1].trim();
     }
   }
   return {
@@ -5213,7 +6259,7 @@ function buildUrlTestInfo({
   const outbounds = sortUrlTestMembers(
     childCodes.flatMap((childCode) => {
       const childEntry = proxyByCode.get(childCode);
-      const link = manualLinkByCode.get(childCode) || cachedProxyLinks.get(childCode) || "";
+      const link = findManualLink(manualLinkByCode, childCode) || cachedProxyLinks.get(childCode) || "";
       const canCopyLink = isCopyableProxyLink(link);
       const resolved = resolveOutboundNameAndPrefix({
         code: childCode,
@@ -5229,8 +6275,13 @@ function buildUrlTestInfo({
           displayName: resolved.displayName,
           prefix: resolved.prefix,
           latency: childEntry?.value?.history?.[0]?.delay || 0,
-          type: childEntry?.value?.type || "",
+          type: dashboardOutboundType(
+            childCode,
+            childEntry?.value?.type,
+            outboundMetadata
+          ),
           transport: outboundMetadata?.transports?.[childCode] || getProxyUrlTransport(link),
+          details: outboundMetadata?.details?.[childCode],
           selected: selectedCode === childCode,
           link,
           canCopyLink,
@@ -5304,7 +6355,7 @@ function buildPriorityInfo({
   const outbounds = levels.flatMap((level, levelIndex) => {
     const members = uniqueCodes(level.outbounds || []).map((childCode) => {
       const childEntry = proxyByCode.get(childCode);
-      const link = manualLinkByCode.get(childCode) || cachedProxyLinks.get(childCode) || "";
+      const link = findManualLink(manualLinkByCode, childCode) || cachedProxyLinks.get(childCode) || "";
       const canCopyLink = isCopyableProxyLink(link);
       const resolved = resolveOutboundNameAndPrefix({
         code: childCode,
@@ -5319,8 +6370,13 @@ function buildPriorityInfo({
         displayName: resolved.displayName,
         prefix: resolved.prefix,
         latency: childEntry?.value?.history?.[0]?.delay || 0,
-        type: childEntry?.value?.type || "",
+        type: dashboardOutboundType(
+          childCode,
+          childEntry?.value?.type,
+          outboundMetadata
+        ),
         transport: outboundMetadata?.transports?.[childCode] || getProxyUrlTransport(link),
+        details: outboundMetadata?.details?.[childCode],
         selected: selectedCode === childCode,
         link,
         canCopyLink,
@@ -5359,6 +6415,7 @@ function buildPriorityInfo({
 function buildProxyGroupOutbounds(section, proxies, outboundMetadata, urltestGroups = {}, priorityGroups = {}, cachedProxyLinks = /* @__PURE__ */ new Map(), hiddenOutboundTags = {}) {
   const sectionName = section[".name"];
   const configuredPrefixes = getConfiguredSubscriptionPrefixes(section);
+  getConfiguredSubscriptionPrefixStyles(section);
   const proxyByCode = getProxyEntryByCode(proxies);
   const selectorTag = getOutboundTagBySection(sectionName);
   const selector = proxyByCode.get(selectorTag);
@@ -5408,7 +6465,7 @@ function buildProxyGroupOutbounds(section, proxies, outboundMetadata, urltestGro
     const item = proxyByCode.get(code);
     const urlTestConfig = urlTestConfigByCode.get(code);
     const priorityConfig = priorityConfigByCode.get(code);
-    const link = manualLinkByCode.get(code) || cachedProxyLinks.get(code) || "";
+    const link = findManualLink(manualLinkByCode, code) || cachedProxyLinks.get(code) || "";
     if (!item && !urlTestConfig && !priorityConfig && !link) {
       return [];
     }
@@ -5486,8 +6543,13 @@ function buildProxyGroupOutbounds(section, proxies, outboundMetadata, urltestGro
         displayName,
         prefix,
         latency,
-        type: priorityConfig ? "Priority" : effectiveItem?.value.type || "URLTest",
+        type: priorityConfig ? "Priority" : dashboardOutboundType(
+          code,
+          effectiveItem?.value.type || "URLTest",
+          outboundMetadata
+        ),
         transport: isGroupType ? void 0 : outboundMetadata?.transports?.[code] || getProxyUrlTransport(link),
+        details: isGroupType ? void 0 : outboundMetadata?.details?.[code],
         selected: isSelected,
         link,
         canCopyLink,
@@ -5597,7 +6659,10 @@ function getOutboundMetadata(dashboardCache) {
     countries: objectMap(metadata.countries),
     transports: objectMap(metadata.transports),
     protocols: objectMap(metadata.protocols),
-    securities: objectMap(metadata.securities)
+    securities: objectMap(metadata.securities),
+    ports: objectMap(metadata.ports),
+    details: objectMap(metadata.details),
+    prefixes: objectMap(metadata.prefixes)
   };
 }
 function getCachedProxyLinks(dashboardCache, includeHidden = false) {
@@ -5734,6 +6799,7 @@ async function getDashboardSections(options = {}) {
     }
     return serviceStatusCache.get(serviceType);
   };
+  const sectionErrors = await readSectionErrors();
   const data = await Promise.all(
     configSections.filter(
       (section) => section.enabled !== "0" && (isConnectionAction(section.action) || isServiceAction(section.action))
@@ -5862,7 +6928,9 @@ async function getDashboardSections(options = {}) {
   );
   return {
     success: true,
-    data
+    data: data.map(
+      (group) => sectionErrors[group.sectionName] ? { ...group, configError: sectionErrors[group.sectionName] } : group
+    )
   };
 }
 
@@ -6003,434 +7071,6 @@ var TabService = class _TabService {
   }
 };
 var TabServiceInstance = TabService.getInstance();
-
-// src/tachyon/tabs/diagnostic/helpers/getCheckTitle.ts
-function getCheckTitle(name) {
-  return `${name} ${_("checks")}`;
-}
-
-// src/tachyon/tabs/diagnostic/checks/constants.ts
-var DIAGNOSTICS_CHECKS = /* @__PURE__ */ ((DIAGNOSTICS_CHECKS2) => {
-  DIAGNOSTICS_CHECKS2["DNS"] = "DNS";
-  DIAGNOSTICS_CHECKS2["SINGBOX"] = "SINGBOX";
-  DIAGNOSTICS_CHECKS2["STEER"] = "STEER";
-  DIAGNOSTICS_CHECKS2["NFT"] = "NFT";
-  DIAGNOSTICS_CHECKS2["ZAPRET"] = "ZAPRET";
-  DIAGNOSTICS_CHECKS2["ZAPRET2"] = "ZAPRET2";
-  DIAGNOSTICS_CHECKS2["BYEDPI"] = "BYEDPI";
-  DIAGNOSTICS_CHECKS2["FAKEIP"] = "FAKEIP";
-  DIAGNOSTICS_CHECKS2["OUTBOUNDS"] = "OUTBOUNDS";
-  DIAGNOSTICS_CHECKS2["INBOUNDS"] = "INBOUNDS";
-  return DIAGNOSTICS_CHECKS2;
-})(DIAGNOSTICS_CHECKS || {});
-var DIAGNOSTICS_CHECKS_MAP = {
-  ["DNS" /* DNS */]: {
-    order: 1,
-    title: getCheckTitle("DNS"),
-    code: "DNS" /* DNS */
-  },
-  ["SINGBOX" /* SINGBOX */]: {
-    order: 2,
-    title: getCheckTitle("Sing-box"),
-    code: "SINGBOX" /* SINGBOX */
-  },
-  ["STEER" /* STEER */]: {
-    order: 2,
-    title: getCheckTitle("Steer"),
-    code: "STEER" /* STEER */
-  },
-  ["NFT" /* NFT */]: {
-    order: 4,
-    title: getCheckTitle("Nftables"),
-    code: "NFT" /* NFT */
-  },
-  ["ZAPRET" /* ZAPRET */]: {
-    order: 5,
-    title: getCheckTitle("Zapret"),
-    code: "ZAPRET" /* ZAPRET */
-  },
-  ["BYEDPI" /* BYEDPI */]: {
-    order: 7,
-    title: getCheckTitle("ByeDPI"),
-    code: "BYEDPI" /* BYEDPI */
-  },
-  ["ZAPRET2" /* ZAPRET2 */]: {
-    order: 6,
-    title: getCheckTitle("Zapret2"),
-    code: "ZAPRET2" /* ZAPRET2 */
-  },
-  ["OUTBOUNDS" /* OUTBOUNDS */]: {
-    order: 8,
-    title: getCheckTitle("Outbounds"),
-    code: "OUTBOUNDS" /* OUTBOUNDS */
-  },
-  ["FAKEIP" /* FAKEIP */]: {
-    order: 9,
-    title: getCheckTitle("FakeIP"),
-    code: "FAKEIP" /* FAKEIP */
-  },
-  ["INBOUNDS" /* INBOUNDS */]: {
-    order: 3,
-    title: getCheckTitle("Inbounds"),
-    code: "INBOUNDS" /* INBOUNDS */
-  }
-};
-
-// src/tachyon/tabs/diagnostic/diagnostic.store.ts
-function isSteerEngine(engine) {
-  return engine === "steer" || engine === "steer-extended";
-}
-function getEngineCheckCode(engine) {
-  if (isSteerEngine(engine)) return "STEER" /* STEER */;
-  return "SINGBOX" /* SINGBOX */;
-}
-function createDiagnosticCheck(code, description) {
-  const meta = DIAGNOSTICS_CHECKS_MAP[code];
-  return {
-    code,
-    title: meta.title,
-    order: meta.order,
-    description,
-    items: [],
-    state: "skipped"
-  };
-}
-function getDiagnosticsChecks(description, options = {}) {
-  const engineCheck = getEngineCheckCode(options.activeEngine);
-  const checks = ["DNS" /* DNS */, engineCheck];
-  if (options.includeInbounds === true) {
-    checks.push("INBOUNDS" /* INBOUNDS */);
-  }
-  checks.push("NFT" /* NFT */);
-  if (options.includeZapret) {
-    checks.push("ZAPRET" /* ZAPRET */);
-  }
-  if (options.includeZapret2) {
-    checks.push("ZAPRET2" /* ZAPRET2 */);
-  }
-  if (options.includeByedpi) {
-    checks.push("BYEDPI" /* BYEDPI */);
-  }
-  checks.push("OUTBOUNDS" /* OUTBOUNDS */, "FAKEIP" /* FAKEIP */);
-  return checks.map((code) => createDiagnosticCheck(code, description));
-}
-function getLoadingDiagnosticsChecks(options = {}) {
-  return {
-    diagnosticsChecks: getDiagnosticsChecks(_("Pending"), options)
-  };
-}
-var initialDiagnosticStore = {
-  diagnosticsSystemInfo: {
-    loading: true,
-    loaded: false,
-    providerInfoLoaded: false,
-    tachyon_version: "loading",
-    tachyon_commit_sha: "",
-    tachyon_latest_version: "loading",
-    luci_app_version: "loading",
-    sing_box_version: "loading",
-    sing_box_extended: 0,
-    sing_box_tiny: 0,
-    sing_box_compressed: 0,
-    sing_box_lx: 0,
-    sing_box_tailscale: 1,
-    sing_box_cert_pin: 0,
-    sing_box_repo_url: "",
-    sing_box_backup_version: "",
-    sing_box_backup_time: 0,
-    steer_version: "loading",
-    steer_installed: 0,
-    steer_extended: 0,
-    steer_repo_url: "https://github.com/xyzmean/steer",
-    steer_backup_version: "",
-    steer_backup_time: 0,
-    active_engine: "sing-box",
-    zapret_version: "loading",
-    zapret_installed: 0,
-    zapret_backup_version: "",
-    zapret_backup_time: 0,
-    zapret2_version: "loading",
-    zapret2_installed: 0,
-    zapret2_backup_version: "",
-    zapret2_backup_time: 0,
-    byedpi_version: "loading",
-    byedpi_installed: 0,
-    byedpi_backup_version: "",
-    byedpi_backup_time: 0,
-    wdtt_version: "loading",
-    wdtt_installed: 0,
-    wdtt_backup_version: "",
-    wdtt_backup_time: 0,
-    olcrtc_version: "loading",
-    olcrtc_installed: 0,
-    olcrtc_backup_version: "",
-    olcrtc_backup_time: 0,
-    tailscale_version: "loading",
-    tailscale_installed: 0,
-    tailscale_backup_version: "",
-    tailscale_backup_time: 0,
-    fptn_version: "loading",
-    fptn_installed: 0,
-    fptn_backup_version: "",
-    fptn_backup_time: 0,
-    server_inbounds_enabled_count: -1,
-    direct_bypass_enabled: 0,
-    direct_bypass_address: "",
-    direct_bypass_port: "",
-    torrserver_running: 0,
-    torrserver_direct_available: 0,
-    torrserver_direct_enabled: 0,
-    torrserver_direct_active: 0,
-    openwrt_version: "loading",
-    device_model: "loading"
-  },
-  diagnosticsActions: {
-    restart: {
-      loading: false
-    },
-    start: {
-      loading: false
-    },
-    stop: {
-      loading: false
-    },
-    enable: {
-      loading: false
-    },
-    disable: {
-      loading: false
-    },
-    globalCheck: {
-      loading: false
-    },
-    doctor: {
-      loading: false
-    },
-    aiDoctor: {
-      loading: false
-    },
-    viewLogs: {
-      loading: false
-    },
-    showSingBoxConfig: {
-      loading: false
-    },
-    generateBugReport: {
-      loading: false
-    },
-    checkServices: {
-      loading: false
-    }
-  },
-  diagnosticsRunAction: { loading: false },
-  diagnosticsChecks: getDiagnosticsChecks(_("Not running")),
-  updatesActions: {
-    tachyonCheck: { loading: false },
-    tachyonInstall: { loading: false },
-    tachyonReinstall: { loading: false },
-    tachyonRollback: { loading: false },
-    singBoxCheck: { loading: false },
-    singBoxInstall: { loading: false },
-    singBoxRollback: { loading: false },
-    singBoxInstallExtended: { loading: false },
-    singBoxInstallExtendedCompressed: { loading: false },
-    singBoxInstallLx: { loading: false },
-    singBoxInstallTiny: { loading: false },
-    singBoxInstallStable: { loading: false },
-    zapretCheck: { loading: false },
-    zapretInstall: { loading: false },
-    zapretRemove: { loading: false },
-    zapretRollback: { loading: false },
-    zapret2Check: { loading: false },
-    zapret2Install: { loading: false },
-    zapret2Remove: { loading: false },
-    zapret2Rollback: { loading: false },
-    byedpiCheck: { loading: false },
-    byedpiInstall: { loading: false },
-    byedpiRemove: { loading: false },
-    byedpiRollback: { loading: false },
-    wdttCheck: { loading: false },
-    wdttInstall: { loading: false },
-    wdttRemove: { loading: false },
-    wdttRollback: { loading: false },
-    olcrtcCheck: { loading: false },
-    olcrtcInstall: { loading: false },
-    olcrtcRemove: { loading: false },
-    olcrtcRollback: { loading: false },
-    fptnCheck: { loading: false },
-    fptnInstall: { loading: false },
-    fptnRemove: { loading: false },
-    fptnRollback: { loading: false },
-    tailscaleCheck: { loading: false },
-    tailscaleInstall: { loading: false },
-    tailscaleRemove: { loading: false },
-    tailscaleRollback: { loading: false },
-    steerCheck: { loading: false },
-    steerInstall: { loading: false },
-    steerRemove: { loading: false },
-    steerRollback: { loading: false },
-    directBypassEnable: { loading: false },
-    directBypassDisable: { loading: false },
-    torrserverDirectEnable: { loading: false },
-    torrserverDirectDisable: { loading: false },
-    engineSwitch: { loading: false }
-  },
-  updatesChecks: {
-    tachyon: { status: null, latest_version: "", release_url: "" },
-    sing_box: { status: null, latest_version: "", release_url: "" },
-    zapret: { status: null, latest_version: "", release_url: "" },
-    zapret2: { status: null, latest_version: "", release_url: "" },
-    byedpi: { status: null, latest_version: "", release_url: "" },
-    wdtt: { status: null, latest_version: "", release_url: "" },
-    olcrtc: { status: null, latest_version: "", release_url: "" },
-    fptn: { status: null, latest_version: "", release_url: "" },
-    tailscale: { status: null, latest_version: "", release_url: "" },
-    steer: { status: null, latest_version: "", release_url: "" },
-    "steer-extended": { status: null, latest_version: "", release_url: "" },
-    direct_bypass: { status: null, latest_version: "", release_url: "" },
-    torrserver_direct: { status: null, latest_version: "", release_url: "" },
-    engine: { status: null, latest_version: "", release_url: "" }
-  }
-};
-
-// src/tachyon/services/store.service.ts
-function jsonStableStringify(obj) {
-  return JSON.stringify(obj, (_2, value) => {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      return Object.keys(value).sort().reduce(
-        (acc, key) => {
-          acc[key] = value[key];
-          return acc;
-        },
-        {}
-      );
-    }
-    return value;
-  });
-}
-function jsonEqual(a, b) {
-  try {
-    return jsonStableStringify(a) === jsonStableStringify(b);
-  } catch {
-    return false;
-  }
-}
-var StoreService = class {
-  constructor(initial) {
-    this.listeners = /* @__PURE__ */ new Set();
-    this.value = initial;
-    this.initial = structuredClone(initial);
-  }
-  get() {
-    return this.value;
-  }
-  set(next) {
-    const prev = this.value;
-    const diff = {};
-    for (const key in next) {
-      if (next[key] === prev[key]) continue;
-      if (!jsonEqual(next[key], prev[key])) diff[key] = next[key];
-    }
-    if (Object.keys(diff).length === 0) {
-      return;
-    }
-    const merged = { ...prev, ...next };
-    this.value = merged;
-    this.listeners.forEach((cb) => cb(this.value, prev, diff));
-  }
-  reset(keys) {
-    const prev = this.value;
-    const next = structuredClone(this.value);
-    if (keys && keys.length > 0) {
-      keys.forEach((key) => {
-        next[key] = structuredClone(this.initial[key]);
-      });
-    } else {
-      Object.assign(next, structuredClone(this.initial));
-    }
-    if (jsonEqual(prev, next)) return;
-    this.value = next;
-    const diff = {};
-    for (const key in next) {
-      if (!jsonEqual(next[key], prev[key])) diff[key] = next[key];
-    }
-    this.listeners.forEach((cb) => cb(this.value, prev, diff));
-  }
-  subscribe(cb) {
-    this.listeners.add(cb);
-    cb(this.value, this.value, {});
-    return () => this.listeners.delete(cb);
-  }
-  unsubscribe(cb) {
-    this.listeners.delete(cb);
-  }
-  patch(key, value) {
-    this.set({ [key]: value });
-  }
-  getKey(key) {
-    return this.value[key];
-  }
-  subscribeKey(key, cb) {
-    let prev = this.value[key];
-    const wrapper = (val) => {
-      if (!jsonEqual(val[key], prev)) {
-        prev = val[key];
-        cb(val[key]);
-      }
-    };
-    this.listeners.add(wrapper);
-    return () => this.listeners.delete(wrapper);
-  }
-};
-var initialStore = {
-  tabService: {
-    current: "",
-    all: []
-  },
-  activeEngine: "sing-box",
-  bandwidthWidget: {
-    loading: true,
-    failed: false,
-    data: { up: 0, down: 0 }
-  },
-  trafficTotalWidget: {
-    loading: true,
-    failed: false,
-    data: { downloadTotal: 0, uploadTotal: 0 }
-  },
-  systemInfoWidget: {
-    loading: true,
-    failed: false,
-    data: { connections: 0, memory: 0 }
-  },
-  servicesInfoWidget: {
-    loading: true,
-    failed: false,
-    data: {
-      singbox: 0,
-      tachyonRunning: 0,
-      tachyonEnabled: 0,
-      tachyonStatus: "",
-      watchdogRunning: 0
-    }
-  },
-  tailscaleWidget: {
-    loading: true,
-    failed: false,
-    data: null
-  },
-  sectionsWidget: {
-    loading: true,
-    failed: false,
-    latencyFetchingSections: {},
-    latencyProgressSections: {},
-    selectorSwitchingSections: {},
-    subscriptionUpdatingSections: {},
-    data: []
-  },
-  ...initialDiagnosticStore
-};
-var store = new StoreService(initialStore);
 
 // src/tachyon/services/tachyonLogWatcher.service.ts
 var TachyonLogWatcher = class _TachyonLogWatcher {
@@ -6646,6 +7286,7 @@ var componentActionKeyMap = {
   "sing_box:install_extended": "singBoxInstallExtended",
   "sing_box:install_extended_compressed": "singBoxInstallExtendedCompressed",
   "sing_box:install_lx": "singBoxInstallLx",
+  "sing_box:install_tachyon_core": "singBoxInstallTachyonCore",
   "sing_box:install_tiny": "singBoxInstallTiny",
   "sing_box:install_stable": "singBoxInstallStable",
   "zapret:check_update": "zapretCheck",
@@ -6678,6 +7319,8 @@ var componentActionKeyMap = {
   "fptn:install_version": "fptnInstall",
   "fptn:remove": "fptnRemove",
   "fptn:rollback": "fptnRollback",
+  "fptn:set_native_mode": "fptnSetNativeMode",
+  "fptn:set_component_mode": "fptnSetComponentMode",
   "tailscale:check_update": "tailscaleCheck",
   "tailscale:install": "tailscaleInstall",
   "tailscale:install_version": "tailscaleInstall",
@@ -6704,6 +7347,10 @@ function getComponentActionKey(component, action) {
 }
 
 // src/tachyon/helpers/singBoxVariant.ts
+function isTachyonCoreVersion(version) {
+  const v = String(version || "").trim();
+  return v.includes("-tachyon.") || v.includes("tachyon-core") || /^v?0\.0\.\d+/.test(v);
+}
 function isExtendedSingBoxVersion(version) {
   return String(version || "").includes("extended") || String(version || "").includes("-lx");
 }
@@ -6752,26 +7399,29 @@ function formatSingBoxVersion(value) {
 }
 function normalizeSingBoxVariantFields(value) {
   const version = String(value.sing_box_version || "");
+  const singBoxTachyonCore = Boolean(value.sing_box_tachyon_core) || isTachyonCoreVersion(version);
   const versionExtended = isExtendedSingBoxVersion(version);
   const versionLx = version.includes("-lx");
-  const singBoxExtended = Boolean(value.sing_box_extended) || versionExtended;
+  const singBoxExtended = !singBoxTachyonCore && (Boolean(value.sing_box_extended) || versionExtended);
   const singBoxLx = singBoxExtended && (Boolean(value.sing_box_lx) || versionLx);
   const m = version.match(/^v?(\d+)\.(\d+)/);
   const versionSupportsCertPin = m ? parseInt(m[1], 10) > 1 || parseInt(m[1], 10) === 1 && parseInt(m[2], 10) >= 15 : false;
-  const singBoxCertPin = Boolean(value.sing_box_cert_pin) || versionLx || Boolean(singBoxLx) || versionSupportsCertPin;
+  const singBoxCertPin = singBoxTachyonCore || Boolean(value.sing_box_cert_pin) || versionLx || Boolean(singBoxLx) || versionSupportsCertPin;
   return {
     ...value,
+    sing_box_tachyon_core: singBoxTachyonCore ? 1 : 0,
+    sing_box_fptn: singBoxTachyonCore || value.sing_box_fptn ? 1 : 0,
     sing_box_extended: singBoxExtended ? 1 : 0,
-    sing_box_tiny: singBoxExtended ? 0 : value.sing_box_tiny ? 1 : 0,
+    sing_box_tiny: singBoxExtended || singBoxTachyonCore ? 0 : value.sing_box_tiny ? 1 : 0,
     sing_box_compressed: singBoxExtended && value.sing_box_compressed ? 1 : 0,
     sing_box_lx: singBoxLx ? 1 : 0,
-    sing_box_tailscale: singBoxExtended || value.sing_box_tailscale ? 1 : 0,
+    sing_box_tailscale: singBoxExtended || singBoxTachyonCore || value.sing_box_tailscale ? 1 : 0,
     sing_box_cert_pin: singBoxCertPin ? 1 : 0
   };
 }
 function renderSingBoxVariantBadge(value) {
   const version = String(value.sing_box_version || "");
-  if (!version || isVersionPlaceholder(version)) {
+  if (!version || isVersionPlaceholder(version) || typeof document === "undefined") {
     return null;
   }
   const normalized = normalizeSingBoxVariantFields(value);
@@ -6785,7 +7435,12 @@ function renderSingBoxVariantBadge(value) {
   badge.style.fontWeight = "600";
   badge.style.lineHeight = "16px";
   badge.style.verticalAlign = "middle";
-  if (normalized.sing_box_lx) {
+  if (normalized.sing_box_tachyon_core) {
+    badge.textContent = "Tachyon Core";
+    badge.style.backgroundColor = "rgba(139, 92, 246, 0.15)";
+    badge.style.color = "#8b5cf6";
+    badge.style.border = "1px solid rgba(139, 92, 246, 0.35)";
+  } else if (normalized.sing_box_lx) {
     badge.textContent = "Leadaxe (lx)";
     badge.style.backgroundColor = "rgba(16, 185, 129, 0.15)";
     badge.style.color = "#10b981";
@@ -6869,6 +7524,7 @@ function getEmptyUpdatesActions() {
     singBoxInstallExtended: { loading: false },
     singBoxInstallExtendedCompressed: { loading: false },
     singBoxInstallLx: { loading: false },
+    singBoxInstallTachyonCore: { loading: false },
     singBoxInstallTiny: { loading: false },
     singBoxInstallStable: { loading: false },
     zapretCheck: { loading: false },
@@ -6895,6 +7551,8 @@ function getEmptyUpdatesActions() {
     fptnInstall: { loading: false },
     fptnRemove: { loading: false },
     fptnRollback: { loading: false },
+    fptnSetNativeMode: { loading: false },
+    fptnSetComponentMode: { loading: false },
     tailscaleCheck: { loading: false },
     tailscaleInstall: { loading: false },
     tailscaleRemove: { loading: false },
@@ -6949,6 +7607,8 @@ function applyServiceState(uiState) {
   nextSystemInfo.sing_box_tiny = uiState.capabilities.sing_box_tiny;
   nextSystemInfo.sing_box_compressed = uiState.capabilities.sing_box_compressed;
   nextSystemInfo.sing_box_lx = uiState.capabilities.sing_box_lx;
+  nextSystemInfo.sing_box_tachyon_core = uiState.capabilities.sing_box_tachyon_core;
+  nextSystemInfo.sing_box_fptn = uiState.capabilities.sing_box_fptn;
   nextSystemInfo.sing_box_tailscale = uiState.capabilities.sing_box_tailscale;
   nextSystemInfo.sing_box_cert_pin = uiState.capabilities.sing_box_cert_pin ?? 0;
   store.set({
@@ -8158,11 +8818,12 @@ var RuntimeClient = class {
           client || "0.0.0.0",
           target,
           String(port),
-          proto
+          proto,
+          "--json"
         ],
         timeout: 1e4
       });
-      if ((res.code ?? 0) !== 0) {
+      if ((res.code ?? 0) !== 0 && !res.stdout) {
         return null;
       }
       return parseJsonStdout3(res.stdout, null);
@@ -9399,13 +10060,16 @@ function renderDetailsMemberName(member) {
     ...renderFlagEmojis(member.displayName)
   ] : renderFlagEmojis(member.displayName);
   if (member.prefix) {
+    const pStyle = resolvePrefixBadgeStyle(member.prefix);
     return [
       ...elements,
       E(
         "span",
         {
           class: "tachyon_dashboard-page__outbound-grid__item__prefix-badge",
-          style: "margin-left: 6px;"
+          style: `margin-left: 6px; background: ${pStyle.bg}; color: ${pStyle.color}; border: 1px solid ${pStyle.border}; font-weight: 600; cursor: pointer;`,
+          title: _("Click to customize prefix colors"),
+          click: (event) => openPrefixColorPickerModal(member.prefix, event)
         },
         renderFlagEmojis(member.prefix)
       )
@@ -9445,12 +10109,11 @@ function renderUrlTestSelectedValue(info) {
         selectedMember ? renderDetailsMemberName(selectedMember) : name
       ),
       ...selectedMember?.type ? [
-        E(
-          "span",
-          {
-            class: "tachyon_dashboard-page__urltest-details__selected-type"
-          },
-          selectedMember.type
+        renderOutboundTypeWithPopover(
+          selectedMember.type,
+          selectedMember.transport,
+          selectedMember.details,
+          "tachyon_dashboard-page__urltest-details__selected-type"
         )
       ] : [],
       ...selectedMember ? [
@@ -9528,29 +10191,21 @@ function renderCommonDetailsModal(info, fields, renderMemberName, isPriority, se
                     renderMemberName(member)
                   ),
                   ...member.type ? [
-                    E(
-                      "span",
-                      {
-                        class: "tachyon_dashboard-page__urltest-details__row-type"
-                      },
-                      formatOutboundType(
-                        member.type,
-                        member.transport
-                      )
+                    renderOutboundTypeWithPopover(
+                      member.type,
+                      member.transport,
+                      member.details,
+                      "tachyon_dashboard-page__urltest-details__row-type"
                     )
                   ] : []
                 ] : [
                   E("b", {}, renderMemberName(member)),
                   ...member.type ? [
-                    E(
-                      "span",
-                      {
-                        class: "tachyon_dashboard-page__urltest-details__row-type"
-                      },
-                      formatOutboundType(
-                        member.type,
-                        member.transport
-                      )
+                    renderOutboundTypeWithPopover(
+                      member.type,
+                      member.transport,
+                      member.details,
+                      "tachyon_dashboard-page__urltest-details__row-type"
                     )
                   ] : []
                 ]
@@ -10007,6 +10662,7 @@ function updateLatencyProgressInline(sectionsWidget) {
       "anytls",
       "snell",
       "mieru",
+      "naive",
       "sudoku",
       "masque",
       "openvpn"
@@ -10356,7 +11012,16 @@ async function renderServicesInfoWidget() {
           }
         },
         {
-          key: store.get().activeEngine === "steer" || store.get().activeEngine === "steer-extended" ? "Steer" : "Sing-box",
+          key: (() => {
+            if (store.get().activeEngine === "steer" || store.get().activeEngine === "steer-extended") {
+              return "Steer";
+            }
+            const systemInfo = store.get().diagnosticsSystemInfo;
+            if (systemInfo.sing_box_tachyon_core) {
+              return "Tachyon Core";
+            }
+            return "Sing-box";
+          })(),
           value: data.singbox ? data.singboxMemoryMb ? `✓ (${data.singboxMemoryMb} MB)` : "✓" : "✗",
           attributes: {
             class: data.singbox ? "tachyon_dashboard-page__widgets-section__item__row--success" : "tachyon_dashboard-page__widgets-section__item__row--error"
@@ -10710,6 +11375,23 @@ var styles = `
     padding: 10px;
     width: 100%;
     box-sizing: border-box;
+}
+
+/* The runtime quarantined this section: sing-box refused the config it
+   produced, so the section is not loaded while everything else runs. */
+.tachyon_dashboard-page__outbound-section--error {
+    border-color: var(--error-color-medium, red);
+}
+
+.tachyon_dashboard-page__outbound-section__config-error-badge {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--error-color-medium, red);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: help;
 }
 
 .tachyon_dashboard-page__outbound-section__title-section {
@@ -11078,6 +11760,68 @@ var styles = `
     max-width: 100%;
     overflow-wrap: anywhere;
     word-break: break-word;
+}
+
+.tachyon_proto-popover-trigger {
+    position: relative;
+    cursor: help;
+}
+
+.tachyon_proto-popover {
+    display: none;
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    z-index: 10050;
+    min-width: 220px;
+    max-width: 310px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(20, 24, 33, 0.97);
+    color: #f1f5f9;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    font-size: 11.5px;
+    line-height: 1.4;
+    text-align: left;
+    pointer-events: none;
+    white-space: normal;
+}
+
+.tachyon_proto-popover-trigger:hover .tachyon_proto-popover {
+    display: block;
+}
+
+.tachyon_proto-popover__header {
+    font-weight: 700;
+    font-size: 12px;
+    color: #60a5fa;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+    padding-bottom: 4px;
+    margin-bottom: 5px;
+    word-break: break-word;
+}
+
+.tachyon_proto-popover__row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    padding: 1.5px 0;
+}
+
+.tachyon_proto-popover__label {
+    color: #94a3b8;
+    font-weight: 500;
+    flex: 0 0 auto;
+}
+
+.tachyon_proto-popover__val {
+    color: #f8fafc;
+    font-family: monospace;
+    font-weight: 600;
+    text-align: right;
+    word-break: break-all;
 }
 
 .tachyon_dashboard-page .btn.tachyon_dashboard-page__outbound-grid__item__copy-button {
@@ -11640,11 +12384,13 @@ async function runDnsCheck() {
 
 // src/tachyon/tabs/diagnostic/checks/runSingBoxCheck.ts
 async function runSingBoxCheck() {
-  const { order, title, code } = DIAGNOSTICS_CHECKS_MAP.SINGBOX;
+  const storeSystemInfo = store?.get()?.diagnosticsSystemInfo;
+  const initialIsTachyonCore = Boolean(storeSystemInfo?.sing_box_tachyon_core);
+  const initialTitle = initialIsTachyonCore ? getCheckTitle("Tachyon Core") : DIAGNOSTICS_CHECKS_MAP.SINGBOX.title;
   updateCheckStore({
-    order,
-    code,
-    title,
+    order: DIAGNOSTICS_CHECKS_MAP.SINGBOX.order,
+    code: DIAGNOSTICS_CHECKS_MAP.SINGBOX.code,
+    title: initialTitle,
     description: _("Checking, please wait"),
     state: "loading",
     items: []
@@ -11652,52 +12398,57 @@ async function runSingBoxCheck() {
   const singBoxChecks = await TachyonShellMethods.checkSingBox();
   if (!singBoxChecks.success) {
     updateCheckStore({
-      order,
-      code,
-      title,
+      order: DIAGNOSTICS_CHECKS_MAP.SINGBOX.order,
+      code: DIAGNOSTICS_CHECKS_MAP.SINGBOX.code,
+      title: initialTitle,
       description: _("Cannot receive checks result"),
       state: "error",
       items: []
     });
-    throw new Error("Sing-box checks failed");
+    throw new Error(
+      `${initialIsTachyonCore ? "Tachyon Core" : "Sing-box"} checks failed`
+    );
   }
   const data = singBoxChecks.data;
+  const isTachyonCore = Boolean(data.sing_box_tachyon_core) || initialIsTachyonCore;
+  const coreTitle = isTachyonCore ? "Tachyon Core" : "Sing-box";
+  const title = isTachyonCore ? getCheckTitle("Tachyon Core") : DIAGNOSTICS_CHECKS_MAP.SINGBOX.title;
   const allGood = Boolean(data.sing_box_installed) && Boolean(data.sing_box_version_ok) && Boolean(data.sing_box_service_exist) && Boolean(data.sing_box_autostart_disabled) && Boolean(data.sing_box_process_running) && Boolean(data.sing_box_ports_listening);
   const atLeastOneGood = Boolean(data.sing_box_installed) || Boolean(data.sing_box_version_ok) || Boolean(data.sing_box_service_exist) || Boolean(data.sing_box_autostart_disabled) || Boolean(data.sing_box_process_running) || Boolean(data.sing_box_ports_listening);
   const { state, description } = getMeta({ atLeastOneGood, allGood });
   const items = [
     {
       state: data.sing_box_installed ? "success" : "error",
-      key: _("Sing-box installed"),
+      key: isTachyonCore ? _("Tachyon Core installed") : _("Sing-box installed"),
       value: ""
     },
     {
       state: data.sing_box_version_ok ? "success" : "error",
-      key: _("Sing-box version is compatible (newer than 1.12.4)"),
+      key: isTachyonCore ? _("Tachyon Core version is compatible") : _("Sing-box version is compatible (newer than 1.12.4)"),
       value: ""
     },
     {
       state: data.sing_box_service_exist ? "success" : "error",
-      key: _("Sing-box service exist"),
+      key: isTachyonCore ? _("Tachyon Core service exist") : _("Sing-box service exist"),
       value: ""
     },
     {
       state: data.sing_box_autostart_disabled ? "success" : "error",
-      key: _("Sing-box autostart disabled"),
+      key: isTachyonCore ? _("Tachyon Core autostart disabled") : _("Sing-box autostart disabled"),
       value: ""
     },
     {
       state: data.sing_box_process_running ? "success" : "error",
-      key: _("Sing-box process running"),
+      key: isTachyonCore ? _("Tachyon Core process running") : _("Sing-box process running"),
       value: ""
     },
     {
       state: data.sing_box_ports_listening ? "success" : "error",
-      key: _("Sing-box listening ports"),
+      key: isTachyonCore ? _("Tachyon Core listening ports") : _("Sing-box listening ports"),
       value: ""
     }
   ];
-  if (!data.sing_box_extended) {
+  if (!data.sing_box_extended && !isTachyonCore) {
     items.push({
       state: !data.sing_box_installed ? "error" : data.sing_box_cert_pin ? "success" : "warning",
       key: _("TLS certificate pinning (sing-box 1.15+)"),
@@ -11705,15 +12456,15 @@ async function runSingBoxCheck() {
     });
   }
   updateCheckStore({
-    order,
-    code,
+    order: DIAGNOSTICS_CHECKS_MAP.SINGBOX.order,
+    code: DIAGNOSTICS_CHECKS_MAP.SINGBOX.code,
     title,
     description,
     state,
     items
   });
   if (!atLeastOneGood || !data.sing_box_process_running) {
-    throw new Error("Sing-box checks failed");
+    throw new Error(`${coreTitle} checks failed`);
   }
 }
 
@@ -12093,6 +12844,7 @@ var PROXY_ACTIONS = /* @__PURE__ */ new Set([
   "anytls",
   "snell",
   "mieru",
+  "naive",
   "sudoku",
   "masque",
   "openvpn"
@@ -12473,6 +13225,8 @@ var UNKNOWN_SYSTEM_INFO = {
   sing_box_tiny: 0,
   sing_box_compressed: 0,
   sing_box_lx: 0,
+  sing_box_tachyon_core: 0,
+  sing_box_fptn: 0,
   sing_box_tailscale: 1,
   sing_box_cert_pin: 0,
   sing_box_repo_url: "",
@@ -12490,6 +13244,7 @@ var UNKNOWN_SYSTEM_INFO = {
   tailscale_installed: 0,
   fptn_version: _("unknown"),
   fptn_installed: 0,
+  fptn_mode: "component",
   server_inbounds_enabled_count: -1,
   openwrt_version: _("unknown"),
   device_model: _("unknown")
@@ -12753,7 +13508,7 @@ function renderModal(text, name, options) {
   let pendingForcedRefresh = false;
   let refreshSessionId = 0;
   let timer;
-  let observer;
+  let observer2;
   let autoRefreshEnabled = options?.initialAutoRefresh ?? Boolean(options?.getText);
   let maskValuesEnabled = options?.initialMaskValues ?? true;
   let shouldScrollToBottomOnMount = Boolean(options?.startAtEnd);
@@ -12782,8 +13537,8 @@ function renderModal(text, name, options) {
     pendingRefresh = false;
     pendingForcedRefresh = false;
     stopRefreshTimer();
-    observer?.disconnect();
-    observer = void 0;
+    observer2?.disconnect();
+    observer2 = void 0;
   };
   const scrollToBottom = () => {
     contentEl.scrollTop = contentEl.scrollHeight;
@@ -12914,6 +13669,7 @@ function renderModal(text, name, options) {
     requestForcedRefresh();
   };
   const footerChildren = [
+    ...options?.extraButtons ?? [],
     renderButton({
       classNames: ["cbi-button-apply"],
       text: _("Download"),
@@ -12980,14 +13736,14 @@ ${currentText}
     ])
   ]);
   if ((options?.getText || options?.startAtEnd) && typeof document !== "undefined") {
-    observer = new MutationObserver(() => {
+    observer2 = new MutationObserver(() => {
       if (!body.isConnected) {
         destroyLiveRefresh();
         return;
       }
       scheduleInitialScrollToBottom();
     });
-    observer.observe(document.body, {
+    observer2.observe(document.body, {
       childList: true,
       subtree: true
     });
@@ -13025,6 +13781,7 @@ function renderAvailableActions({
   generateBugReport,
   checkServices,
   testLeaks,
+  routeExplain,
   stabilityReport
 }) {
   return E("div", { class: "tachyon_diagnostic-page__right-bar__actions" }, [
@@ -13157,6 +13914,16 @@ function renderAvailableActions({
         disabled: testLeaks.disabled
       })
     ]),
+    ...insertIf(!!routeExplain?.visible, [
+      renderButton({
+        classNames: ["cbi-button-action"],
+        onClick: routeExplain.onClick,
+        icon: renderSquareChartGanttIcon24,
+        text: _("Route Decision Explainer"),
+        loading: routeExplain.loading,
+        disabled: routeExplain.disabled
+      })
+    ]),
     ...insertIf(!!stabilityReport?.visible, [
       renderButton({
         classNames: ["cbi-button-action"],
@@ -13180,7 +13947,7 @@ function renderAvailableActions({
       renderButton({
         onClick: showSingBoxConfig.onClick,
         icon: renderCogIcon24,
-        text: _("Show sing-box config"),
+        text: showSingBoxConfig.text || _("Show sing-box config"),
         loading: showSingBoxConfig.loading,
         disabled: showSingBoxConfig.disabled
       })
@@ -14364,7 +15131,7 @@ function renderStrategyFuzzerModal(ruleNames = []) {
         class: `cbi-button ${activeTab2 === id ? "cbi-button-action" : "cbi-button-neutral"}`,
         style: "display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; font-size: 12px; font-weight: 500; border-radius: 6px; cursor: pointer;"
       },
-      [E("span", {}, icon), E("span", {}, label)]
+      [E("span", {}, label)]
     );
     btn.addEventListener("click", () => {
       activeTab2 = id;
@@ -14678,7 +15445,7 @@ function renderStrategyFuzzerModal(ruleNames = []) {
     ]
   );
   const applyBestBtn = renderButton({
-    text: _("🏆 Apply Best Match"),
+    text: _("Apply Best Match"),
     classNames: ["cbi-button-save"],
     disabled: true,
     onClick: () => handleApplyBest()
@@ -14846,7 +15613,7 @@ function renderStrategyFuzzerModal(ruleNames = []) {
   );
   resultsContainer.appendChild(tableEl);
   const startBtn = renderButton({
-    text: _("🚀 Start Benchmark"),
+    text: _("Start Benchmark"),
     classNames: ["cbi-button-action"],
     onClick: () => handleToggleRun()
   });
@@ -15078,7 +15845,7 @@ function renderStrategyFuzzerModal(ruleNames = []) {
       },
       [
         renderButton({
-          text: _("💾 Save Custom Patterns"),
+          text: _("Save Custom Patterns"),
           classNames: ["cbi-button-save"],
           onClick: async () => {
             const res = await TachyonShellMethods.saveFuzzerPatterns(patternsConfig);
@@ -15090,7 +15857,7 @@ function renderStrategyFuzzerModal(ruleNames = []) {
           }
         }),
         renderButton({
-          text: _("🔄 Reset to Factory Defaults"),
+          text: _("Reset to Factory Defaults"),
           classNames: ["cbi-button-neutral"],
           onClick: async () => {
             const res = await TachyonShellMethods.resetFuzzerPatterns();
@@ -15285,7 +16052,7 @@ function renderStrategyFuzzerModal(ruleNames = []) {
     style: "flex: 1 1 240px; min-width: 180px; font-size: 12px;"
   });
   const aiSynthesizeBtn = renderButton({
-    text: _("🧠 Synthesize with AI"),
+    text: _("Synthesize with AI"),
     classNames: ["cbi-button-action"],
     onClick: () => handleAiSynthesize()
   });
@@ -15363,12 +16130,12 @@ function renderStrategyFuzzerModal(ruleNames = []) {
         ),
         E("div", { style: "display: flex; gap: 8px;" }, [
           renderButton({
-            text: _("🔄 Refresh"),
+            text: _("Refresh"),
             classNames: ["cbi-button-neutral"],
             onClick: () => renderHistoryTab()
           }),
           renderButton({
-            text: _("🗑️ Clear History"),
+            text: _("Clear History"),
             classNames: ["cbi-button-reset"],
             onClick: async () => {
               await TachyonShellMethods.clearFuzzerHistory();
@@ -16479,7 +17246,7 @@ function renderDnsBenchmarkModal() {
     onClick: () => startBenchmark()
   });
   const applyBtn = renderButton({
-    text: `🚀 ${_("Apply Recommended DNS")}`,
+    text: _("Apply Recommended DNS"),
     classNames: ["cbi-button-positive"],
     disabled: true,
     onClick: () => applyRecommended()
@@ -16544,32 +17311,48 @@ function renderDnsBenchmarkModal() {
   const applyRecommended = async () => {
     if (applyBtn) {
       applyBtn.disabled = true;
-      applyBtn.textContent = `⏳ ${_("Applying...")}`;
+      applyBtn.textContent = _("Applying...");
     }
-    const res = await TachyonShellMethods.applyDnsBenchmark();
-    if (res.success) {
+    try {
+      const res = await TachyonShellMethods.applyDnsBenchmark();
+      if (res.success) {
+        ui.addNotification(
+          _("Tachyon"),
+          E(
+            "p",
+            {},
+            _(
+              "Recommended DNS settings applied successfully and service restarted!"
+            )
+          ),
+          "info"
+        );
+        if (ui.hideModal) ui.hideModal();
+        window.setTimeout(() => window.location.reload(), 600);
+      } else {
+        ui.addNotification(
+          _("Tachyon"),
+          E("p", {}, res.error || _("Failed to apply DNS settings")),
+          "error"
+        );
+        if (applyBtn) {
+          applyBtn.disabled = false;
+          applyBtn.textContent = _("Apply Recommended DNS");
+        }
+      }
+    } catch (err) {
       ui.addNotification(
         _("Tachyon"),
         E(
           "p",
           {},
-          _(
-            "Recommended DNS settings applied successfully and service restarted!"
-          )
+          err?.message || _("Failed to apply DNS settings")
         ),
-        "info"
-      );
-      if (ui.hideModal) ui.hideModal();
-      window.location.reload();
-    } else {
-      ui.addNotification(
-        _("Tachyon"),
-        E("p", {}, res.error || _("Failed to apply DNS settings")),
         "error"
       );
       if (applyBtn) {
         applyBtn.disabled = false;
-        applyBtn.textContent = `🚀 ${_("Apply Recommended DNS")}`;
+        applyBtn.textContent = _("Apply Recommended DNS");
       }
     }
   };
@@ -17912,6 +18695,13 @@ var FIX_LABELS = {
   fix_bootstrap_dns: _("Reset Bootstrap DNS"),
   optimize_mtu: _("Optimize AWG MTU")
 };
+function getFixLabel(code, isTachyonCore) {
+  if (isTachyonCore) {
+    if (code === "start_singbox") return _("Start Tachyon Core");
+    if (code === "restart_singbox_dns") return _("Restart Tachyon Core DNS");
+  }
+  return FIX_LABELS[code] || code;
+}
 function getUi2() {
   if (typeof ui !== "undefined") return ui;
   if (typeof window !== "undefined" && window.ui)
@@ -17948,8 +18738,8 @@ function renderAiDoctorModal(options) {
       status: repLower.includes("сбой разрешения dns") || repLower.includes("dns resolution failed") || repLower.includes("dns failed") || repLower.includes("dnsmasq failed") ? "FAIL" : "OK"
     },
     {
-      name: "sing-box",
-      status: (repLower.includes("sing-box") || repLower.includes("proxy")) && (repLower.includes("остановлен") || repLower.includes("stopped") || repLower.includes("не функционирует") || repLower.includes("error") || repLower.includes("crash")) ? "FAIL" : "OK"
+      name: options.isTachyonCore ? "Tachyon Core" : "sing-box",
+      status: (repLower.includes("sing-box") || repLower.includes("tachyon-core") || repLower.includes("tachyon core") || repLower.includes("proxy")) && (repLower.includes("остановлен") || repLower.includes("stopped") || repLower.includes("не функционирует") || repLower.includes("error") || repLower.includes("crash")) ? "FAIL" : "OK"
     },
     {
       name: "nftables",
@@ -17993,7 +18783,7 @@ function renderAiDoctorModal(options) {
       }
     }
     const nodeSummary = nodes.map((n) => `${n.name}: ${n.status}`).join(" | ");
-    const fixesSummary = quickFixes.length > 0 ? quickFixes.map((f) => FIX_LABELS[f] || f).join(", ") : _("None");
+    const fixesSummary = quickFixes.length > 0 ? quickFixes.map((f) => getFixLabel(f, options.isTachyonCore)).join(", ") : _("None");
     const clientsSummary = currentClients.length > 0 ? currentClients.map(
       (c) => `- ${c.hostname} (IP: ${c.ip}, MAC: ${c.mac.slice(0, 8)}**): ${c.mode.toUpperCase()}`
     ).join("\n") : _("No DHCP clients detected");
@@ -18078,13 +18868,16 @@ function renderAiDoctorModal(options) {
             },
             quickFixes.map((code) => {
               let applied = false;
-              const friendlyLabel = FIX_LABELS[code] || code;
+              const friendlyLabel = getFixLabel(
+                code,
+                options.isTachyonCore
+              );
               const btn = renderButton({
                 classNames: ["cbi-button-apply"],
-                text: `⚡ ${friendlyLabel}`,
+                text: friendlyLabel,
                 onClick: async () => {
                   if (applied) return;
-                  btn.textContent = "⏳ " + _("Applying...") + " " + friendlyLabel;
+                  btn.textContent = _("Applying...") + " " + friendlyLabel;
                   showToast(
                     _("Applying fix") + ": " + friendlyLabel + "...",
                     "success"
@@ -18092,7 +18885,7 @@ function renderAiDoctorModal(options) {
                   const fixRes = await TachyonShellMethods.applyQuickFix(code);
                   if (fixRes && typeof fixRes === "object" && fixRes.success) {
                     applied = true;
-                    btn.textContent = `✓ ${friendlyLabel} (${_("Fixed")})`;
+                    btn.textContent = `${friendlyLabel} (${_("Fixed")})`;
                     btn.classList.remove("cbi-button-apply");
                     btn.classList.add("cbi-button-neutral");
                     showToast(
@@ -18100,7 +18893,7 @@ function renderAiDoctorModal(options) {
                       "success"
                     );
                   } else {
-                    btn.textContent = `⚡ ${friendlyLabel}`;
+                    btn.textContent = friendlyLabel;
                     showToast(
                       _("Failed to apply fix") + ": " + friendlyLabel,
                       "error"
@@ -18152,7 +18945,7 @@ function renderAiDoctorModal(options) {
         ),
         renderButton({
           classNames: ["cbi-button-action"],
-          text: "🔄 " + _("Refresh Device List"),
+          text: _("Refresh Device List"),
           onClick: loadLanClients
         })
       ]);
@@ -18171,7 +18964,7 @@ function renderAiDoctorModal(options) {
           ),
           renderButton({
             classNames: ["cbi-button-neutral"],
-            text: "🔄 " + _("Refresh"),
+            text: _("Refresh"),
             onClick: loadLanClients
           })
         ]
@@ -18230,7 +19023,7 @@ function renderAiDoctorModal(options) {
                     classNames: [
                       isDirect ? "cbi-button-action" : "cbi-button-apply"
                     ],
-                    text: isDirect ? "🛡️ " + _("Route via Proxy") : "⚡ " + _("Direct Bypass"),
+                    text: isDirect ? _("Route via Proxy") : _("Direct Bypass"),
                     onClick: async () => {
                       showToast(
                         _("Updating device routing mode..."),
@@ -18325,7 +19118,7 @@ function renderAiDoctorModal(options) {
               classNames: [
                 activeTab2 === "diagnosis" ? "cbi-button-action" : "cbi-button-neutral"
               ],
-              text: "🔍 " + _("Current Diagnosis"),
+              text: _("Current Diagnosis"),
               onClick: () => {
                 activeTab2 = "diagnosis";
                 renderModalLayout();
@@ -18335,7 +19128,7 @@ function renderAiDoctorModal(options) {
               classNames: [
                 activeTab2 === "devices" ? "cbi-button-action" : "cbi-button-neutral"
               ],
-              text: `📱 ${_("LAN Devices")} ${lanClients.length > 0 ? `(${lanClients.length})` : ""}`,
+              text: `${_("LAN Devices")} ${lanClients.length > 0 ? `(${lanClients.length})` : ""}`,
               onClick: () => {
                 activeTab2 = "devices";
                 if (lanClients.length === 0) {
@@ -18349,7 +19142,7 @@ function renderAiDoctorModal(options) {
               classNames: [
                 activeTab2 === "history" ? "cbi-button-action" : "cbi-button-neutral"
               ],
-              text: `🕒 ${_("History")} (${historyEntries.length})`,
+              text: `${_("History")} (${historyEntries.length})`,
               onClick: () => {
                 historyEntries = getAiDoctorHistory();
                 activeTab2 = "history";
@@ -18374,14 +19167,14 @@ function renderAiDoctorModal(options) {
               [
                 renderButton({
                   classNames: ["cbi-button-action"],
-                  text: "📋 " + _("Copy Support Report"),
+                  text: _("Copy Support Report"),
                   onClick: () => {
                     void copySupportReport();
                   }
                 }),
                 renderButton({
                   classNames: ["cbi-button-reset"],
-                  text: "🚨 " + _("Restore Native Internet (Stop Tachyon)"),
+                  text: _("Restore Native Internet (Stop Tachyon)"),
                   onClick: async () => {
                     showToast(
                       _(
@@ -18423,6 +19216,530 @@ function renderAiDoctorModal(options) {
   };
   renderModalLayout();
   uiObj?.showModal(_("AI Doctor Diagnosis"), mainContainer);
+}
+
+// src/tachyon/tabs/diagnostic/partials/renderRouteExplainModal.ts
+var ROUTE_PRESETS = [
+  { label: "Instagram", target: "instagram.com", port: 443, proto: "tcp" },
+  { label: "YouTube", target: "youtube.com", port: 443, proto: "tcp" },
+  { label: "Discord Voice", target: "discord.gg", port: 443, proto: "udp" },
+  { label: "Telegram", target: "t.me", port: 443, proto: "tcp" },
+  { label: "Cloudflare IP", target: "1.1.1.1", port: 443, proto: "tcp" }
+];
+function getVerdictMeta(verdict) {
+  switch (verdict) {
+    case "proxied":
+    case "proxy":
+      return {
+        label: _("PROXIED"),
+        badgeStyle: "background: #28a745; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;",
+        alertClass: "alert-message success"
+      };
+    case "zapret":
+    case "zapret2":
+      return {
+        label: _("DPI BYPASS (ZAPRET)"),
+        badgeStyle: "background: #17a2b8; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;",
+        alertClass: "alert-message info"
+      };
+    case "byedpi":
+      return {
+        label: _("DPI BYPASS (BYEDPI)"),
+        badgeStyle: "background: #17a2b8; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;",
+        alertClass: "alert-message info"
+      };
+    case "blocked":
+    case "block":
+    case "drop":
+      return {
+        label: _("BLOCKED"),
+        badgeStyle: "background: #dc3545; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;",
+        alertClass: "alert-message warning"
+      };
+    case "local":
+      return {
+        label: _("LOCAL LAN"),
+        badgeStyle: "background: #6c757d; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;",
+        alertClass: "alert-message info"
+      };
+    case "direct":
+    default:
+      return {
+        label: _("DIRECT (WAN)"),
+        badgeStyle: "background: #007bff; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;",
+        alertClass: "alert-message info"
+      };
+  }
+}
+function pickLocalizedExplanation(explanation) {
+  if (!explanation) return "";
+  if (typeof explanation === "string") return explanation;
+  const isRu = typeof document !== "undefined" && document.documentElement?.lang?.toLowerCase().startsWith("ru");
+  if (isRu && explanation.ru) return explanation.ru;
+  if (/[а-яё]/i.test(_("Available actions")) && explanation.ru) {
+    return explanation.ru;
+  }
+  return explanation.en || explanation.ru || "";
+}
+function renderRouteExplainModal(initialTarget = "instagram.com") {
+  let isRunning = false;
+  const targetInput = E("input", {
+    type: "text",
+    class: "cbi-input-text",
+    value: initialTarget,
+    placeholder: _("Domain, URL, or IP (e.g. instagram.com or 1.1.1.1)"),
+    style: "width: 100%; min-width: 200px;"
+  });
+  const clientInput = E("input", {
+    type: "text",
+    class: "cbi-input-text",
+    value: "192.168.1.100",
+    placeholder: _("Client IP or MAC (e.g. 192.168.1.100)"),
+    style: "width: 100%; min-width: 140px;"
+  });
+  const portInput = E("input", {
+    type: "number",
+    class: "cbi-input-text",
+    value: "443",
+    min: "1",
+    max: "65535",
+    style: "width: 90px;"
+  });
+  const protoSelect = E(
+    "select",
+    {
+      class: "cbi-input-select",
+      style: "width: 90px;"
+    },
+    [
+      E("option", { value: "tcp", selected: true }, "TCP"),
+      E("option", { value: "udp" }, "UDP")
+    ]
+  );
+  const statusLabel = E(
+    "div",
+    {
+      style: "font-size: 13px; font-weight: 500; margin-bottom: 12px; color: var(--text-color-medium, #6c757d);"
+    },
+    _(
+      "Enter a target domain or IP address to trace how Tachyon routes its traffic across all 7 pipeline stages."
+    )
+  );
+  const resultsContainer = E("div", {
+    style: "display: none; margin-bottom: 16px;"
+  });
+  const renderStageRow = (stepNum, stageTitle, summaryNode, detailsText, badgeText, badgeColor = "#6c757d") => {
+    return E("tr", { class: "tr cbi-section-table-row" }, [
+      E(
+        "td",
+        {
+          class: "td",
+          style: "width: 36px; text-align: center; font-weight: bold;"
+        },
+        String(stepNum)
+      ),
+      E("td", { class: "td", style: "width: 180px; font-weight: 600;" }, [
+        stageTitle
+      ]),
+      E("td", { class: "td" }, [
+        typeof summaryNode === "string" ? E("code", {}, summaryNode) : summaryNode,
+        detailsText ? E(
+          "div",
+          {
+            style: "font-size: 11px; color: var(--text-color-medium, #6c757d); margin-top: 2px;"
+          },
+          detailsText
+        ) : E("span")
+      ]),
+      E(
+        "td",
+        { class: "td", style: "width: 110px; text-align: center;" },
+        badgeText ? [
+          E(
+            "span",
+            {
+              class: "badge",
+              style: `background: ${badgeColor}; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 11px;`
+            },
+            badgeText
+          )
+        ] : ["—"]
+      )
+    ]);
+  };
+  const renderReport = (data) => {
+    resultsContainer.innerHTML = "";
+    if (typeof resultsContainer.replaceChildren === "function") {
+      resultsContainer.replaceChildren();
+    }
+    if (data.success === false || data.error) {
+      resultsContainer.appendChild(
+        E(
+          "div",
+          { class: "alert-message warning" },
+          data.error || _("Route explanation failed.")
+        )
+      );
+      resultsContainer.style.display = "block";
+      return;
+    }
+    const verdictKey = String(data.verdict || data.action || "direct");
+    const verdictMeta = getVerdictMeta(verdictKey);
+    const explanationText = pickLocalizedExplanation(data.explanation);
+    const query = data.query || {
+      client: clientInput.value.trim() || "192.168.1.100",
+      target: targetInput.value.trim(),
+      port: Number(portInput.value) || 443,
+      proto: protoSelect.value || "tcp"
+    };
+    const summaryCard = E(
+      "div",
+      {
+        class: verdictMeta.alertClass,
+        style: "margin-bottom: 14px;"
+      },
+      [
+        E(
+          "div",
+          {
+            style: "display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 6px;"
+          },
+          [
+            E(
+              "div",
+              { style: "display: flex; align-items: center; gap: 8px;" },
+              [
+                E("span", { style: verdictMeta.badgeStyle }, verdictMeta.label),
+                E(
+                  "b",
+                  {},
+                  `${query.client} → ${query.target}:${query.port} (${String(query.proto).toUpperCase()})`
+                )
+              ]
+            ),
+            data.matched_rule ? E(
+              "span",
+              { style: "font-size: 12px;" },
+              `${_("Matched rule")}: ${data.matched_rule.type} (${data.matched_rule.value})`
+            ) : E("span")
+          ]
+        ),
+        explanationText ? E("div", { style: "font-size: 12px;" }, explanationText) : E("span")
+      ]
+    );
+    resultsContainer.appendChild(summaryCard);
+    const stages = data.stages;
+    if (stages) {
+      const s1 = stages["1_client_classification"];
+      const s2 = stages["2_target_classification"];
+      const s3 = stages["3_section_matching"];
+      const s4 = stages["4_dns_decision"];
+      const s5 = stages["5_nftables_interception"];
+      const s6 = stages["6_policy_routing"];
+      const s7 = stages["7_engine_outbound"];
+      const rows = [];
+      if (s1) {
+        rows.push(
+          renderStageRow(
+            1,
+            _("Client Classification"),
+            `${s1.client}${s1.mac ? ` (${s1.mac})` : ""}`,
+            s1.details,
+            s1.is_excluded ? _("EXCLUDED") : _("ACTIVE"),
+            s1.is_excluded ? "#ffc107" : "#28a745"
+          )
+        );
+      }
+      if (s2) {
+        rows.push(
+          renderStageRow(
+            2,
+            _("Target Classification"),
+            `${s2.target}:${s2.port} (${String(s2.proto).toUpperCase()})`,
+            s2.details,
+            String(s2.target_type || "host").toUpperCase(),
+            s2.is_private_ip ? "#6c757d" : "#007bff"
+          )
+        );
+      }
+      if (s3) {
+        const secTitle = s3.section_label || s3.matched_section || _("Default rule");
+        rows.push(
+          renderStageRow(
+            3,
+            _("Section Matching"),
+            `${secTitle} — ${s3.rule_type}: ${s3.rule_value}`,
+            s3.details,
+            String(s3.action || "direct").toUpperCase(),
+            s3.matched_section ? "#28a745" : "#6c757d"
+          )
+        );
+      }
+      if (s4) {
+        rows.push(
+          renderStageRow(
+            4,
+            _("DNS Resolution"),
+            s4.resolver || s4.mode,
+            s4.details,
+            String(s4.mode || "direct").toUpperCase(),
+            s4.mode === "fakeip" || s4.mode === "tachyon_dns" ? "#28a745" : "#6c757d"
+          )
+        );
+      }
+      if (s5) {
+        rows.push(
+          renderStageRow(
+            5,
+            _("Firewall (nftables)"),
+            `${s5.table} / ${s5.chain} → ${s5.action}`,
+            s5.details,
+            s5.intercepted ? _("INTERCEPTED") : _("BYPASS"),
+            s5.intercepted ? "#28a745" : "#6c757d"
+          )
+        );
+      }
+      if (s6) {
+        rows.push(
+          renderStageRow(
+            6,
+            _("Policy Routing"),
+            `${_("Table")}: ${s6.table} (${s6.route})`,
+            s6.details,
+            s6.table.includes("100") || s6.table.includes("tachyon") ? _("TPROXY LO") : _("MAIN WAN"),
+            s6.table.includes("100") || s6.table.includes("tachyon") ? "#17a2b8" : "#6c757d"
+          )
+        );
+      }
+      if (s7) {
+        const outSummary = s7.group_tag ? `${s7.engine} → ${s7.group_tag} → ${s7.selected_node}${s7.node_type ? ` (${s7.node_type})` : ""}` : `${s7.engine} → ${s7.selected_node}`;
+        rows.push(
+          renderStageRow(
+            7,
+            _("Engine Outbound"),
+            outSummary,
+            s7.details,
+            String(s7.node_type || s7.outbound_tag || s7.engine).toUpperCase(),
+            s7.engaged === false ? "#6c757d" : "#28a745"
+          )
+        );
+      }
+      const stageTable = E(
+        "table",
+        {
+          class: "table cbi-section-table",
+          style: "width: 100%; margin-bottom: 8px; font-size: 12px;"
+        },
+        [
+          E("thead", {}, [
+            E("tr", { class: "tr cbi-section-table-titles" }, [
+              E("th", { class: "th", style: "width: 36px;" }, "#"),
+              E("th", { class: "th", style: "width: 180px;" }, _("Stage")),
+              E("th", { class: "th" }, _("Decision & Details")),
+              E(
+                "th",
+                { class: "th", style: "width: 110px; text-align: center;" },
+                _("State")
+              )
+            ])
+          ]),
+          E("tbody", {}, rows)
+        ]
+      );
+      resultsContainer.appendChild(stageTable);
+    }
+    resultsContainer.style.display = "block";
+  };
+  let traceBtn = null;
+  const runExplain = async () => {
+    if (isRunning) return;
+    const rawTarget = targetInput.value.trim();
+    if (!rawTarget) {
+      statusLabel.textContent = _(
+        "Please enter a target domain, URL, or IP address."
+      );
+      return;
+    }
+    isRunning = true;
+    if (traceBtn) traceBtn.disabled = true;
+    statusLabel.textContent = _("Tracing routing decision pipeline...");
+    try {
+      const clientVal = clientInput.value.trim() || "192.168.1.100";
+      const portVal = Math.max(
+        1,
+        Math.min(65535, Number(portInput.value) || 443)
+      );
+      const protoVal = protoSelect.value || "tcp";
+      const result = await runtimeClient.explainRoute(
+        clientVal,
+        rawTarget,
+        portVal,
+        protoVal
+      );
+      if (!result) {
+        statusLabel.textContent = _("Failed to trace route.");
+        resultsContainer.innerHTML = "";
+        if (typeof resultsContainer.replaceChildren === "function") {
+          resultsContainer.replaceChildren();
+        }
+        resultsContainer.appendChild(
+          E(
+            "div",
+            { class: "alert-message warning" },
+            _(
+              "Could not execute route explain command. Ensure Tachyon backend is installed properly."
+            )
+          )
+        );
+        resultsContainer.style.display = "block";
+      } else {
+        statusLabel.textContent = _("Route decision trace completed.");
+        renderReport(result);
+      }
+    } catch (err) {
+      statusLabel.textContent = _("An unexpected error occurred.");
+      resultsContainer.innerHTML = "";
+      if (typeof resultsContainer.replaceChildren === "function") {
+        resultsContainer.replaceChildren();
+      }
+      resultsContainer.appendChild(
+        E(
+          "div",
+          { class: "alert-message warning" },
+          err instanceof Error ? err.message : String(err)
+        )
+      );
+      resultsContainer.style.display = "block";
+    } finally {
+      isRunning = false;
+      if (traceBtn) traceBtn.disabled = false;
+    }
+  };
+  targetInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      void runExplain();
+    }
+  });
+  traceBtn = renderButton({
+    classNames: ["cbi-button-action"],
+    icon: renderCircleCheckBigIcon24,
+    text: _("Trace Route"),
+    onClick: runExplain
+  });
+  const presetButtons = ROUTE_PRESETS.map(
+    (preset) => renderButton({
+      classNames: ["cbi-button"],
+      text: `${preset.label} (${preset.port}/${preset.proto.toUpperCase()})`,
+      onClick: () => {
+        targetInput.value = preset.target;
+        portInput.value = String(preset.port);
+        protoSelect.value = preset.proto;
+        void runExplain();
+      }
+    })
+  );
+  const formNode = E(
+    "div",
+    {
+      class: "cbi-section-node",
+      style: "padding: 12px; margin-bottom: 12px; border-radius: 6px; background: var(--background-color-high, rgba(128,128,128,0.05)); border: 1px solid var(--border-color, rgba(128,128,128,0.15));"
+    },
+    [
+      E(
+        "div",
+        {
+          style: "display: grid; grid-template-columns: 1fr 180px 90px 90px auto; gap: 8px; align-items: end;"
+        },
+        [
+          E("div", {}, [
+            E(
+              "label",
+              {
+                style: "display: block; font-size: 11px; font-weight: 600; margin-bottom: 4px;"
+              },
+              _("Target (Domain / IP / URL)")
+            ),
+            targetInput
+          ]),
+          E("div", {}, [
+            E(
+              "label",
+              {
+                style: "display: block; font-size: 11px; font-weight: 600; margin-bottom: 4px;"
+              },
+              _("Client IP / MAC")
+            ),
+            clientInput
+          ]),
+          E("div", {}, [
+            E(
+              "label",
+              {
+                style: "display: block; font-size: 11px; font-weight: 600; margin-bottom: 4px;"
+              },
+              _("Port")
+            ),
+            portInput
+          ]),
+          E("div", {}, [
+            E(
+              "label",
+              {
+                style: "display: block; font-size: 11px; font-weight: 600; margin-bottom: 4px;"
+              },
+              _("Protocol")
+            ),
+            protoSelect
+          ]),
+          E("div", {}, [traceBtn])
+        ]
+      ),
+      E(
+        "div",
+        {
+          style: "display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px;"
+        },
+        [
+          E(
+            "span",
+            {
+              style: "font-size: 11px; color: var(--text-color-medium, #6c757d); margin-right: 4px;"
+            },
+            _("Quick presets:")
+          ),
+          ...presetButtons
+        ]
+      )
+    ]
+  );
+  const modalContent = E("div", { style: "max-width: 820px; width: 100%;" }, [
+    formNode,
+    statusLabel,
+    resultsContainer,
+    E(
+      "div",
+      {
+        class: "right",
+        style: "display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px;"
+      },
+      [
+        renderButton({
+          classNames: ["cbi-button"],
+          icon: renderRotateCcwIcon24,
+          text: _("Re-run Trace"),
+          onClick: runExplain
+        }),
+        renderButton({
+          classNames: ["cbi-button-neutral"],
+          text: _("Close"),
+          onClick: () => ui.hideModal()
+        })
+      ]
+    )
+  ]);
+  ui.showModal(_("Route Decision Explainer"), modalContent);
+  void runExplain();
 }
 
 // src/helpers/normalizeCompiledVersion.ts
@@ -19170,6 +20487,11 @@ var TACHYON_MASK_AFTER_TOKEN_SPACE = [
   "option bootstrap_dns_server",
   "list dns_server",
   "list bootstrap_dns_server",
+  "option dns_mtls_client_certificate",
+  "option dns_mtls_client_key",
+  "option dns_mtls_ca",
+  "option dns_mtls_certificate",
+  "option dns_mtls_endpoint",
   "option listen",
   "option listen_port",
   "option public_host",
@@ -19559,6 +20881,8 @@ async function fetchDiagnosticsProviderInfo({
         sing_box_tiny: uiState.capabilities.sing_box_tiny,
         sing_box_compressed: uiState.capabilities.sing_box_compressed,
         sing_box_lx: uiState.capabilities.sing_box_lx,
+        sing_box_tachyon_core: uiState.capabilities.sing_box_tachyon_core,
+        sing_box_fptn: uiState.capabilities.sing_box_fptn,
         sing_box_tailscale: uiState.capabilities.sing_box_tailscale,
         sing_box_cert_pin: uiState.capabilities.sing_box_cert_pin,
         zapret_installed: uiState.capabilities.zapret_installed,
@@ -19829,10 +21153,52 @@ async function handleShowGlobalCheck() {
     setDiagnosticActionLoading("globalCheck", false);
   }
 }
-async function handleRunDoctor() {
+function getDoctorModalTitle(issues, fixed, report) {
+  if (issues > 0 || fixed > 0) {
+    return _("Doctor repair") + " — " + _("Issues") + ": " + issues + ", " + _("Fixed") + ": " + fixed;
+  }
+  if (/safe bypass|аварийного обхода|bypassed|стоковом состоянии|stock (state|internet)/i.test(
+    report
+  )) {
+    return _("Doctor repair") + " — Safe Bypass";
+  }
+  return _("Doctor repair") + " — " + _("No issues found");
+}
+function showDoctorModal(report, issues, fixed) {
+  const title = getDoctorModalTitle(issues, fixed, report);
+  let isFixing = false;
+  const fixBtn = renderButton({
+    classNames: ["cbi-button-action"],
+    text: _("Fix"),
+    onClick: async () => {
+      if (isFixing) {
+        return;
+      }
+      isFixing = true;
+      fixBtn.disabled = true;
+      fixBtn.classList.add("tachyon-partial-button--loading");
+      try {
+        await handleRunDoctor(true);
+      } finally {
+        isFixing = false;
+        fixBtn.disabled = false;
+        fixBtn.classList.remove("tachyon-partial-button--loading");
+      }
+    }
+  });
+  ui.showModal(
+    title,
+    renderModal(report, "doctor_repair", {
+      initialAutoRefresh: false,
+      extraButtons: [fixBtn]
+    })
+  );
+}
+async function handleRunDoctor(fixParam = false) {
+  const fix = fixParam === true;
   setDiagnosticActionLoading("doctor", true);
   try {
-    const doctorRes = await TachyonShellMethods.doctor();
+    const doctorRes = await TachyonShellMethods.doctor(fix);
     if (!doctorRes || typeof doctorRes !== "object") {
       showToast(_("Doctor failed") + ": " + _("Unknown error"), "error");
       return;
@@ -19843,15 +21209,17 @@ async function handleRunDoctor() {
       const report = data ? String(data.report ?? "") : String(rawData ?? "");
       const issues = data ? Number(data.issues ?? 0) : 0;
       const fixed = data ? Number(data.fixed ?? 0) : 0;
-      const title = issues > 0 ? _("Doctor repair") + " — " + _("Issues") + ": " + issues + ", " + _("Fixed") + ": " + fixed : /safe bypass|аварийного обхода|bypassed|стоковом состоянии|stock (state|internet)/i.test(
-        report
-      ) ? _("Doctor repair") + " — Safe Bypass" : _("Doctor repair") + " — " + _("No issues found");
-      ui.showModal(
-        title,
-        renderModal(report, "doctor_repair", {
-          initialAutoRefresh: false
-        })
-      );
+      showDoctorModal(report, issues, fixed);
+      if (fix) {
+        showToast(
+          fixed > 0 ? _("Doctor fixes applied") + `: ${fixed}` : _("Doctor repair completed"),
+          "success"
+        );
+        await refreshDiagnosticServicesInfo({
+          force: true,
+          allowInactive: true
+        });
+      }
     } else {
       const errorMsg = typeof doctorRes.error === "string" ? doctorRes.error : _("Unknown error");
       showToast(_("Doctor failed") + ": " + errorMsg, "error");
@@ -19917,6 +21285,9 @@ async function handleRunAiDoctor() {
         report,
         quickFixes,
         backendNodes,
+        isTachyonCore: Boolean(
+          store.get().diagnosticsSystemInfo?.sing_box_tachyon_core
+        ),
         onRefreshServices: () => refreshDiagnosticServicesInfo({
           force: true,
           allowInactive: true
@@ -20020,8 +21391,11 @@ async function handleShowSingBoxConfig() {
       const maskedSingBoxConfigText = formatMaskedSingBoxConfig(
         showSingBoxConfig.data
       );
+      const isTachyonCore = Boolean(
+        store.get().diagnosticsSystemInfo?.sing_box_tachyon_core
+      );
       ui.showModal(
-        _("Show sing-box config"),
+        isTachyonCore ? _("Show Tachyon Core config") : _("Show sing-box config"),
         renderModal(rawSingBoxConfigText, "show_sing_box_config", {
           maskText: () => maskedSingBoxConfigText,
           initialAutoRefresh: false,
@@ -20077,6 +21451,9 @@ async function handleGenerateBugReport() {
       }
       return filtered.join("\n");
     };
+    const isTachyonCore = Boolean(
+      store.get().diagnosticsSystemInfo?.sing_box_tachyon_core
+    );
     const rawReport = [
       "--- TACHYON CONFIG ---",
       configResult || "Failed to fetch config",
@@ -20084,8 +21461,8 @@ async function handleGenerateBugReport() {
       "--- TACHYON LOGS ---",
       logsResult.code === 0 ? filterUdpErrors(logsResult.stdout) : "Failed to fetch tachyon logs",
       "",
-      "--- SING-BOX LOGS ---",
-      singboxLogsResult.code === 0 ? filterUdpErrors(singboxLogsResult.stdout) : "Failed to fetch sing-box logs"
+      isTachyonCore ? "--- TACHYON-CORE LOGS ---" : "--- SING-BOX LOGS ---",
+      singboxLogsResult.code === 0 ? filterUdpErrors(singboxLogsResult.stdout) : `Failed to fetch ${isTachyonCore ? "tachyon-core" : "sing-box"} logs`
     ].join("\n");
     const maskedReport = maskLogText(maskGlobalCheckText(rawReport));
     const blob = new Blob([maskedReport], { type: "text/plain;charset=utf-8" });
@@ -20201,7 +21578,7 @@ function renderDiagnosticAvailableActionsWidget() {
     doctor: {
       loading: diagnosticsActions.doctor.loading,
       visible: true,
-      onClick: handleRunDoctor,
+      onClick: () => handleRunDoctor(false),
       disabled: utilityActionsDisabled
     },
     aiDoctor: {
@@ -20240,6 +21617,12 @@ function renderDiagnosticAvailableActionsWidget() {
       disabled: false,
       onClick: handleOpenLeakCheck
     },
+    routeExplain: {
+      visible: true,
+      loading: false,
+      disabled: false,
+      onClick: () => renderRouteExplainModal()
+    },
     stabilityReport: {
       visible: true,
       loading: false,
@@ -20257,6 +21640,7 @@ function renderDiagnosticAvailableActionsWidget() {
     showSingBoxConfig: {
       loading: diagnosticsActions.showSingBoxConfig.loading,
       visible: true,
+      text: store.get().diagnosticsSystemInfo?.sing_box_tachyon_core ? _("Show Tachyon Core config") : _("Show sing-box config"),
       onClick: handleShowSingBoxConfig,
       disabled: utilityActionsDisabled
     },
@@ -20296,6 +21680,7 @@ function renderDiagnosticSystemInfoWidget() {
     diagnosticsSystemInfo.sing_box_version
   );
   const steerInstalled = Boolean(diagnosticsSystemInfo.steer_installed);
+  const singBoxRowLabel = diagnosticsSystemInfo.sing_box_tachyon_core ? "Tachyon Core" : "Sing-box";
   if (isSteer) {
     items.push({
       key: "Steer",
@@ -20304,14 +21689,14 @@ function renderDiagnosticSystemInfoWidget() {
     });
   } else {
     items.push({
-      key: "Sing-box",
+      key: singBoxRowLabel,
       value: formatSingBoxVersion(diagnosticsSystemInfo),
       tag: { label: _("active"), kind: "success" }
     });
   }
   if (isSteer && singBoxInstalled) {
     items.push({
-      key: "Sing-box",
+      key: singBoxRowLabel,
       value: formatSingBoxVersion(diagnosticsSystemInfo),
       tag: { label: _("installed"), kind: "warning" }
     });
@@ -21166,7 +22551,7 @@ function getTargetCellParts(connection) {
   };
 }
 function getRoute(connection) {
-  const chains = Array.isArray(connection.chains) ? connection.chains : [];
+  const chains = Array.isArray(connection.chains) ? connection.chains : Array.isArray(connection.metadata?.chains) ? connection.metadata.chains : [];
   const routeTag = [...chains].reverse().find(getRouteDisplayNameByTag);
   const fallbackRouteTag = getRouteTagFromRule(connection.rule);
   const route = getRouteDisplayNameByTag(routeTag || "") || getRouteDisplayNameByTag(fallbackRouteTag) || normalizeString(routeTag) || normalizeString(fallbackRouteTag);
@@ -23061,6 +24446,8 @@ function shouldApplyCompletedComponentActionResult(result, notify) {
 // src/tachyon/helpers/engine.ts
 function engineLabel(engine) {
   switch (engine) {
+    case "tachyon-core":
+      return "tachyon-core";
     case "steer":
       return "steer";
     case "steer-extended":
@@ -23655,6 +25042,20 @@ function computeSystemInfoMutation(currentSystemInfo, result) {
   }
   if (result.component === "sing_box") {
     nextSystemInfo.sing_box_version = version;
+    if (result.action === "install" || result.action === "install_version" || result.action === "reinstall" || result.action === "install_stable" || result.action === "install_tiny" || result.action === "install_extended" || result.action === "install_extended_compressed" || result.action === "install_lx") {
+      nextSystemInfo.sing_box_tachyon_core = 0;
+      nextSystemInfo.sing_box_fptn = 0;
+    }
+    if (result.action === "install_tachyon_core") {
+      nextSystemInfo.sing_box_tachyon_core = 1;
+      nextSystemInfo.sing_box_fptn = 1;
+      nextSystemInfo.sing_box_extended = 0;
+      nextSystemInfo.sing_box_tiny = 0;
+      nextSystemInfo.sing_box_compressed = 0;
+      nextSystemInfo.sing_box_lx = 0;
+      nextSystemInfo.sing_box_tailscale = 1;
+      nextSystemInfo.sing_box_cert_pin = 1;
+    }
     if (result.action === "install_extended") {
       nextSystemInfo.sing_box_extended = 1;
       nextSystemInfo.sing_box_tiny = 0;
@@ -23751,6 +25152,10 @@ function computeSystemInfoMutation(currentSystemInfo, result) {
     if (result.action === "remove") {
       nextSystemInfo.fptn_installed = 0;
       nextSystemInfo.fptn_version = "not installed";
+    } else if (result.action === "set_native_mode") {
+      nextSystemInfo.fptn_mode = "native";
+    } else if (result.action === "set_component_mode") {
+      nextSystemInfo.fptn_mode = "component";
     } else {
       nextSystemInfo.fptn_installed = 1;
       nextSystemInfo.fptn_version = version;
@@ -23840,12 +25245,12 @@ function steerModulesUciArgs(selection) {
 }
 
 // src/tachyon/tabs/updates/cardDefinitions.ts
-function getComponentCardTitle(component) {
+function getComponentCardTitle(component, isTachyonCore) {
   switch (component) {
     case "tachyon":
       return "Tachyon";
     case "sing_box":
-      return "Sing-box";
+      return isTachyonCore ? "Tachyon Core" : "Sing-box";
     case "zapret":
       return "Zapret";
     case "zapret2":
@@ -24014,6 +25419,7 @@ var componentActionStateRefreshPromise = null;
 var followedComponentJobs = /* @__PURE__ */ new Set();
 var handledComponentJobs = /* @__PURE__ */ new Set();
 var activeVersionPickerComponent = null;
+var versionPickerPage = 1;
 var versionPickerLoading = false;
 var versionPickerError = null;
 var versionPickerReleases = [];
@@ -24087,7 +25493,7 @@ function beginComponentAction(button) {
   setActionLoading(button.key, true, true);
   return true;
 }
-function setCheckResult(component, status, latestVersion, releaseUrl = "", currentSha = "", latestSha = "") {
+function setCheckResult(component, status, latestVersion, releaseUrl = "", currentSha = "", latestSha = "", releaseNotes = "") {
   const updatesChecks = store.get().updatesChecks;
   store.set({
     updatesChecks: {
@@ -24096,6 +25502,7 @@ function setCheckResult(component, status, latestVersion, releaseUrl = "", curre
         status,
         latest_version: latestVersion,
         release_url: releaseUrl,
+        ...releaseNotes ? { release_notes: releaseNotes } : {},
         ...currentSha ? { current_sha: currentSha } : {},
         ...latestSha ? { latest_sha: latestSha } : {}
       }
@@ -24115,7 +25522,8 @@ function applyCachedCheckResults(results) {
         result.latest_version || "",
         result.release_url || "",
         result.current_sha || "",
-        result.latest_sha || ""
+        result.latest_sha || "",
+        result.release_notes || ""
       );
     }
   });
@@ -24224,7 +25632,8 @@ async function applyCompletedComponentAction({
         result.latest_version || "",
         result.release_url || "",
         result.current_sha || "",
-        result.latest_sha || ""
+        result.latest_sha || "",
+        result.release_notes || ""
       );
       modalController?.updateVersions({
         currentVersion: getComponentCurrentVersion2(result.component),
@@ -24333,7 +25742,10 @@ async function followComponentActionState(state) {
       showUpdateProgressModal({
         component: state.component,
         action: state.action,
-        componentTitle: getComponentCardTitle(state.component),
+        componentTitle: getComponentCardTitle(
+          state.component,
+          state.component === "sing_box" && Boolean(store.get().diagnosticsSystemInfo?.sing_box_tachyon_core)
+        ),
         currentVersion: state.current_version,
         targetVersion: state.latest_version
       });
@@ -24448,7 +25860,10 @@ async function handleComponentAction(button) {
   if (!beginComponentAction(button)) {
     return;
   }
-  const cardTitle = getComponentCardTitle(button.component);
+  const cardTitle = getComponentCardTitle(
+    button.component,
+    button.component === "sing_box" && Boolean(store.get().diagnosticsSystemInfo?.sing_box_tachyon_core)
+  );
   const currentVersion = getComponentCurrentVersion2(button.component);
   const targetVersion = getExpectedLatestVersionForAction2(button);
   const checkResult = getVisibleCheckResult(button.component);
@@ -24609,7 +26024,8 @@ function getComponentCards() {
   const fptnInstalled = Boolean(systemInfo.fptn_installed);
   const tailscaleInstalled = Boolean(systemInfo.tailscale_installed);
   const singBoxInstalled = !isNotInstalled2(systemInfo.sing_box_version);
-  const singBoxStable = singBoxInstalled && !systemInfo.sing_box_extended && !systemInfo.sing_box_tiny;
+  const tachyonCore = Boolean(systemInfo.sing_box_tachyon_core);
+  const singBoxStable = singBoxInstalled && !systemInfo.sing_box_extended && !systemInfo.sing_box_tiny && !systemInfo.sing_box_tachyon_core;
   const singBoxExtended = Boolean(systemInfo.sing_box_extended) && !systemInfo.sing_box_compressed && !systemInfo.sing_box_lx;
   const singBoxExtendedCompressed = Boolean(systemInfo.sing_box_extended) && Boolean(systemInfo.sing_box_compressed);
   const singBoxLx = Boolean(systemInfo.sing_box_extended) && Boolean(systemInfo.sing_box_lx);
@@ -24681,6 +26097,15 @@ function getComponentCards() {
       action: "install_lx"
     });
   }
+  if (!tachyonCore) {
+    singBoxActions.push({
+      key: "singBoxInstallTachyonCore",
+      text: "tachyon-core",
+      icon: renderDownloadIcon24,
+      component: "sing_box",
+      action: "install_tachyon_core"
+    });
+  }
   const zapretActions = getOptionalComponentActions({
     component: "zapret",
     installed: zapretInstalled,
@@ -24729,6 +26154,24 @@ function getComponentCards() {
     removeKey: "fptnRemove",
     rollbackKey: "fptnRollback"
   });
+  const fptnModeChoiceAvailable = tachyonCore && fptnInstalled;
+  if (fptnModeChoiceAvailable) {
+    fptnActions.push(
+      systemInfo.fptn_mode === "native" ? {
+        key: "fptnSetComponentMode",
+        text: _("Via component"),
+        icon: renderRotateCcwIcon24,
+        component: "fptn",
+        action: "set_component_mode"
+      } : {
+        key: "fptnSetNativeMode",
+        text: _("Native (core)"),
+        icon: renderRotateCcwIcon24,
+        component: "fptn",
+        action: "set_native_mode"
+      }
+    );
+  }
   const tailscaleActions = getOptionalComponentActions({
     component: "tailscale",
     installed: tailscaleInstalled,
@@ -24794,12 +26237,12 @@ function getComponentCards() {
     {
       component: "sing_box",
       column: 0,
-      title: "Sing-box",
+      title: systemInfo.sing_box_tachyon_core ? "Tachyon Core" : "Sing-box",
       version: systemInfoLoading ? _("Loading...") : formatSingBoxVersion(systemInfo),
       badgeNode: systemInfoLoading ? null : renderSingBoxVariantBadge(systemInfo),
       latestVersion: getLatestVersion("sing_box"),
       releaseUrl: getGitHubReleaseUrl("sing_box"),
-      repoUrl: systemInfo.sing_box_repo_url || (singBoxLx ? "https://github.com/Leadaxe/sing-box-lx" : singBoxExtended || singBoxExtendedCompressed ? "https://github.com/shtorm-7/sing-box-extended" : COMPONENT_REPO_URLS.sing_box),
+      repoUrl: systemInfo.sing_box_repo_url || (tachyonCore ? "https://github.com/Dushnilin/tachyon-core" : singBoxLx ? "https://github.com/Leadaxe/sing-box-lx" : singBoxExtended || singBoxExtendedCompressed ? "https://github.com/shtorm-7/sing-box-extended" : COMPONENT_REPO_URLS.sing_box),
       actions: singBoxActions,
       // The package variants (stable/tiny) cannot install a picked tag - the
       // backend refuses before touching anything (issue #108), so do not offer
@@ -24879,7 +26322,7 @@ function getComponentCards() {
       component: "fptn",
       column: 2,
       title: "FPTN",
-      version: systemInfoLoading ? _("Loading...") : fptnInstalled ? systemInfo.fptn_version : _("Not installed"),
+      version: systemInfoLoading ? _("Loading...") : fptnInstalled ? fptnModeChoiceAvailable ? `${systemInfo.fptn_version} · ${systemInfo.fptn_mode === "native" ? _("native (core)") : _("component")}` : systemInfo.fptn_version : _("Not installed"),
       latestVersion: getLatestVersion("fptn"),
       releaseUrl: getGitHubReleaseUrl("fptn"),
       repoUrl: COMPONENT_REPO_URLS.fptn,
@@ -24907,9 +26350,15 @@ async function toggleVersionPicker(component) {
     return;
   }
   activeVersionPickerComponent = component;
+  versionPickerPage = 1;
+  await loadVersionPickerReleases(component, 1);
+}
+async function loadVersionPickerReleases(component, page) {
+  const cacheKey = `${component}:${page}`;
   versionPickerError = null;
-  if (versionPickerReleasesCache[component]) {
-    versionPickerReleases = versionPickerReleasesCache[component];
+  versionPickerPage = page;
+  if (versionPickerReleasesCache[cacheKey]) {
+    versionPickerReleases = versionPickerReleasesCache[cacheKey];
     versionPickerLoading = false;
     renderUpdatesComponents();
     return;
@@ -24920,30 +26369,31 @@ async function toggleVersionPicker(component) {
   try {
     const response = await TachyonShellMethods.componentListReleases(
       component,
-      5
+      5,
+      page
     );
-    if (activeVersionPickerComponent !== component) {
+    if (activeVersionPickerComponent !== component || versionPickerPage !== page) {
       return;
     }
     if (!response.success) {
       versionPickerError = response.error || _("No versions found");
       versionPickerReleases = [];
     } else if (!response.data || response.data.length === 0) {
-      versionPickerError = _("No versions found");
+      versionPickerError = page > 1 ? _("No more versions found") : _("No versions found");
       versionPickerReleases = [];
     } else {
       versionPickerReleases = response.data;
-      versionPickerReleasesCache[component] = response.data;
+      versionPickerReleasesCache[cacheKey] = response.data;
       versionPickerError = null;
     }
   } catch (_error) {
-    if (activeVersionPickerComponent !== component) {
+    if (activeVersionPickerComponent !== component || versionPickerPage !== page) {
       return;
     }
     versionPickerError = _("Failed to load versions");
     versionPickerReleases = [];
   } finally {
-    if (activeVersionPickerComponent === component) {
+    if (activeVersionPickerComponent === component && versionPickerPage === page) {
       versionPickerLoading = false;
       renderUpdatesComponents();
     }
@@ -24963,8 +26413,275 @@ async function handleInstallVersion(component, tag) {
   };
   await handleComponentAction(button);
 }
+function normalizeTagForMatch(tag) {
+  return String(tag || "").trim().replace(/^v/i, "");
+}
+function renderInlineReleaseMarkdown(text) {
+  const nodes = [];
+  const tokenRegex = /(\*\*([^*]+)\*\*|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = tokenRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(document.createTextNode(text.slice(lastIndex, match.index)));
+    }
+    if (match[2] !== void 0) {
+      nodes.push(E("strong", {}, match[2]));
+    } else if (match[3] !== void 0) {
+      nodes.push(
+        E(
+          "code",
+          {
+            style: "padding: 1px 5px; border-radius: 4px; background: rgba(128,128,128,0.16); font-family: monospace; font-size: 0.92em;"
+          },
+          match[3]
+        )
+      );
+    } else if (match[4] !== void 0 && match[5] !== void 0) {
+      nodes.push(E("strong", {}, match[4]));
+    }
+    lastIndex = tokenRegex.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    nodes.push(document.createTextNode(text.slice(lastIndex)));
+  }
+  return nodes.length > 0 ? nodes : [document.createTextNode(text)];
+}
+function renderFormattedReleaseNotes(container, rawText) {
+  container.innerHTML = "";
+  const normalized = String(rawText || "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    container.appendChild(
+      E(
+        "div",
+        { style: "opacity: 0.75;" },
+        _("No release description available.")
+      )
+    );
+    return;
+  }
+  const lines = normalized.split("\n");
+  let listItems = [];
+  let inCodeBlock = false;
+  let codeLines = [];
+  const flushList = () => {
+    if (listItems.length > 0) {
+      container.appendChild(
+        E(
+          "ul",
+          {
+            style: "margin: 4px 0 10px 18px; padding: 0; display: flex; flex-direction: column; gap: 4px;"
+          },
+          listItems
+        )
+      );
+      listItems = [];
+    }
+  };
+  const flushCodeBlock = () => {
+    if (codeLines.length > 0) {
+      container.appendChild(
+        E(
+          "pre",
+          {
+            style: "margin: 6px 0 10px; padding: 8px 10px; border-radius: 6px; background: rgba(0,0,0,0.2); overflow-x: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word;"
+          },
+          codeLines.join("\n")
+        )
+      );
+      codeLines = [];
+    }
+  };
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith("```")) {
+      flushList();
+      if (inCodeBlock) {
+        flushCodeBlock();
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      codeLines.push(rawLine);
+      continue;
+    }
+    if (!trimmed) {
+      flushList();
+      continue;
+    }
+    if (/^(-{3,}|\*{3,})$/.test(trimmed)) {
+      flushList();
+      container.appendChild(
+        E("hr", {
+          style: "border: none; border-top: 1px solid rgba(128,128,128,0.25); margin: 8px 0;"
+        })
+      );
+      continue;
+    }
+    const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      flushList();
+      const level = headingMatch[1].length;
+      const fontSize = level === 1 ? "15px" : level === 2 ? "14px" : "13px";
+      container.appendChild(
+        E(
+          "div",
+          {
+            style: `font-weight: 700; font-size: ${fontSize}; margin: 10px 0 4px;`
+          },
+          renderInlineReleaseMarkdown(headingMatch[2])
+        )
+      );
+      continue;
+    }
+    const bulletMatch = trimmed.match(/^(?:[-*•]|\d+\.)\s+(.+)$/);
+    if (bulletMatch) {
+      listItems.push(
+        E(
+          "li",
+          { style: "line-height: 1.45;" },
+          renderInlineReleaseMarkdown(bulletMatch[1])
+        )
+      );
+      continue;
+    }
+    flushList();
+    container.appendChild(
+      E(
+        "div",
+        { style: "margin: 4px 0; line-height: 1.45;" },
+        renderInlineReleaseMarkdown(trimmed)
+      )
+    );
+  }
+  flushList();
+  flushCodeBlock();
+}
+async function openReleaseNotesModal(opts) {
+  let currentNotes = (opts.notes || "").trim();
+  let currentVersion = (opts.version || "").trim();
+  const versionBadgeEl = E(
+    "span",
+    { class: "tachyon-update-modal__version-badge" },
+    currentVersion || _("Latest release")
+  );
+  const headerEl = E("div", { class: "tachyon-update-modal__header" }, [
+    E("div", { class: "tachyon-update-modal__header-info" }, [
+      E("b", { class: "tachyon-update-modal__component-name" }, opts.title),
+      versionBadgeEl
+    ])
+  ]);
+  const notesContainerEl = E(
+    "div",
+    {
+      class: "tachyon-update-modal__log",
+      style: "white-space: normal; word-break: break-word; font-family: inherit; font-size: 13px; line-height: 1.45; max-height: 420px; overflow-y: auto; padding: 12px 14px;"
+    },
+    []
+  );
+  if (currentNotes) {
+    renderFormattedReleaseNotes(notesContainerEl, currentNotes);
+  } else {
+    notesContainerEl.textContent = _("Loading release description...");
+  }
+  const logPanelEl = E("div", { class: "tachyon-update-modal__log-panel" }, [
+    E("div", { class: "tachyon-update-modal__log-header" }, [
+      E("b", {}, _("What's new?")),
+      renderButton({
+        classNames: ["cbi-button-action", "tachyon-update-modal__log-copy"],
+        text: _("Copy"),
+        onClick: () => copyToClipboard(currentNotes || notesContainerEl.textContent || "")
+      })
+    ]),
+    notesContainerEl
+  ]);
+  const actionsContainer = E(
+    "div",
+    {
+      class: "tachyon-update-modal__actions",
+      style: "display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap;"
+    },
+    [
+      renderButton({
+        classNames: ["cbi-button-neutral"],
+        text: _("Close"),
+        icon: renderXIcon24,
+        onClick: () => ui.hideModal()
+      })
+    ]
+  );
+  const modalBodyEl = E("div", { class: "tachyon-update-modal__body" }, [
+    headerEl,
+    logPanelEl,
+    actionsContainer
+  ]);
+  ui.showModal(`${_("What's new?")}: ${opts.title}`, modalBodyEl);
+  if (!currentNotes) {
+    try {
+      const cacheKey = `${opts.component}:1`;
+      let releases = versionPickerReleasesCache[cacheKey];
+      if (!releases || releases.length === 0) {
+        const res = await TachyonShellMethods.componentListReleases(
+          opts.component,
+          10,
+          1
+        );
+        if (res.success && Array.isArray(res.data)) {
+          releases = res.data;
+          versionPickerReleasesCache[cacheKey] = res.data;
+        }
+      }
+      if (releases && releases.length > 0) {
+        const wanted = normalizeTagForMatch(currentVersion);
+        const matched = (wanted ? releases.find((r) => normalizeTagForMatch(r.tag) === wanted) : void 0) || releases[0];
+        currentNotes = (matched.body || "").trim();
+        if (!currentVersion && matched.tag) {
+          currentVersion = matched.tag;
+          versionBadgeEl.textContent = currentVersion;
+        }
+      }
+      renderFormattedReleaseNotes(notesContainerEl, currentNotes);
+    } catch {
+      notesContainerEl.textContent = _("Failed to load release description.");
+    }
+  }
+}
 function renderVersionPickerDropdown(component) {
   const container = E("div", { class: "tachyon-version-picker" });
+  const customInput = E("input", {
+    type: "text",
+    class: "cbi-input-text tachyon-version-picker__custom-input",
+    placeholder: _("Custom tag (e.g. v1.2.3)"),
+    id: `tachyon-version-picker-custom-${component}`
+  });
+  const customInstallBtn = renderButton({
+    text: _("Install"),
+    loading: false,
+    disabled: isAnyActionLoading(),
+    onClick: () => {
+      const tag = customInput.value?.trim();
+      if (tag) {
+        void handleInstallVersion(component, tag);
+      }
+    }
+  });
+  customInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const tag = customInput.value?.trim();
+      if (tag) {
+        void handleInstallVersion(component, tag);
+      }
+    }
+  });
+  const customRow = E("div", { class: "tachyon-version-picker__custom" }, [
+    customInput,
+    customInstallBtn
+  ]);
+  container.appendChild(customRow);
   if (versionPickerLoading) {
     container.appendChild(
       E(
@@ -24973,46 +26690,101 @@ function renderVersionPickerDropdown(component) {
         _("Loading versions...")
       )
     );
-    return container;
-  }
-  if (versionPickerError) {
+  } else if (versionPickerError) {
     container.appendChild(
       E("div", { class: "tachyon-version-picker__error" }, versionPickerError)
     );
-    return container;
+  } else if (versionPickerReleases.length === 0) {
+    container.appendChild(
+      E(
+        "div",
+        { class: "tachyon-version-picker__empty" },
+        _("No versions found")
+      )
+    );
+  } else {
+    const list = E("div", { class: "tachyon-version-picker__list" });
+    for (const release of versionPickerReleases) {
+      const children = [
+        E("span", { class: "tachyon-version-picker__tag" }, release.tag)
+      ];
+      if (release.published) {
+        children.push(
+          E(
+            "span",
+            { class: "tachyon-version-picker__date" },
+            release.published
+          )
+        );
+      }
+      if (release.prerelease) {
+        children.push(
+          E(
+            "span",
+            { class: "tachyon-version-picker__prerelease" },
+            _("pre-release")
+          )
+        );
+      }
+      children.push(
+        renderButton({
+          text: _("What's new?"),
+          loading: false,
+          disabled: false,
+          onClick: () => void openReleaseNotesModal({
+            component,
+            title: getComponentCardTitle(component),
+            version: release.tag,
+            notes: release.body,
+            releaseUrl: release.release_url
+          })
+        })
+      );
+      children.push(
+        renderButton({
+          text: _("Install"),
+          loading: false,
+          disabled: isAnyActionLoading(),
+          onClick: () => void handleInstallVersion(component, release.tag)
+        })
+      );
+      list.appendChild(
+        E("div", { class: "tachyon-version-picker__item" }, children)
+      );
+    }
+    container.appendChild(list);
   }
-  const list = E("div", { class: "tachyon-version-picker__list" });
-  for (const release of versionPickerReleases) {
-    const children = [
-      E("span", { class: "tachyon-version-picker__tag" }, release.tag)
-    ];
-    if (release.published) {
-      children.push(
-        E("span", { class: "tachyon-version-picker__date" }, release.published)
-      );
-    }
-    if (release.prerelease) {
-      children.push(
-        E(
-          "span",
-          { class: "tachyon-version-picker__prerelease" },
-          _("pre-release")
-        )
-      );
-    }
-    children.push(
+  const hasReleasesOrNext = versionPickerReleases.length >= 5;
+  const paginationRow = E(
+    "div",
+    { class: "tachyon-version-picker__pagination" },
+    [
       renderButton({
-        text: _("Install"),
+        text: "← " + _("Previous"),
         loading: false,
-        disabled: isAnyActionLoading(),
-        onClick: () => void handleInstallVersion(component, release.tag)
+        disabled: versionPickerLoading || versionPickerPage <= 1,
+        onClick: () => {
+          if (versionPickerPage > 1) {
+            void loadVersionPickerReleases(component, versionPickerPage - 1);
+          }
+        }
+      }),
+      E(
+        "span",
+        { class: "tachyon-version-picker__page-num" },
+        `${_("Page")} ${versionPickerPage}`
+      ),
+      renderButton({
+        text: _("Next") + " →",
+        loading: false,
+        disabled: versionPickerLoading || !hasReleasesOrNext,
+        onClick: () => {
+          void loadVersionPickerReleases(component, versionPickerPage + 1);
+        }
       })
-    );
-    list.appendChild(
-      E("div", { class: "tachyon-version-picker__item" }, children)
-    );
-  }
-  container.appendChild(list);
+    ]
+  );
+  container.appendChild(paginationRow);
   return container;
 }
 function renderComponentCard(card) {
@@ -25060,21 +26832,27 @@ function renderComponentCard(card) {
     if (checkResult.status === "outdated") {
       labelText = _("Update is available:");
       const versionToShow = checkResult.latest_version || card.latestVersion || card.version;
-      if (checkResult.release_url) {
+      if (versionToShow || checkResult.release_url) {
         latestValueNodes.push(
           E(
             "a",
             {
               class: "tachyon_updates-page__component__release-version-link",
-              href: checkResult.release_url,
-              target: "_blank",
-              rel: "noopener noreferrer"
+              href: "#",
+              click: (e) => {
+                e.preventDefault();
+                void openReleaseNotesModal({
+                  component: card.component,
+                  title: card.title,
+                  version: versionToShow,
+                  notes: checkResult.release_notes,
+                  releaseUrl: checkResult.release_url
+                });
+              }
             },
-            versionToShow || _("Open")
+            versionToShow || _("What's new?")
           )
         );
-      } else if (versionToShow) {
-        latestValueNodes.push(document.createTextNode(versionToShow));
       }
     } else if (checkResult.status === "outdated_same_release") {
       labelText = _("Update is available for current release");
@@ -25097,24 +26875,46 @@ function renderComponentCard(card) {
     } else if (checkResult.status === "dev") {
       labelText = `${_("Installed version is newer than release")}. ${_("Latest version:")}`;
       const versionToShow = checkResult.latest_version || card.latestVersion;
-      if (checkResult.release_url) {
+      if (versionToShow || checkResult.release_url) {
         latestValueNodes.push(
           E(
             "a",
             {
               class: "tachyon_updates-page__component__release-version-link",
-              href: checkResult.release_url,
-              target: "_blank",
-              rel: "noopener noreferrer"
+              href: "#",
+              click: (e) => {
+                e.preventDefault();
+                void openReleaseNotesModal({
+                  component: card.component,
+                  title: card.title,
+                  version: versionToShow,
+                  notes: checkResult.release_notes,
+                  releaseUrl: checkResult.release_url
+                });
+              }
             },
-            versionToShow || _("Open")
+            versionToShow || _("What's new?")
           )
         );
-      } else if (versionToShow) {
-        latestValueNodes.push(document.createTextNode(versionToShow));
       }
     }
     if (labelText) {
+      if (card.supportsVersions || checkResult.release_notes || checkResult.release_url || card.repoUrl && card.component !== "tailscale") {
+        latestValueNodes.push(
+          renderButton({
+            text: _("What's new?"),
+            loading: false,
+            disabled: false,
+            onClick: () => void openReleaseNotesModal({
+              component: card.component,
+              title: card.title,
+              version: checkResult.latest_version || card.latestVersion || card.version,
+              notes: checkResult.release_notes,
+              releaseUrl: checkResult.release_url
+            })
+          })
+        );
+      }
       const rowChildren = [
         E(
           "span",
@@ -25127,7 +26927,8 @@ function renderComponentCard(card) {
           E(
             "span",
             {
-              class: "tachyon_updates-page__component__info-value tachyon_updates-page__component__info-value--latest"
+              class: "tachyon_updates-page__component__info-value tachyon_updates-page__component__info-value--latest",
+              style: "display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;"
             },
             latestValueNodes
           )
@@ -25229,18 +27030,45 @@ function renderComponentCard(card) {
       ])
     );
   }
-  if (card.supportsVersions) {
-    const isPickerOpen = activeVersionPickerComponent === card.component;
-    const versionsButton = renderButton({
-      text: isPickerOpen ? _("Hide versions") : _("Versions"),
-      loading: isPickerOpen && versionPickerLoading,
-      disabled: systemInfoLoading || anyActionLoading,
-      onClick: () => void toggleVersionPicker(card.component)
-    });
+  const canShowWhatsNew = Boolean(
+    card.supportsVersions || card.repoUrl && card.component !== "tailscale"
+  );
+  if (canShowWhatsNew) {
+    const isPickerOpen = card.supportsVersions && activeVersionPickerComponent === card.component;
+    const versionButtons = [];
+    if (card.supportsVersions) {
+      versionButtons.push(
+        renderButton({
+          text: isPickerOpen ? _("Hide versions") : _("Versions"),
+          loading: isPickerOpen && versionPickerLoading,
+          disabled: systemInfoLoading || anyActionLoading,
+          onClick: () => void toggleVersionPicker(card.component)
+        })
+      );
+    }
+    versionButtons.push(
+      renderButton({
+        text: _("What's new?"),
+        loading: false,
+        disabled: systemInfoLoading,
+        onClick: () => void openReleaseNotesModal({
+          component: card.component,
+          title: card.title,
+          version: checkResult?.latest_version || card.latestVersion || card.version,
+          notes: checkResult?.release_notes,
+          releaseUrl: checkResult?.release_url
+        })
+      })
+    );
     actionElements.push(
-      E("div", { class: "tachyon_updates-page__component__versions" }, [
-        versionsButton
-      ])
+      E(
+        "div",
+        {
+          class: "tachyon_updates-page__component__versions",
+          style: "display: flex; gap: 8px; flex-wrap: wrap;"
+        },
+        versionButtons
+      )
     );
     if (isPickerOpen) {
       actionElements.push(renderVersionPickerDropdown(card.component));
@@ -25315,11 +27143,12 @@ function renderEngineCard() {
     extended?.installed || systemInfo.steer_installed && systemInfo.steer_extended
   );
   const singBoxInstalled = !isNotInstalled2(systemInfo.sing_box_version);
-  const singBoxTiny = Boolean(systemInfo.sing_box_tiny);
+  const tachyonCore = Boolean(systemInfo.sing_box_tachyon_core) || isTachyonCoreVersion(systemInfo.sing_box_version);
+  const singBoxTiny = Boolean(systemInfo.sing_box_tiny) && !tachyonCore;
   const singBoxExtendedCompressed = Boolean(systemInfo.sing_box_extended) && Boolean(systemInfo.sing_box_compressed);
   const singBoxLx = Boolean(systemInfo.sing_box_lx);
   const singBoxExtended = Boolean(systemInfo.sing_box_extended) && !singBoxExtendedCompressed && !singBoxLx;
-  const singBoxStable = singBoxInstalled && !singBoxTiny && !singBoxExtended && !singBoxExtendedCompressed && !singBoxLx;
+  const singBoxStable = singBoxInstalled && !singBoxTiny && !singBoxExtended && !singBoxExtendedCompressed && !singBoxLx && !tachyonCore;
   const isSingBoxActive = active === "sing-box";
   const engineVersion = isSingBoxActive ? singBoxLoading ? _("Loading...") : formatSingBoxVersion(systemInfo) : systemInfo.steer_version || (baseInstalled || extendedInstalled ? _("Installed") : _("Not installed"));
   let engineBadgeNode = null;
@@ -25338,7 +27167,7 @@ function renderEngineCard() {
       "Base"
     );
   }
-  const engineRepoUrl = isSingBoxActive ? systemInfo.sing_box_repo_url || (singBoxLx ? "https://github.com/Leadaxe/sing-box-lx" : singBoxExtended || singBoxExtendedCompressed ? "https://github.com/shtorm-7/sing-box-extended" : COMPONENT_REPO_URLS.sing_box) : systemInfo.steer_repo_url || COMPONENT_REPO_URLS.steer;
+  const engineRepoUrl = isSingBoxActive ? systemInfo.sing_box_repo_url || (tachyonCore ? "https://github.com/Dushnilin/tachyon-core" : singBoxLx ? "https://github.com/Leadaxe/sing-box-lx" : singBoxExtended || singBoxExtendedCompressed ? "https://github.com/shtorm-7/sing-box-extended" : COMPONENT_REPO_URLS.sing_box) : systemInfo.steer_repo_url || COMPONENT_REPO_URLS.steer;
   const headerChildren = [
     E(
       "b",
@@ -25347,11 +27176,12 @@ function renderEngineCard() {
     )
   ];
   if (engineBadgeNode) headerChildren.push(engineBadgeNode);
+  const engineTitleLabel = isSingBoxActive && tachyonCore ? "tachyon-core" : engineLabel(active);
   headerChildren.push(
     E(
       "span",
       { class: "tachyon_updates-page__component__header-version" },
-      `${engineLabel(active)} ${engineVersion}`
+      `${engineTitleLabel} ${engineVersion}`
     )
   );
   if (engineRepoUrl) {
@@ -25383,21 +27213,27 @@ function renderEngineCard() {
     if (checkResult.status === "outdated") {
       labelText = _("Update is available:");
       const v = checkResult.latest_version || engineVersion;
-      if (checkResult.release_url) {
+      if (v || checkResult.release_url) {
         latestValueNodes.push(
           E(
             "a",
             {
               class: "tachyon_updates-page__component__release-version-link",
-              href: checkResult.release_url,
-              target: "_blank",
-              rel: "noopener noreferrer"
+              href: "#",
+              click: (e) => {
+                e.preventDefault();
+                void openReleaseNotesModal({
+                  component: checkComponent,
+                  title: engineTitleLabel,
+                  version: v,
+                  notes: checkResult.release_notes,
+                  releaseUrl: checkResult.release_url
+                });
+              }
             },
-            v || _("Open")
+            v || _("What's new?")
           )
         );
-      } else if (v) {
-        latestValueNodes.push(document.createTextNode(v));
       }
     } else if (checkResult.status === "outdated_same_release") {
       labelText = _("Update is available for current release");
@@ -25420,24 +27256,44 @@ function renderEngineCard() {
     } else if (checkResult.status === "dev") {
       labelText = `${_("Installed version is newer than release")}. ${_("Latest version:")}`;
       const v = checkResult.latest_version || getLatestVersion(checkComponent);
-      if (checkResult.release_url) {
+      if (v || checkResult.release_url) {
         latestValueNodes.push(
           E(
             "a",
             {
               class: "tachyon_updates-page__component__release-version-link",
-              href: checkResult.release_url,
-              target: "_blank",
-              rel: "noopener noreferrer"
+              href: "#",
+              click: (e) => {
+                e.preventDefault();
+                void openReleaseNotesModal({
+                  component: checkComponent,
+                  title: engineTitleLabel,
+                  version: v,
+                  notes: checkResult.release_notes,
+                  releaseUrl: checkResult.release_url
+                });
+              }
             },
-            v || _("Open")
+            v || _("What's new?")
           )
         );
-      } else if (v) {
-        latestValueNodes.push(document.createTextNode(v));
       }
     }
     if (labelText) {
+      latestValueNodes.push(
+        renderButton({
+          text: _("What's new?"),
+          loading: false,
+          disabled: false,
+          onClick: () => void openReleaseNotesModal({
+            component: checkComponent,
+            title: engineTitleLabel,
+            version: checkResult.latest_version || engineVersion,
+            notes: checkResult.release_notes,
+            releaseUrl: checkResult.release_url
+          })
+        })
+      );
       const rowChildren = [
         E(
           "span",
@@ -25450,7 +27306,8 @@ function renderEngineCard() {
           E(
             "span",
             {
-              class: "tachyon_updates-page__component__info-value tachyon_updates-page__component__info-value--latest"
+              class: "tachyon_updates-page__component__info-value tachyon_updates-page__component__info-value--latest",
+              style: "display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;"
             },
             latestValueNodes
           )
@@ -25470,7 +27327,7 @@ function renderEngineCard() {
     { class: "tachyon_updates-page__component__details" },
     detailsChildren
   ) : null;
-  const currentSingBoxVariant = singBoxTiny ? "sing-box-tiny" : singBoxExtendedCompressed ? "sing-box-extended-compressed" : singBoxLx ? "sing-box-lx" : singBoxExtended ? "sing-box-extended" : "sing-box-stable";
+  const currentSingBoxVariant = tachyonCore ? "tachyon-core" : singBoxTiny ? "sing-box-tiny" : singBoxExtendedCompressed ? "sing-box-extended-compressed" : singBoxLx ? "sing-box-lx" : singBoxExtended ? "sing-box-extended" : "sing-box-stable";
   const selectableVariants = [
     {
       id: "sing-box-stable",
@@ -25506,6 +27363,13 @@ function renderEngineCard() {
       group: "sing-box",
       installed: singBoxInstalled && singBoxLx,
       active: isSingBoxActive && singBoxLx
+    },
+    {
+      id: "tachyon-core",
+      label: "tachyon-core",
+      group: "sing-box",
+      installed: singBoxInstalled && tachyonCore,
+      active: isSingBoxActive && tachyonCore
     },
     {
       id: "steer",
@@ -25554,6 +27418,11 @@ function renderEngineCard() {
     if (id === "steer-extended") return "steer-extended";
     return "sing-box";
   }
+  function getVariantComponent(id) {
+    if (id === "steer") return "steer";
+    if (id === "steer-extended") return "steer-extended";
+    return "sing_box";
+  }
   function getVariantInstallAction(id) {
     switch (id) {
       case "sing-box-tiny":
@@ -25564,6 +27433,8 @@ function renderEngineCard() {
         return "install_extended_compressed";
       case "sing-box-lx":
         return "install_lx";
+      case "tachyon-core":
+        return "install_tachyon_core";
       default:
         return "install_stable";
     }
@@ -25667,7 +27538,7 @@ function renderEngineCard() {
     const presetId = presetForSteerModules(selection);
     const presetSelect = E("select", {
       class: "cbi-input-select",
-      style: "font-size:12px;"
+      style: "font-size:12px;width:auto;max-width:100%;"
     });
     const presetChoices = [
       { id: "all", label: _("All modules") },
@@ -25701,13 +27572,30 @@ function renderEngineCard() {
       });
       return E("label", { style: "white-space:nowrap;" }, [box, ` ${module}`]);
     });
+    const presetRow = E(
+      "div",
+      {
+        style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;"
+      },
+      [
+        E("span", { style: "font-size:12px;" }, `${_("Modules")}:`),
+        presetSelect
+      ]
+    );
+    const moduleRow = E(
+      "div",
+      {
+        style: "display:flex;align-items:center;gap:6px 16px;flex-wrap:wrap;font-size:12px;"
+      },
+      moduleBoxes
+    );
     actionElements.push(
       E(
         "div",
         {
-          style: "margin-top:4px;font-size:12px;gap:8px;align-items:center;flex-wrap:wrap;"
+          style: "margin-top:8px;display:flex;flex-direction:column;gap:6px;min-width:0;"
         },
-        [E("span", {}, `${_("Modules")}:`), presetSelect, ...moduleBoxes]
+        [presetRow, moduleRow]
       )
     );
   }
@@ -25735,19 +27623,46 @@ function renderEngineCard() {
       )
     );
   }
-  const isPickerOpen = activeVersionPickerComponent === checkComponent;
-  actionElements.push(
-    E("div", { class: "tachyon_updates-page__component__versions" }, [
+  const pickerHonoursTag = selectedVariant.id !== "sing-box-stable" && selectedVariant.id !== "sing-box-tiny";
+  const pickerComponent = getVariantComponent(selectedVariant.id);
+  const isPickerOpen = pickerHonoursTag && activeVersionPickerComponent === pickerComponent;
+  const engineVersionButtons = [];
+  if (pickerHonoursTag) {
+    engineVersionButtons.push(
       renderButton({
         text: isPickerOpen ? _("Hide versions") : _("Versions"),
         loading: isPickerOpen && versionPickerLoading,
         disabled: singBoxLoading || anyActionLoading || steerBusy,
-        onClick: () => void toggleVersionPicker(checkComponent)
+        onClick: () => void toggleVersionPicker(pickerComponent)
       })
-    ])
+    );
+  }
+  engineVersionButtons.push(
+    renderButton({
+      text: _("What's new?"),
+      loading: false,
+      disabled: singBoxLoading,
+      onClick: () => void openReleaseNotesModal({
+        component: pickerComponent,
+        title: selectedVariant.label,
+        version: checkResult?.latest_version || engineVersion,
+        notes: checkResult?.release_notes,
+        releaseUrl: checkResult?.release_url
+      })
+    })
+  );
+  actionElements.push(
+    E(
+      "div",
+      {
+        class: "tachyon_updates-page__component__versions",
+        style: "display: flex; gap: 8px; flex-wrap: wrap;"
+      },
+      engineVersionButtons
+    )
   );
   if (isPickerOpen) {
-    actionElements.push(renderVersionPickerDropdown(checkComponent));
+    actionElements.push(renderVersionPickerDropdown(pickerComponent));
   }
   const actionsContainer = E(
     "div",
@@ -25894,7 +27809,10 @@ async function runComponentAction(component, action, _key) {
     {
       component,
       action,
-      componentTitle: getComponentCardTitle(component),
+      componentTitle: getComponentCardTitle(
+        component,
+        component === "sing_box" && Boolean(store.get().diagnosticsSystemInfo?.sing_box_tachyon_core)
+      ),
       currentVersion: getComponentCurrentVersion2(component)
     },
     `${_("Active engine")}: ${engineLabel(engineTarget)}`
@@ -26485,6 +28403,45 @@ var styles6 = `
     border-radius: 3px;
     padding: 1px 4px;
 }
+
+.tachyon-version-picker__custom {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-color-low, #dee2e6);
+}
+
+.tachyon-version-picker__custom-input {
+    flex: 1 1 auto;
+    font-size: 12px;
+    padding: 4px 8px;
+    height: 30px;
+}
+
+.tachyon-version-picker__empty {
+    padding: 6px 0;
+    font-size: 12px;
+    color: var(--text-color-medium, #6c757d);
+    font-style: italic;
+}
+
+.tachyon-version-picker__pagination {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-color-low, #dee2e6);
+}
+
+.tachyon-version-picker__page-num {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-color-medium, #6c757d);
+}
 `;
 
 // src/tachyon/tabs/updates/index.ts
@@ -26790,6 +28747,36 @@ function injectGlobalStyles() {
   );
 }
 
+// src/helpers/applyAutofillProtection.ts
+var AUTOFILL_ATTRIBUTES = {
+  autocomplete: "off",
+  autocorrect: "off",
+  autocapitalize: "off",
+  spellcheck: "false"
+};
+var FIELD_SELECTOR = "input, textarea, select";
+function protectField(field) {
+  for (const [name, value] of Object.entries(AUTOFILL_ATTRIBUTES))
+    field.setAttribute(name, value);
+}
+function protectFields(root) {
+  if (!root || root.nodeType !== 1) return;
+  const element = root;
+  if (element.matches(FIELD_SELECTOR)) protectField(element);
+  for (const field of element.querySelectorAll(FIELD_SELECTOR))
+    protectField(field);
+}
+var observer = null;
+function applyAutofillProtection() {
+  protectFields(document.body);
+  if (observer) return;
+  observer = new MutationObserver((records) => {
+    for (const record of records)
+      for (const node of record.addedNodes) protectFields(node);
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
 // src/main.ts
 if (typeof structuredClone !== "function")
   globalThis.structuredClone = (obj) => JSON.parse(JSON.stringify(obj));
@@ -26806,6 +28793,7 @@ return baseclass.extend({
   TACHYON_UCI_PACKAGE,
   TachyonShellMethods,
   UpdatesTab,
+  applyAutofillProtection,
   applyUiStateToStore,
   bulkValidate,
   coreService,
@@ -26818,6 +28806,7 @@ return baseclass.extend({
   renderDnsBenchmarkModal,
   showToast,
   store,
+  supportsVpnUrl,
   validateDNS,
   validateDomain,
   validateIP,

@@ -33,7 +33,16 @@ function isDownloadSectionAction(action, capabilities) {
     case "proxy":
     case "outbound":
     case "vpn":
+    case "fptn":
     case "awg":
+    case "warp":
+    case "anytls":
+    case "snell":
+    case "mieru":
+    case "naive":
+    case "sudoku":
+    case "masque":
+    case "openvpn":
       return true;
     case "zapret":
       return !capabilities?.loaded || Boolean(capabilities.zapretInstalled);
@@ -126,6 +135,19 @@ function configureDnsList(option, choices, defaultValue) {
     }
     const validation = main.validateDNS(normalized);
     return validation.valid ? true : validation.message;
+  };
+  const origRenderWidget = option.renderWidget;
+  option.renderWidget = function (section_id, option_index, cfgvalue) {
+    const node = origRenderWidget.call(
+      this,
+      section_id,
+      option_index,
+      cfgvalue,
+    );
+    if (this.speedTestController && node) {
+      this.speedTestController.attachList(node, { alwaysEnabled: true });
+    }
+    return node;
   };
 }
 
@@ -513,6 +535,12 @@ function createSnapshotsWidget() {
   });
   btnSave.textContent = _("Save Snapshot");
 
+  const btnImport = E("button", {
+    class: "btn cbi-button cbi-button-action",
+    type: "button",
+  });
+  btnImport.textContent = _("Import Profile");
+
   const listEl = E("div", {
     style: "display:flex;flex-direction:column;gap:6px;",
   });
@@ -532,18 +560,120 @@ function createSnapshotsWidget() {
     return size + " B";
   }
 
-  function execSnapshot(args) {
+  function execSnapshotJson(args) {
     return fs.exec("/usr/bin/tachyon", args).then(function (res) {
-      let ok = false;
+      let parsed = null;
       try {
-        let stdout = ((res && res.stdout) || "").trim();
-        let match = stdout.match(/\{[\s\S]*\}/);
-        ok = JSON.parse(match ? match[0] : stdout).success !== false;
+        const stdout = ((res && res.stdout) || "").trim();
+        const match = stdout.match(/\{[\s\S]*\}/);
+        parsed = JSON.parse(match ? match[0] : stdout);
       } catch (e) {
-        ok = false;
+        parsed = null;
       }
-      if (!ok) throw new Error("command failed");
+      if (!parsed || parsed.success === false) {
+        throw new Error((parsed && parsed.message) || "command failed");
+      }
+      return parsed;
     });
+  }
+
+  function execSnapshot(args) {
+    return execSnapshotJson(args).then(function () {});
+  }
+
+  function showDiffModal(snap) {
+    execSnapshotJson(["snapshot_diff", snap.file])
+      .then(function (data) {
+        const diffPre = E(
+          "pre",
+          {
+            style:
+              "max-height:320px;overflow:auto;padding:10px;border-radius:6px;border:1px solid var(--border-color,#dee2e6);background:var(--background-color-low,#f8f9fa);font-family:monospace;font-size:12px;white-space:pre-wrap;margin:8px 0;",
+          },
+          data.has_changes
+            ? data.diff || ""
+            : _("No differences with active configuration (secrets masked)."),
+        );
+
+        ui.showModal(
+          _("Snapshot Diff") + ": " + (snap.name || ""),
+          [
+            E(
+              "p",
+              {
+                style: "font-size:12px;color:var(--text-color-medium,#888);",
+              },
+              _(
+                "Secrets and credentials are masked as ***. Added lines (+): ",
+              ) +
+                String(data.added_count || 0) +
+                " · " +
+                _("Removed lines (-): ") +
+                String(data.removed_count || 0),
+            ),
+            diffPre,
+            E("div", { class: "button-row" }, [
+              E(
+                "button",
+                {
+                  class: "btn cbi-button cbi-button-neutral",
+                  type: "button",
+                  click: function () {
+                    ui.hideModal();
+                  },
+                },
+                _("Close"),
+              ),
+              E(
+                "button",
+                {
+                  class: "btn cbi-button cbi-button-negative",
+                  type: "button",
+                  click: function () {
+                    ui.hideModal();
+                    performRestore(snap.file);
+                  },
+                },
+                _("Restore"),
+              ),
+            ]),
+          ],
+          "cbi-modal",
+        );
+      })
+      .catch(function () {
+        ui.addNotification(
+          null,
+          E("p", {}, _("Failed to compare snapshot")),
+          "error",
+        );
+      });
+  }
+
+  function performExport(snap) {
+    execSnapshotJson(["snapshot_export", snap.file])
+      .then(function (data) {
+        const payload = JSON.stringify(data.profile || data, null, 2);
+        const blob = new Blob([payload], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download =
+          (snap.name || "tachyon") +
+          (snap.stamp ? "-" + snap.stamp : "") +
+          ".tachyon-profile.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      })
+      .catch(function () {
+        ui.addNotification(
+          null,
+          E("p", {}, _("Failed to export snapshot")),
+          "error",
+        );
+      });
   }
 
   function performRestore(file) {
@@ -628,6 +758,32 @@ function createSnapshotsWidget() {
               },
               formatStamp(snap.stamp) +
                 (snap.size != null ? " \u00b7 " + formatSize(snap.size) : ""),
+            ),
+          );
+          row.appendChild(
+            E(
+              "button",
+              {
+                class: "btn cbi-button cbi-button-neutral",
+                type: "button",
+                click: function () {
+                  showDiffModal(snap);
+                },
+              },
+              _("Diff"),
+            ),
+          );
+          row.appendChild(
+            E(
+              "button",
+              {
+                class: "btn cbi-button cbi-button-neutral",
+                type: "button",
+                click: function () {
+                  performExport(snap);
+                },
+              },
+              _("Export"),
             ),
           );
           row.appendChild(
@@ -811,22 +967,101 @@ function createSnapshotsWidget() {
     );
   });
 
+  btnImport.addEventListener("click", function () {
+    const textarea = E("textarea", {
+      class: "cbi-input-textarea",
+      style:
+        "width:100%;min-height:140px;font-family:monospace;font-size:12px;",
+      placeholder: '{"format": "tachyon-profile-v1", ...}',
+    });
+    const fileInput = E("input", {
+      type: "file",
+      accept: ".json,application/json",
+      style: "margin-bottom:8px;",
+    });
+    fileInput.addEventListener("change", function () {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = function (ev) {
+        textarea.value = String((ev && ev.target && ev.target.result) || "");
+      };
+      reader.readAsText(f);
+    });
+
+    ui.showModal(
+      _("Import Snapshot Profile"),
+      [
+        E(
+          "p",
+          {},
+          _(
+            "Select an exported .tachyon-profile.json file or paste its JSON contents below.",
+          ),
+        ),
+        fileInput,
+        textarea,
+        E("div", { class: "button-row" }, [
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-neutral",
+              type: "button",
+              click: function () {
+                ui.hideModal();
+              },
+            },
+            _("Cancel"),
+          ),
+          E(
+            "button",
+            {
+              class: "btn cbi-button cbi-button-positive",
+              type: "button",
+              click: function () {
+                const raw = (textarea.value || "").trim();
+                if (!raw) return;
+                ui.hideModal();
+                execSnapshot(["snapshot_import", raw])
+                  .then(function () {
+                    loadSnapshots();
+                  })
+                  .catch(function () {
+                    ui.addNotification(
+                      null,
+                      E("p", {}, _("Failed to import snapshot profile")),
+                      "error",
+                    );
+                  });
+              },
+            },
+            _("Import"),
+          ),
+        ]),
+      ],
+      "cbi-modal",
+    );
+  });
+
   wrapper.appendChild(
     E(
       "div",
       {
         style: "display:flex;align-items:center;gap:12px;flex-wrap:wrap;",
       },
-      btnSave,
-      E(
-        "span",
-        {
-          style: "font-size:12px;color:var(--text-color-medium,#888);",
-        },
-        _(
-          "Up to 10 snapshots are kept; the oldest ones are removed automatically.",
+      [
+        btnSave,
+        btnImport,
+        E(
+          "span",
+          {
+            style: "font-size:12px;color:var(--text-color-medium,#888);",
+          },
+          _(
+            "Up to 10 snapshots are kept; the oldest ones are removed automatically.",
+          ),
         ),
-      ),
+      ],
     ),
   );
   wrapper.appendChild(listEl);
@@ -1482,16 +1717,14 @@ function createComponentsVisibilityWidget(option, section_id) {
           E(
             "div",
             {
-              style:
-                "font-weight:600;font-size:0.875rem;color:inherit;",
+              style: "font-weight:600;font-size:0.875rem;color:inherit;",
             },
             c.label,
           ),
           E(
             "div",
             {
-              style:
-                "font-size:0.75rem;opacity:0.75;",
+              style: "font-size:0.75rem;opacity:0.75;",
             },
             c.desc,
           ),
@@ -1604,7 +1837,7 @@ function createSettingsContent(section, capabilities) {
       "Automatically benchmark latency, packet loss, and anti-censorship reliability of major DNS servers (UDP/DoH) from this router to find and apply the optimal configuration.",
     ),
   );
-  dnsBenchmarkBtn.inputtitle = "⚡ " + _("Auto-Tune & Benchmark DNS");
+  dnsBenchmarkBtn.inputtitle = _("Auto-Tune & Benchmark DNS");
   dnsBenchmarkBtn.inputstyle = "action important";
   dnsBenchmarkBtn.onclick = function () {
     if (main && typeof main.renderDnsBenchmarkModal === "function") {
@@ -1622,15 +1855,29 @@ function createSettingsContent(section, capabilities) {
     "_dns_speed_test",
     _("DNS speed test"),
     _(
-      "Test the selected DoH servers from this router without changing settings. Click a ping for details.",
+      "Test the selected Main, Bootstrap, and Fallback DNS servers from this router without changing settings. Click a ping for details.",
     ),
   );
   dnsSpeedOption.renderWidget = function (section_id) {
-    return dnsSpeedController.renderToolbar(() => ({
-      protocol:
-        dnsTypeOption.formvalue(section_id) || settingsDnsDynamicState.dnsType,
-      servers: optionListValues(dnsOption, section_id),
-    }));
+    return dnsSpeedController.renderToolbar(() => {
+      const protocol =
+        dnsTypeOption.formvalue(section_id) ||
+        settingsDnsDynamicState.dnsType ||
+        "udp";
+      const mainServers =
+        protocol === "doh" || protocol === "udp"
+          ? optionListValues(dnsOption, section_id)
+          : [];
+      const udpServers = [
+        ...optionListValues(bootstrapOption, section_id),
+        ...optionListValues(fallbackDnsOption, section_id),
+      ];
+      return {
+        protocol,
+        servers: mainServers,
+        udp_servers: udpServers,
+      };
+    });
   };
   dnsSpeedOption.write = function () {};
   dnsSpeedOption.remove = function () {};
@@ -1695,6 +1942,7 @@ function createSettingsContent(section, capabilities) {
       "DNS server used to obtain IP addresses for upstream DNS and proxies. If multiple servers are selected, a timeout switches to a backup.",
     ),
   );
+  bootstrapOption.speedTestController = dnsSpeedController;
   configureDnsList(
     bootstrapOption,
     main.BOOTSTRAP_DNS_SERVER_OPTIONS,
@@ -1710,6 +1958,7 @@ function createSettingsContent(section, capabilities) {
       "Plain-UDP DNS servers used as a last resort when all primary DNS fail. These are always unencrypted (no DoH/DoT). Example: 1.1.1.1, 8.8.8.8. Unlike the ISP fallback toggle, these are your own chosen servers.",
     ),
   );
+  fallbackDnsOption.speedTestController = dnsSpeedController;
   configureDnsList(fallbackDnsOption, main.BOOTSTRAP_DNS_SERVER_OPTIONS, "");
   fallbackDnsOption.rmempty = true;
   fallbackDnsOption.default = [];
@@ -1950,11 +2199,10 @@ function createSettingsContent(section, capabilities) {
       const rawVal =
         input && input.value !== undefined && input.value !== ""
           ? input.value
-          : (cfgvalue || 10000);
+          : cfgvalue || 10000;
       const val = parseInt(rawVal, 10);
       if (isNaN(val) || val <= 0) {
-        calcNode.textContent =
-          "⚡ " + _("Local DNS caching disabled (0 entries)");
+        calcNode.textContent = _("Local DNS caching disabled (0 entries)");
         return;
       }
       const bytes = val * 120;
@@ -1964,7 +2212,6 @@ function createSettingsContent(section, capabilities) {
           : (bytes / (1024 * 1024)).toFixed(1) + " MB";
 
       calcNode.innerHTML =
-        "📊 " +
         _("Estimated RAM usage (max):") +
         " <strong>~" +
         sizeText +
@@ -2234,15 +2481,25 @@ function createSettingsContent(section, capabilities) {
 
   o = section.taboption(
     "services",
-    form.Flag,
+    form.ListValue,
     "disable_quic",
     _("Disable QUIC"),
     _(
-      "Disable the QUIC protocol to improve compatibility or fix issues with video streaming",
+      "Disable the QUIC protocol to improve compatibility or fix issues with video streaming. Tunneled also rejects QUIC handed to the proxy; All rejects every UDP/443 outright.",
     ),
   );
-  o.default = "0";
+  o.value("off", _("Off"));
+  o.value("tunneled", _("Tunneled"));
+  o.value("all", _("All"));
+  o.default = "off";
   o.rmempty = false;
+  o.cfgvalue = function (section_id) {
+    const value = uci.get(UCI_PACKAGE, section_id, "disable_quic");
+    // legacy flag values keep their meaning across the mode split
+    if (value === "1" || value === "true" || value === "yes" || value === "on")
+      return "tunneled";
+    return value === "all" ? "all" : "off";
+  };
 
   o = section.taboption(
     "services",
@@ -2259,12 +2516,44 @@ function createSettingsContent(section, capabilities) {
   o = section.taboption(
     "services",
     form.Flag,
-    "isolate_p2p",
-    _("P2P Leak Protection"),
-    _("Isolate BitTorrent traffic and force it direct to prevent VPN bans"),
+    "wifi_calling_direct",
+    _("Wi-Fi Calling Direct (VoWiFi)"),
+    _(
+      "Route IPsec IKEv2 / ESP-in-UDP (UDP 500, 4500) directly via WAN so mobile Wi-Fi Calling works reliably without VPN interference",
+    ),
   );
   o.default = "0";
   o.rmempty = false;
+
+  o = section.taboption(
+    "services",
+    form.ListValue,
+    "bittorrent_policy",
+    _("BitTorrent / P2P Policy"),
+    _(
+      "Control how BitTorrent and P2P traffic is handled: allow normal routing, force direct via WAN to prevent VPN bans, or block completely.",
+    ),
+  );
+  o.value("off", _("Off (Allow)"));
+  o.value("direct", _("Direct (Bypass Proxy / Leak Protection)"));
+  o.value("block", _("Block BitTorrent Traffic"));
+  o.default = "off";
+  o.rmempty = false;
+  o.cfgvalue = function (section_id) {
+    const val = uci.get(UCI_PACKAGE, section_id, "bittorrent_policy");
+    if (val === "direct" || val === "block" || val === "off") return val;
+    const legacy = uci.get(UCI_PACKAGE, section_id, "isolate_p2p");
+    return legacy === "1" ? "direct" : "off";
+  };
+  o.write = function (section_id, value) {
+    uci.set(UCI_PACKAGE, section_id, "bittorrent_policy", value);
+    uci.set(
+      UCI_PACKAGE,
+      section_id,
+      "isolate_p2p",
+      value === "direct" ? "1" : "0",
+    );
+  };
 
   o = section.taboption(
     "services",
@@ -2272,10 +2561,11 @@ function createSettingsContent(section, capabilities) {
     "p2p_ports",
     _("P2P Client Ports"),
     _(
-      'Pin P2P isolation to the torrent client\'s own ports, comma separated. Each entry is "proto", "proto:port" or "proto:port-port" (tcp/udp). Without a port the whole protocol is routed direct.',
+      'Pin P2P policy to the torrent client\'s own ports, comma separated. Each entry is "proto", "proto:port" or "proto:port-port" (tcp/udp). Without a port the whole protocol is matched.',
     ),
   );
-  o.depends("isolate_p2p", "1");
+  o.depends("bittorrent_policy", "direct");
+  o.depends("bittorrent_policy", "block");
   o.placeholder = "tcp:6881,udp:6881-6889";
   o.validate = function (_section_id, value) {
     if (!value || !value.trim()) {
@@ -2285,7 +2575,9 @@ function createSettingsContent(section, capabilities) {
     const entries = value.split(",");
     for (const entry of entries) {
       const trimmed = entry.trim();
-      if (!/^((tcp|udp):)?[0-9]{1,5}(-[0-9]{1,5})?$|^(tcp|udp)$/.test(trimmed)) {
+      if (
+        !/^((tcp|udp):)?[0-9]{1,5}(-[0-9]{1,5})?$|^(tcp|udp)$/.test(trimmed)
+      ) {
         return _(
           'Each entry must be "proto", "proto:port" or "proto:port-port" (tcp/udp), e.g. tcp:6881,udp:6881-6889',
         );
@@ -2293,7 +2585,9 @@ function createSettingsContent(section, capabilities) {
 
       const portSpec = trimmed.includes(":")
         ? trimmed.split(":")[1]
-        : (/^[0-9]/.test(trimmed) ? trimmed : null);
+        : /^[0-9]/.test(trimmed)
+          ? trimmed
+          : null;
       if (!portSpec) {
         continue;
       }
@@ -2414,27 +2708,76 @@ function createSettingsContent(section, capabilities) {
 
     function renderStepIcon(state) {
       if (state === "done")
-        return E("span", { style: "color: var(--color-green-base, #2ecc71); font-weight: bold;" }, "\u2713");
+        return E(
+          "span",
+          {
+            style:
+              "color: var(--color-green-base, #2ecc71); font-weight: bold;",
+          },
+          "\u2713",
+        );
       if (state === "error")
-        return E("span", { style: "color: var(--color-red-base, #e74c3c); font-weight: bold;" }, "\u2717");
+        return E(
+          "span",
+          {
+            style: "color: var(--color-red-base, #e74c3c); font-weight: bold;",
+          },
+          "\u2717",
+        );
       if (state === "active")
-        return E("span", { class: "spinning", style: "color: var(--color-blue-base, #3498db);" }, "\u25CB");
-      return E("span", { style: "color: var(--text-color-medium, #999);" }, "\u25CB");
+        return E(
+          "span",
+          {
+            class: "spinning",
+            style: "color: var(--color-blue-base, #3498db);",
+          },
+          "\u25CB",
+        );
+      return E(
+        "span",
+        { style: "color: var(--text-color-medium, #999);" },
+        "\u25CB",
+      );
     }
 
-    const stepsContainer = E("div", { style: "display: flex; flex-direction: column; gap: 8px; margin: 12px 0;" });
+    const stepsContainer = E("div", {
+      style: "display: flex; flex-direction: column; gap: 8px; margin: 12px 0;",
+    });
     const stepEls = steps.map((step) => {
-      const row = E("div", { style: "display: flex; align-items: center; gap: 8px; padding: 4px 0; transition: opacity 0.3s;" }, [
-        renderStepIcon("pending"),
-        E("span", { style: "font-size: 13px; color: var(--text-color-medium, #666);" }, step.label),
-      ]);
+      const row = E(
+        "div",
+        {
+          style:
+            "display: flex; align-items: center; gap: 8px; padding: 4px 0; transition: opacity 0.3s;",
+        },
+        [
+          renderStepIcon("pending"),
+          E(
+            "span",
+            {
+              style: "font-size: 13px; color: var(--text-color-medium, #666);",
+            },
+            step.label,
+          ),
+        ],
+      );
       stepsContainer.appendChild(row);
-      return { el: row, iconEl: row.childNodes[0], labelEl: row.childNodes[1], key: step.key };
+      return {
+        el: row,
+        iconEl: row.childNodes[0],
+        labelEl: row.childNodes[1],
+        key: step.key,
+      };
     });
 
-    const detailText = E("p", {
-      style: "margin: 4px 0 0; font-size: 12px; color: var(--text-color-medium, #999); min-height: 18px;",
-    }, _("Starting lists update..."));
+    const detailText = E(
+      "p",
+      {
+        style:
+          "margin: 4px 0 0; font-size: 12px; color: var(--text-color-medium, #999); min-height: 18px;",
+      },
+      _("Starting lists update..."),
+    );
 
     let pollTimer = null;
     let pollAttempts = 0;
@@ -2505,10 +2848,11 @@ function createSettingsContent(section, capabilities) {
       _("Close"),
     );
 
-    const modalBody = E("div", { style: "display: flex; flex-direction: column; gap: 4px;" }, [
-      stepsContainer,
-      detailText,
-    ]);
+    const modalBody = E(
+      "div",
+      { style: "display: flex; flex-direction: column; gap: 4px;" },
+      [stepsContainer, detailText],
+    );
 
     ui.showModal(_("Updating lists..."), [
       modalBody,
@@ -2554,7 +2898,9 @@ function createSettingsContent(section, capabilities) {
             stopPolling();
             if (data.success !== false) {
               markAllDone();
-              detailText.textContent = _("Lists and rule sets successfully updated!");
+              detailText.textContent = _(
+                "Lists and rule sets successfully updated!",
+              );
               detailText.style.color = "var(--color-green-base, #2ecc71)";
               setTimeout(function () {
                 ui.hideModal();
@@ -2574,7 +2920,8 @@ function createSettingsContent(section, capabilities) {
                   null,
                   E(
                     "p",
-                    _("Error updating lists: ") +
+                    _("Error updating lists:") +
+                      " " +
                       (data.message || _("Update failed")),
                   ),
                   "error",
@@ -2600,7 +2947,7 @@ function createSettingsContent(section, capabilities) {
         ui.hideModal();
         ui.addNotification(
           null,
-          E("p", _("Error updating lists: ") + (err.message || err)),
+          E("p", _("Error updating lists:") + " " + (err.message || err)),
           "error",
         );
       });
@@ -3492,6 +3839,62 @@ function createSettingsContent(section, capabilities) {
     uci.unset(UCI_PACKAGE, section_id, "smart_detect_sections");
   };
 
+  const sdExpandOpt = section.taboption(
+    "services",
+    form.Flag,
+    "smart_detect_expand_to_root",
+    _("Expand detected subdomains to root domain"),
+    _(
+      "When enabled, detecting a blocked subdomain (e.g. sub.example.com) adds the entire base domain (example.com), unless this would include an excluded subdomain. When disabled, only the specific subdomain is routed through the proxy.",
+    ),
+  );
+  sdExpandOpt.default = "1";
+  sdExpandOpt.rmempty = false;
+  sdExpandOpt.depends("smart_detect", "1");
+
+  const sdExcludeOpt = section.taboption(
+    "services",
+    form.DynamicList,
+    "smart_detect_exclude",
+    _("Excluded domains from Smart Detect"),
+    _(
+      "Domains and subdomains that should never be automatically proxied by Smart Detect (e.g. yandex.net, mail.ru, vk.com).",
+    ),
+  );
+  sdExcludeOpt.placeholder = "example.com";
+  sdExcludeOpt.depends("smart_detect", "1");
+
+  const sdExcludeListsOpt = section.taboption(
+    "services",
+    form.DynamicList,
+    "smart_detect_exclude_lists",
+    _("Preset exclusions for Smart Detect"),
+    _(
+      "Selected presets exclude their domains and subdomains from automatic Smart Detect additions. Manual routing rules and previously added domains are kept. Presets follow regular list updates; if a selected preset has no cached copy, detection waits until lists are updated.",
+    ),
+  );
+  sdExcludeListsOpt.placeholder = _("Service list");
+  sdExcludeListsOpt.depends("smart_detect", "1");
+  const sdIpOnlyPresets = new Set([
+    "cloudflare",
+    "cloudfront",
+    "hetzner",
+    "ovh",
+    "digitalocean",
+  ]);
+  const sdPresetChoices = Object.entries(main.DOMAIN_LIST_OPTIONS).filter(
+    ([name]) => !sdIpOnlyPresets.has(name),
+  );
+  sdPresetChoices.forEach(([name, label]) =>
+    sdExcludeListsOpt.value(name, label),
+  );
+  sdExcludeListsOpt.validate = function (_section_id, value) {
+    const names = Array.isArray(value) ? value : value ? [value] : [];
+    return names.every((name) => sdPresetChoices.some(([key]) => key === name))
+      ? true
+      : _("Select a predefined domain list");
+  };
+
   const sdDomainsOpt = section.option(
     form.DummyValue,
     "_smart_detect_domains",
@@ -3690,15 +4093,24 @@ function createTelegramContent(section) {
     _("Telegram Bot Token"),
     _("Enter the API token obtained from @BotFather."),
   );
-  o.depends("enabled", "1");
-  o.retain = true;
   o.password = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.validate = function (section_id, value) {
     if (this.section.formvalue(section_id, "enabled") === "1" && !value) {
       return _("Token is required when the bot is enabled");
     }
     return true;
+  };
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val) {
+      uci.set(UCI_PACKAGE, section_id, "bot_token", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "bot_token");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "bot_token");
   };
 
   o = section.option(
@@ -3709,9 +4121,7 @@ function createTelegramContent(section) {
       "Comma-separated list of Telegram user IDs authorized to control the bot.",
     ),
   );
-  o.depends("enabled", "1");
-  o.retain = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.validate = function (section_id, value) {
     if (this.section.formvalue(section_id, "enabled") === "1") {
       if (!value) {
@@ -3723,6 +4133,39 @@ function createTelegramContent(section) {
     }
     return true;
   };
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val) {
+      uci.set(UCI_PACKAGE, section_id, "admin_ids", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "admin_ids");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "admin_ids");
+  };
+
+  o = section.option(
+    form.Value,
+    "router_name",
+    _("Router Name"),
+    _(
+      "Optional name displayed at the top of all Telegram bot messages to identify this router when multiple routers share the same bot token.",
+    ),
+  );
+  o.placeholder = _("Home Router / Office / Dacha");
+  o.rmempty = true;
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val) {
+      uci.set(UCI_PACKAGE, section_id, "router_name", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "router_name");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "router_name");
+  };
 
   o = section.option(
     form.Value,
@@ -3733,9 +4176,9 @@ function createTelegramContent(section) {
   o.depends("enabled", "1");
   o.retain = true;
   o.default = "5";
-  o.rmempty = false;
+  o.rmempty = true;
   o.validate = function (section_id, value) {
-    if (this.section.formvalue(section_id, "enabled") !== "1") {
+    if (this.section.formvalue(section_id, "enabled") !== "1" || !value) {
       return true;
     }
     const val = parseInt(value);
@@ -3743,6 +4186,17 @@ function createTelegramContent(section) {
       return _("Polling interval must be at least 1 second");
     }
     return true;
+  };
+  o.write = function (section_id, value) {
+    const val = value ? `${value}`.trim() : "";
+    if (val && val !== "5") {
+      uci.set(UCI_PACKAGE, section_id, "poll_interval", val);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, "poll_interval");
+    }
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "poll_interval");
   };
 
   o = section.option(
@@ -3868,7 +4322,6 @@ function createTelegramContent(section) {
     _("Test Telegram Connection"),
   );
   testOpt.rawhtml = true;
-  testOpt.depends("enabled", "1");
   testOpt.cfgvalue = function () {
     const wrapper = E("div", { style: "margin-top: 8px;" });
     const btn = E(

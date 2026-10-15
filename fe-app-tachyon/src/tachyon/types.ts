@@ -168,13 +168,16 @@ export namespace Tachyon {
     FUZZER_UPDATE_PRESETS = 'fuzzer_update_presets',
     // generate
     GENERATE_REALITY_KEYPAIR = 'generate_reality_keypair',
+    GENERATE_TLS_KEYPAIR = 'generate_tls_keypair',
     GENERATE_WARP = 'generate_warp',
+    GENERATE_WG_KEYPAIR = 'generate_wg_keypair',
     // get
     GET_BYEDPI_STATUS = 'get_byedpi_status',
     GET_ENGINE_STATUS = 'get_engine_status',
     GET_FPTN_STATUS = 'get_fptn_status',
     GET_OLCRTC_STATUS = 'get_olcrtc_status',
     GET_OUTBOUND_METADATA = 'get_outbound_metadata',
+    GET_ROUTER_NETWORK_ENV = 'get_router_network_env',
     GET_SERVER_CAPABILITIES = 'get_server_capabilities',
     GET_SING_BOX_STATUS = 'get_sing_box_status',
     GET_STATUS = 'get_status',
@@ -273,6 +276,9 @@ export namespace Tachyon {
     SHOW_VERSION = 'show_version',
     // snapshot
     SNAPSHOT_DELETE = 'snapshot_delete',
+    SNAPSHOT_DIFF = 'snapshot_diff',
+    SNAPSHOT_EXPORT = 'snapshot_export',
+    SNAPSHOT_IMPORT = 'snapshot_import',
     SNAPSHOT_LIST = 'snapshot_list',
     SNAPSHOT_RESTORE = 'snapshot_restore',
     SNAPSHOT_SAVE = 'snapshot_save',
@@ -332,6 +338,7 @@ export namespace Tachyon {
     latency: number;
     type: string;
     transport?: string;
+    details?: string;
     selected: boolean;
     link?: string;
     canCopyLink?: boolean;
@@ -348,6 +355,7 @@ export namespace Tachyon {
     latency: number;
     type: string;
     transport?: string;
+    details?: string;
     selected: boolean;
     link?: string;
     canCopyLink?: boolean;
@@ -416,6 +424,9 @@ export namespace Tachyon {
     subscriptionSourceCount?: number;
     subscriptionMetadata?: SubscriptionMetadata[];
     serviceStatus?: ServiceStatus;
+    // sing-box rejected this section at start and the runtime quarantined it;
+    // the section is not loaded and the reason is shown on the dashboard card.
+    configError?: string;
     outbounds: Outbound[];
   }
 
@@ -475,6 +486,7 @@ export namespace Tachyon {
     | 'anytls'
     | 'snell'
     | 'mieru'
+    | 'naive'
     | 'sudoku'
     | 'masque'
     | 'openvpn'
@@ -656,6 +668,8 @@ export namespace Tachyon {
     show_dashboard_metadata?: '0' | '1';
     prefix_nodes?: '0' | '1';
     node_prefix?: string;
+    node_prefix_bg?: string;
+    node_prefix_color?: string;
     include_urltest_groups?: '0' | '1';
     hide_urltest_group_outbounds?: '0' | '1';
     hide_detour_outbounds?: '0' | '1';
@@ -667,6 +681,8 @@ export namespace Tachyon {
     smart_detect_mode?: 'default' | 'plus';
     smart_detect_section?: string;
     smart_detect_sections?: string | string[];
+    smart_detect_expand_to_root?: '0' | '1';
+    smart_detect_exclude?: string | string[];
     dns_turbo_cache?: '0' | '1';
     dns_local_cache?: '0' | '1';
     dns_cache_size?: string;
@@ -760,6 +776,7 @@ export namespace Tachyon {
     sing_box_ports_listening: 0 | 1;
     sing_box_extended?: 0 | 1;
     sing_box_cert_pin?: 0 | 1;
+    sing_box_tachyon_core?: 0 | 1;
   }
 
   export interface SteerCheckResult {
@@ -831,6 +848,8 @@ export namespace Tachyon {
     transports?: Record<string, string>;
     protocols?: Record<string, string>;
     securities?: Record<string, string>;
+    ports?: Record<string, string>;
+    details?: Record<string, string>;
     prefixes?: Record<string, string>;
   }
 
@@ -902,6 +921,8 @@ export namespace Tachyon {
     sing_box_tiny: 0 | 1;
     sing_box_compressed: 0 | 1;
     sing_box_lx?: 0 | 1;
+    sing_box_tachyon_core?: 0 | 1;
+    sing_box_fptn?: 0 | 1;
     sing_box_tailscale: 0 | 1;
     sing_box_cert_pin?: 0 | 1;
     sing_box_repo_url?: string;
@@ -926,6 +947,7 @@ export namespace Tachyon {
     fptn_version: string;
     fptn_installed: 0 | 1;
     fptn_supported?: 0 | 1;
+    fptn_mode?: 'native' | 'component';
     fptn_backup_version?: string;
     fptn_backup_time?: number;
     direct_bypass_enabled?: 0 | 1;
@@ -962,6 +984,8 @@ export namespace Tachyon {
     sing_box_tiny: 0 | 1;
     sing_box_compressed: 0 | 1;
     sing_box_lx: 0 | 1;
+    sing_box_tachyon_core?: 0 | 1;
+    sing_box_fptn?: 0 | 1;
     sing_box_tailscale: 0 | 1;
     sing_box_cert_pin?: 0 | 1;
     zapret_installed: 0 | 1;
@@ -1057,10 +1081,13 @@ export namespace Tachyon {
     | 'install_extended'
     | 'install_extended_compressed'
     | 'install_lx'
+    | 'install_tachyon_core'
     | 'install_tiny'
     | 'install_stable'
     | 'enable'
     | 'disable'
+    | 'set_native_mode'
+    | 'set_component_mode'
     | 'switch';
 
   export interface ComponentActionResult {
@@ -1074,6 +1101,7 @@ export namespace Tachyon {
     current_version: string;
     latest_version: string;
     release_url?: string;
+    release_notes?: string;
     changed: boolean;
     status?: 'latest' | 'outdated' | 'dev' | 'outdated_same_release' | '';
     /** Short commit SHA of the currently installed build (tachyon only) */
@@ -1109,6 +1137,7 @@ export namespace Tachyon {
     published: string;
     prerelease: boolean;
     release_url: string;
+    body?: string;
   }
 
   export type ComponentActionStartResult = UiActionStartResult;

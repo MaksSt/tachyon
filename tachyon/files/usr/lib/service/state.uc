@@ -217,15 +217,46 @@ function consume_pending_reload(path) {
     return true;
 }
 
+// Only this one pending reason means "a subscription cache was rewritten",
+// which config.json regeneration plus a SIGHUP into the running sing-box
+// settles. Every other reason still means the configuration itself changed and
+// has to go through the real reload (issue #119).
+const PENDING_RELOAD_SOFT_APPLY_REASON = "subscription_deferred_recovery";
+
+function pending_reload_reason(path) {
+    // Deliberately not first_line_value(): that helper is declared further down
+    // this file and ucode resolves a call against what is defined at that point.
+    let data = fs.readfile(path);
+    if (data == null)
+        return "";
+    let first = split(trim(as_string(data)), "\n")[0];
+    return replace(as_string(first), /^reason=/, "");
+}
+
 function run_pending_reload_if_requested(path, init_script) {
     path = as_string(path || DEFAULT_PENDING_RELOAD_FILE);
     init_script = as_string(init_script || DEFAULT_SERVICE_INIT);
 
+    let reason = "";
+    if (fs.stat(path) != null)
+        reason = pending_reload_reason(path);
+
     if (!consume_pending_reload(path))
         return;
 
-    command_success_from_args([ "logger", "-t", "tachyon", "[info] Applying pending Tachyon reload" ]);
-    system(background_command(shell_quote(init_script) + " reload pending"));
+    // One launch site for both outcomes, so this file does not grow a second
+    // background invocation.
+    let apply_in_place = reason == PENDING_RELOAD_SOFT_APPLY_REASON;
+    let message = apply_in_place ? "Applying pending subscription recovery in place" : "Applying pending Tachyon reload";
+    let command = apply_in_place
+        ? command_from_args([
+            "ucode", "-L", LIB_DIR, LIB_DIR + "/components/updates.uc",
+            "subscription-deferred-recovery-apply"
+        ])
+        : shell_quote(init_script) + " reload pending";
+
+    command_success_from_args([ "logger", "-t", "tachyon", "[info] " + message ]);
+    system(background_command(command));
 }
 
 function first_line_value(path) {
@@ -449,11 +480,87 @@ function sing_box_service_pid_runtime() {
     return 0;
 }
 
-// Send SIGHUP to the running sing-box process and wait for it to stay alive.
+function has_int(values, needle) {
+    for (let value in values)
+        if (int(value) == needle)
+            return true;
+    return false;
+}
+
+// Mixed-inbound ports the generated config declares. Read from the config
+// rather than hardcoded, so this stays in step with the generator and stands
+// down when no section enables the mixed proxy at all.
+function sing_box_mixed_ports() {
+    let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+    let config_path = trim(as_string(settings.config_path || "")) || "/etc/sing-box/config.json";
+    let data = fs.readfile(config_path);
+    if (data == null)
+        return [];
+
+    let parsed;
+    try {
+        parsed = json(data);
+    }
+    catch (e) {
+        return [];
+    }
+    if (parsed == null || parsed.inbounds == null)
+        return [];
+
+    let ports = [];
+    for (let inbound in parsed.inbounds) {
+        if (inbound.type != "mixed" || inbound.listen_port == null)
+            continue;
+        let port = int(inbound.listen_port, 10);
+        if (port > 0 && !has_int(ports, port))
+            push(ports, port);
+    }
+    return ports;
+}
+
+// Are the ports the config promises actually in LISTEN? /proc/net/tcp is
+// read directly: this runs inside the SIGHUP poll loop and a netstat fork per
+// iteration is exactly the kind of churn a reload should not add.
+function sing_box_mixed_ports_listening(ports) {
+    if (length(ports) == 0)
+        return true;
+
+    let listening = {};
+    for (let path in [ "/proc/net/tcp", "/proc/net/tcp6" ]) {
+        let content = fs.readfile(path);
+        if (content == null)
+            continue;
+        for (let line in split(content, "\n")) {
+            let fields = split(trim(line), /[ \t]+/);
+            if (length(fields) < 4 || (fields[3] != "0A" && fields[3] != "0a"))
+                continue;
+            let colon = index(fields[1], ":");
+            if (colon <= 0)
+                continue;
+            listening[int(substr(fields[1], colon + 1), 16)] = true;
+        }
+    }
+
+    for (let port in ports)
+        if (!listening[int(port)])
+            return false;
+    return true;
+}
+
+// Send SIGHUP to the running sing-box process and wait for it to stay alive
+// AND to still be listening.
 // sing-box 1.10+ reloads its configuration in-place on SIGHUP without tearing
 // down the process, so existing TCP sessions are not disrupted.
+// A live pid is not evidence that the reload worked: on tachyon-core a SIGHUP
+// was observed to leave the process running and answering the clash API while
+// the mixed inbound silently never came back - every LAN client proxy and the
+// Telegram bot then dead-ended, and only the watchdog's two-strike mixed-port
+// watch noticed, ten minutes later. So the inbounds the config declares are
+// checked too; if they do not come back the caller escalates to a full restart
+// instead of logging a success that did not happen.
 // Returns true if the process accepted the reload and is still healthy;
-// returns false if the process died or was unreachable (caller should restart).
+// returns false if the process died, was unreachable, or came back deaf
+// (caller should restart).
 function try_sighup_reload(pid) {
     pid = int(pid || 0);
     if (pid <= 0 || !pid_is_sing_box(pid))
@@ -463,25 +570,37 @@ function try_sighup_reload(pid) {
     // finished a reload and the transient exit-code is unreliable.
     command_success_from_args([ "kill", "-HUP", as_string(pid) ]);
 
-    // Give sing-box up to 5 s to ingest the new config.  We poll every 500 ms.
-    let deadline = 10;
+    // Give sing-box up to 15 s to ingest the new config and bring its inbounds
+    // back. We poll every 500 ms and only call it a success when the process
+    // is alive AND every mixed port the config declares is listening again.
+    let ports = sing_box_mixed_ports();
+    let deadline = 30;
     while (deadline > 0) {
         command_success_from_args([ "sleep", "0.5" ]);
         deadline--;
         let current_pid = sing_box_service_pid_runtime();
         if (current_pid <= 0)
             return false;   // process died — caller must restart
-        if (current_pid == pid)
-            return true;    // still alive, reload succeeded
-        // PID changed: procd replaced the process (e.g. MTProxy restart path);
-        // treat as success since something is running.
-        if (pid_is_sing_box(current_pid))
+        // PID unchanged, or procd replaced it (e.g. MTProxy restart path): both
+        // mean "something is running". That alone is not enough - the inbounds
+        // have to be back before this counts as a working reload.
+        let process_ok = current_pid == pid || pid_is_sing_box(current_pid);
+        if (process_ok && sing_box_mixed_ports_listening(ports)) {
+            common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
             return true;
+        }
     }
 
-    // Timed out: verify at least that a sing-box is still up.
+    // Timed out: verify at least that a sing-box is still up, and that it is
+    // not running deaf.
     let final_pid = sing_box_service_pid_runtime();
-    return final_pid > 0 && pid_is_sing_box(final_pid);
+    if (final_pid <= 0 || !pid_is_sing_box(final_pid))
+        return false;
+    if (sing_box_mixed_ports_listening(ports)) {
+        common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
+        return true;
+    }
+    return false;
 }
 
 function hup_sing_box_runtime() {
@@ -1076,6 +1195,28 @@ function nft_guest_mode_signature_body(body, guest_mode) {
     return body;
 }
 
+function section_runtime_failed(name) {
+    let path = getenv("TACHYON_SECTION_FAIL_STATE_FILE") || "/var/run/tachyon/section-fail-state.json";
+    let raw = "";
+    try {
+        raw = trim(as_string(fs.readfile(path)) || "");
+    } catch (e) {
+        raw = "";
+    }
+    if (raw == "")
+        return false;
+    let parsed = null;
+    try {
+        parsed = json(raw);
+    } catch (e) {
+        parsed = null;
+    }
+    if (type(parsed) != "object")
+        return false;
+    let entry = object_or_empty(parsed[as_string(name)]);
+    return entry.failed == true || as_string(entry.failed || "") == "1";
+}
+
 function nft_runtime_signature_body(settings, sections, schedules, profiles, guest_modes) {
     let body = "";
 
@@ -1090,6 +1231,8 @@ function nft_runtime_signature_body(settings, sections, schedules, profiles, gue
     body = signature_add_value(body, "settings.excluded_ips", option(settings, "excluded_ips", ""));
     body = signature_add_value(body, "settings.route_router_traffic", bool_option(settings, "route_router_traffic", false) ? "1" : "0");
     body = signature_add_value(body, "settings.route_router_traffic_section", option(settings, "route_router_traffic_section", ""));
+    if (bool_option(settings, "wifi_calling_direct", false))
+        body = signature_add_value(body, "settings.wifi_calling_direct", "1");
 
     for (let section in sections) {
         section = object_or_empty(section);
@@ -1125,6 +1268,12 @@ function nft_runtime_signature_body(settings, sections, schedules, profiles, gue
         body = signature_add_value(body, "rule." + name + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
         body = signature_add_value(body, "rule." + name + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
         body = signature_add_value(body, "rule." + name + ".dscp", connections.dscp_value(section));
+        let fail_policy = lc(trim(option(section, "fail_policy", "keep")));
+        if (fail_policy == "block" || fail_policy == "direct") {
+            body = signature_add_value(body, "rule." + name + ".fail_policy", fail_policy);
+            if (section_runtime_failed(name))
+                body = signature_add_value(body, "rule." + name + ".runtime_failed", "1");
+        }
     }
 
     for (let profile in profiles)
@@ -1171,6 +1320,9 @@ function subscription_urls_signature(section) {
     for (let entry in connections.subscription_urls(section)) {
         push(result, {
             url: entry,
+            // Part of the signature, not decoration: without it a toggle would
+            // leave the signature identical and nothing would rebuild the config.
+            enabled: connections.subscription_url_enabled(section, entry) ? "1" : "0",
             subscription_update_enabled: connections.subscription_update_enabled(section, entry) ? "1" : "0",
             subscription_update_interval: connections.subscription_update_interval(section, entry),
             download_via_proxy_section: connections.subscription_download_section(section, entry),
@@ -1580,6 +1732,12 @@ function append_sing_box_rule_signature_body(body, section, sections) {
     if (action != "dns")
         body = signature_add_value(body, prefix + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
     body = signature_add_value(body, prefix + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
+    let fail_policy = lc(trim(option(section, "fail_policy", "keep")));
+    if (fail_policy == "block" || fail_policy == "direct") {
+        body = signature_add_value(body, prefix + ".fail_policy", fail_policy);
+        if (section_runtime_failed(name))
+            body = signature_add_value(body, prefix + ".runtime_failed", "1");
+    }
 
     return body;
 }
@@ -1730,11 +1888,11 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
         body = signature_add_value(body, "settings.dns_detour_section", option(settings, "dns_detour_section", ""));
     body = signature_add_value(body, "settings.dns_rewrite_ttl", option(settings, "dns_rewrite_ttl", "60"));
     body = signature_add_value(body, "settings.output_network_interface", option(settings, "output_network_interface", ""));
-    body = signature_add_value(body, "settings.disable_quic", bool_option_value(settings, "disable_quic", false));
+    body = signature_add_value(body, "settings.disable_quic", common.disable_quic_mode(option(settings, "disable_quic", "0")));
     body = signature_add_value(body, "settings.block_doh", bool_option_value(settings, "block_doh", false));
     if (sing_box_signature_has_remote_ruleset_sources(sections))
         body = signature_add_value(body, "settings.update_interval", settings_update_interval(settings));
-    body = signature_add_value(body, "settings.cache_path", option(settings, "cache_path", "/tmp/sing-box/cache.db"));
+    body = signature_add_value(body, "settings.cache_path", option(settings, "cache_path", "/usr/share/sing-box/cache.db"));
     body = signature_add_value(body, "settings.config_path", option(settings, "config_path", ""));
     body = signature_add_value(body, "settings.log_level", option(settings, "log_level", "warn"));
     body = signature_add_value(body, "settings.service_listen_address", option(settings, "service_listen_address", ""));
@@ -1757,6 +1915,15 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
         body = signature_add_value(body, "settings.download_components_via_proxy_section", option(settings, "download_components_via_proxy_section", ""));
     body = signature_add_value(body, "settings.route_router_traffic", bool_option_value(settings, "route_router_traffic", false));
     body = signature_add_value(body, "settings.route_router_traffic_section", option(settings, "route_router_traffic_section", ""));
+    if (bool_option(settings, "wifi_calling_direct", false))
+        body = signature_add_value(body, "settings.wifi_calling_direct", "1");
+    let bt_policy = lc(trim(option(settings, "bittorrent_policy", "")));
+    if (bt_policy == "")
+        bt_policy = bool_option(settings, "isolate_p2p", false) ? "direct" : "off";
+    if (bt_policy != "off") {
+        body = signature_add_value(body, "settings.bittorrent_policy", bt_policy);
+        body = signature_add_value(body, "settings.p2p_ports", option(settings, "p2p_ports", ""));
+    }
 
     for (let section in sections)
         body = append_sing_box_rule_signature_body(body, object_or_empty(section), sections);

@@ -12,6 +12,15 @@ let runtime_cursor = false;
 let loaded_packages = {};
 
 function words(value) {
+    if (type(value) == "array") {
+        let result = [];
+        for (let item in value) {
+            let s = trim(as_string(item));
+            if (s != "")
+                push(result, s);
+        }
+        return result;
+    }
     value = trim(as_string(value));
     return value == "" ? [] : split(value, /[ \t\r\n]+/);
 }
@@ -456,6 +465,13 @@ function set_section(path, type_name) {
     let c = cursor();
     if (c == null || parts == null || parts.option != "")
         return false;
+    let cfg_file = "/etc/config/" + parts.package;
+    if (!fs.stat(cfg_file)) {
+        let dir = fs.stat("/etc/config");
+        if (!dir || dir.type != "directory")
+            fs.mkdir("/etc/config", 0755);
+        fs.writefile(cfg_file, "");
+    }
     if (!load(parts.package))
         return false;
     parts = resolve_parts(c, parts);

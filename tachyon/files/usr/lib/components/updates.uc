@@ -1519,6 +1519,10 @@ function cache_component_update_check_result(value, notify_update) {
         cached.current_build = as_string(value.current_build);
     if (as_string(value.latest_build) != "")
         cached.latest_build = as_string(value.latest_build);
+    if (as_string(value.release_notes) != "")
+        cached.release_notes = as_string(value.release_notes);
+    else if (as_string(previous.release_notes) != "" && as_string(previous.latest_version) == cached.latest_version)
+        cached.release_notes = as_string(previous.release_notes);
     if (!write_state_file(path, cached))
         return false;
 
@@ -1577,6 +1581,7 @@ function update_component_check_cache_from_action(value) {
             current_version: current_ver,
             latest_version,
             release_url: as_string(value.release_url),
+            release_notes: as_string(value.release_notes),
             status: "latest",
             current_sha: as_string(value.current_sha),
             latest_sha: as_string(value.latest_sha),
@@ -2262,7 +2267,7 @@ function download_to_file(url, filepath, proxy_address) {
     // download_one: try url via the given proxy (or direct if proxy=="")
     function download_one(target_url, proxy_addr) {
         if (command_exists("curl")) {
-            let curl_args = [ "curl", "--connect-timeout", "5", "-m", "10", "-fsSL" ];
+            let curl_args = [ "curl", "--connect-timeout", "5", "-m", "15", "-y", "6", "-Y", "32768", "-fsSL" ];
             if (as_string(proxy_addr) != "") {
                 push(curl_args, "-x", "http://" + as_string(proxy_addr));
             } else {
@@ -2273,7 +2278,7 @@ function download_to_file(url, filepath, proxy_address) {
             push(curl_args, target_url, "-o", filepath);
             return command_success_from_args(curl_args) && file_nonempty(filepath);
         } else {
-            let command = command_from_args([ "wget", "-q", "-T", "10", "-O", filepath, target_url ]);
+            let command = command_from_args([ "wget", "-q", "-T", "15", "-O", filepath, target_url ]);
             if (as_string(proxy_addr) != "")
                 command = "http_proxy=" + shell_quote("http://" + as_string(proxy_addr)) +
                     " https_proxy=" + shell_quote("http://" + as_string(proxy_addr)) + " " + command;
@@ -2281,25 +2286,31 @@ function download_to_file(url, filepath, proxy_address) {
         }
     }
 
+    // 1. Through the configured proxy section first if available
+    if (as_string(proxy_address) != "") {
+        if (download_one(url, proxy_address)) {
+            log_message("Successfully downloaded " + as_string(url) + " via proxy section", "info");
+            return true;
+        }
+        log_message("Download via proxy section failed for " + as_string(url) + "; retrying direct and mirrors", "warn");
+    }
+
     for (let i = 0; i < length(candidates); i++) {
         let candidate = candidates[i];
         let label = i == 0 ? "" : " via mirror " + candidate;
 
-        // 1. Direct — always the first attempt for every candidate
+        // 2. Direct fallback
         if (download_one(candidate, "")) {
             if (candidate != url)
                 log_message("Successfully downloaded " + as_string(url) + label, "info");
             return true;
         }
 
-        // 2. Through the configured proxy section — only if direct failed
-        if (as_string(proxy_address) != "") {
+        // 3. Through the configured proxy section for mirrors if direct failed
+        if (as_string(proxy_address) != "" && i > 0) {
             log_message("Download direct failed for " + as_string(candidate) + "; retrying via proxy section", "warn");
             if (download_one(candidate, proxy_address)) {
-                if (candidate != url)
-                    log_message("Successfully downloaded " + as_string(url) + label + " (via proxy section)", "info");
-                else
-                    log_message("Successfully downloaded " + as_string(url) + " via proxy section", "info");
+                log_message("Successfully downloaded " + as_string(url) + label + " (via proxy section)", "info");
                 return true;
             }
             log_message("Download via proxy section also failed for " + as_string(candidate), "warn");
@@ -2574,15 +2585,22 @@ function import_community_srs_file(service, settings) {
     for (let candidate in candidates) {
         if (download_to_file(candidate, tmpfile, service_proxy_address(settings, "lists")) &&
             file_nonempty(tmpfile) &&
-            singbox_rulesets_module().is_usable_srs_file(tmpfile) &&
             helpers.file_is_usable(tmpfile, 100)) {
-            ensure_dir(TMP_RULESET_FOLDER);
-            copy_file(tmpfile, cached_file);
-            ensure_dir("/etc/tachyon/rulesets");
-            copy_file(tmpfile, persistent_file);
-            log_message("Successfully cached preset ruleset " + service + (candidate != url ? " via mirror " + candidate : ""), "info");
-            downloaded = true;
-            break;
+            let raw = fs.readfile(tmpfile);
+            let unchanged_verified = raw != null &&
+                common.content_unchanged(cached_file, raw) &&
+                singbox_rulesets_module().srs_file_already_verified(cached_file);
+            if (unchanged_verified || singbox_rulesets_module().is_usable_srs_file(tmpfile)) {
+                ensure_dir(TMP_RULESET_FOLDER);
+                copy_file(tmpfile, cached_file);
+                singbox_rulesets_module().remember_srs_file_verified(cached_file);
+                ensure_dir("/etc/tachyon/rulesets");
+                copy_file(tmpfile, persistent_file);
+                singbox_rulesets_module().remember_srs_file_verified(persistent_file);
+                log_message("Successfully cached preset ruleset " + service + (candidate != url ? " via mirror " + candidate : ""), "info");
+                downloaded = true;
+                break;
+            }
         }
         remove_file(tmpfile);
     }
@@ -2591,9 +2609,10 @@ function import_community_srs_file(service, settings) {
     if (downloaded) {
         // Cached successfully
     }
-    else if (singbox_rulesets_module().is_usable_srs_file(persistent_file) && helpers.file_is_usable(persistent_file, 100)) {
+    else if (singbox_rulesets_module().is_adoptable_srs_file(persistent_file) && helpers.file_is_usable(persistent_file, 100)) {
         ensure_dir(TMP_RULESET_FOLDER);
         copy_file(persistent_file, cached_file);
+        singbox_rulesets_module().remember_srs_file_verified(cached_file);
         log_message("Using persistent cached ruleset for " + service + " after download failure", "warn");
     }
     else {
@@ -2779,6 +2798,12 @@ function import_all_preset_lists(settings) {
             if (!downloaded) {
                 if (file_exists_value(persistent_file)) {
                     tmpfile = persistent_file;
+                } else if (as_string(service) == "telegram") {
+                    let core_ip = require("core.ip");
+                    for (let s in (core_ip.DEFAULT_TELEGRAM_SUBNETS || [])) push(combined_lines, s);
+                    for (let s in (core_ip.DEFAULT_TELEGRAM_SUBNETS6 || [])) push(combined_lines, s);
+                    log_message("Seeded community subnet list telegram with built-in fallbacks", "info");
+                    continue;
                 } else {
                     log_message("Failed to download built-in preset subnet list " + as_string(service) + "; skipping it until next update", "warn");
                     continue;
@@ -2868,6 +2893,12 @@ function import_builtin_subnets_from_rule(section, settings) {
             if (!downloaded) {
                 if (file_exists_value(persistent_file)) {
                     tmpfile = persistent_file;
+                } else if (as_string(service) == "telegram") {
+                    let core_ip = require("core.ip");
+                    for (let s in (core_ip.DEFAULT_TELEGRAM_SUBNETS || [])) push(combined_lines, s);
+                    for (let s in (core_ip.DEFAULT_TELEGRAM_SUBNETS6 || [])) push(combined_lines, s);
+                    log_message("Seeded community subnet list telegram with built-in fallbacks", "info");
+                    continue;
                 } else {
                     log_message("Failed to download built-in " + as_string(service) + " subnet list; skipping it until next update", "warn");
                     continue;
@@ -3195,22 +3226,22 @@ function dns_probe_passed(proxy_address) {
         // up after a component update or restart and the proxy port may not be
         // ready even though the process is already running.
         let attempt = 1;
-        while (attempt <= 10) {
+        while (attempt <= 5) {
             if (service_proxy_is_ready(proxy_address)) {
                 log_message("Service proxy is ready", "info");
                 return true;
             }
-            log_message("Service proxy not yet ready [" + attempt + "/10]", "info");
-            command_success_from_args([ "sleep", "3" ]);
+            log_message("Service proxy not yet ready [" + attempt + "/5]", "info");
+            command_success_from_args([ "sleep", "1" ]);
             attempt++;
         }
-        log_message("Service proxy is not accepting connections after 10 attempts; skipping list update", "info");
+        log_message("Service proxy is not accepting connections after 5 attempts; skipping list update", "info");
         return false;
     }
 
     let attempt = 1;
-    while (attempt <= 10) {
-        let output = command_output_from_args([ "dig", "+short", "openwrt.org", "A", "+timeout=3", "+tries=1" ]);
+    while (attempt <= 3) {
+        let output = command_output_from_args([ "dig", "+short", "openwrt.org", "A", "+timeout=2", "+tries=2" ]);
         for (let line in split(output, "\n")) {
             if (match(as_string(line), /^[0-9]+\./) != null) {
                 log_message("DNS check passed", "info");
@@ -3218,19 +3249,19 @@ function dns_probe_passed(proxy_address) {
             }
         }
 
-        log_message("DNS is unavailable [" + attempt + "/10]", "info");
-        command_success_from_args([ "sleep", "3" ]);
+        log_message("DNS is unavailable [" + attempt + "/3]", "info");
+        command_success_from_args([ "sleep", "1" ]);
         attempt++;
     }
 
-    log_message("DNS check failed after 10 attempts; skipping remote lists update until the next attempt", "info");
+    log_message("DNS check failed after 3 attempts; skipping remote lists update until the next attempt", "info");
     return false;
 }
 
 function github_probe(proxy_address) {
     let attempt = 1;
-    let timeout = 5;
-    while (attempt <= 10) {
+    let timeout = 3;
+    while (attempt <= 2) {
         let args = [ "curl", "-s", "-m", "" + timeout ];
         if (as_string(proxy_address) != "") {
             push(args, "-x");
@@ -3243,14 +3274,12 @@ function github_probe(proxy_address) {
             return true;
         }
 
-        log_message("GitHub is unavailable [" + attempt + "/10] (max-timeout=" + timeout + ")", "info");
-        if (timeout < 10)
-            timeout++;
-        command_success_from_args([ "sleep", "3" ]);
+        log_message("GitHub is unavailable [" + attempt + "/2] (max-timeout=" + timeout + ")", "info");
+        command_success_from_args([ "sleep", "1" ]);
         attempt++;
     }
 
-    log_message("GitHub connection check failed after 10 attempts; trying configured list downloads individually", "info");
+    log_message("GitHub connection check failed; trying configured list downloads individually", "info");
     return false;
 }
 
@@ -3436,6 +3465,15 @@ function list_update() {
         if (!import_all_preset_lists(settings))
             ok = false;
     }
+    let exclusions = require("service.smart_detect_exclusions");
+    for (let name in exclusions.selected_lists(settings)) {
+        if (!bool_option(settings, "download_all_presets", false) && !import_community_srs_file(name, settings))
+            ok = false;
+        if (!exclusions.prepare_list(name, TMP_RULESET_FOLDER + "/community-" + name + ".srs")) {
+            log_message("Smart Detect: could not refresh exclusion preset " + name + "; keeping the previous cache", "warn");
+            ok = false;
+        }
+    }
     for (let section in sections)
         if (!rebuild_domain_ip_lists_from_rule(section, settings))
             ok = false;
@@ -3595,6 +3633,94 @@ function run_pending_reload_if_requested() {
     service_state_success([ "run-pending-reload-if-requested", PENDING_RELOAD_FILE, SERVICE_INIT ]);
 }
 
+// Regenerate config.json from the freshly rewritten subscription caches and put
+// the new config in front of sing-box. Shared by the scheduled subscription
+// update and by the deferred-recovery bootstrap retry, which used to escalate
+// to a full `tachyon reload` (issue #119): the full reload walks
+// validate -> capture-state -> plan -> zapret -> nft -> sing-box, tears down
+// both helper workers and restarts them again, which is exactly the churn that
+// dropped live connections after a subscription update.
+function subscription_runtime_apply_changed(context) {
+    log_message("Reloading sing-box to apply " + context, "info");
+    if (!module_success([ LIB_DIR + "/server/service.uc", "prepare-all-defaults" ]))
+        return false;
+    if (!module_success([ LIB_DIR + "/config/validator.uc", "validate-runtime" ])) {
+        log_message("Runtime config validation failed. Aborted.", "fatal");
+        return false;
+    }
+
+    if (!singbox_runtime_success([ "configure-service" ]))
+        return false;
+    let sing_box_config_path = option(uci_settings(), "config_path", "");
+    let sing_box_config_hash_before = file_md5(sing_box_config_path);
+    let sing_box_pid_before = trim(module_output([ LIB_DIR + "/service/state.uc", "sing-box-service-runtime-pid" ]));
+    if (!singbox_runtime_success([ "init-config", "0", "1", "1" ])) {
+        log_message("Failed to rebuild sing-box configuration after " + context, "error");
+        return false;
+    }
+
+    // Graceful in-place reload via SIGHUP first: sing-box 1.10+ hot-swaps its
+    // config without tearing down the process, so active TCP sessions
+    // (Telegram, etc.) are preserved. Only a failed SIGHUP escalates to a full
+    // restart, and only there do the helper workers have to stand down.
+    let sighup_ok = service_state_success([ "sighup-sing-box-runtime", sing_box_pid_before ]);
+    if (!sighup_ok) {
+        log_message("SIGHUP reload failed; falling back to full sing-box restart", "warn");
+        module_success([ PRIORITY_UC, "stop-runtime" ]);
+        module_success([ DNS_FAILOVER_UC, "stop-runtime" ]);
+        if (!service_state_success([
+            "reload-sing-box-runtime",
+            sing_box_pid_before,
+            sing_box_config_hash_before,
+            file_md5(sing_box_config_path)
+        ])) {
+            module_success([ PRIORITY_UC, "start-runtime" ]);
+            module_success([ DNS_FAILOVER_UC, "start-runtime" ]);
+            return false;
+        }
+        if (!module_success([ DNS_FAILOVER_UC, "start-runtime" ])) {
+            log_message("Failed to restart DNS failover runtime after " + context, "error");
+            return false;
+        }
+    }
+
+    // Priority reads the section cache once per worker start, and the cache was
+    // just rewritten, so it always has to be restarted after an apply. Its
+    // start-runtime stops the previous worker itself. DNS failover is left
+    // alone on the SIGHUP path: it probes the sing-box DNS listener, which
+    // stays bound across an in-place reload, and it re-normalizes its state
+    // every probe cycle.
+    if (!module_success([ PRIORITY_UC, "start-runtime" ])) {
+        log_message("Failed to restart Priority runtime after " + context, "error");
+        return false;
+    }
+
+    return write_current_reload_state_clean();
+}
+
+function subscription_deferred_recovery_apply() {
+    if (!subscription_cache_success([ "ensure-runtime-dirs" ]))
+        exit(1);
+
+    if (!acquire_runtime_lock(SUBSCRIPTION_UPDATE_LOCK_DIR, false)) {
+        log_message("Deferred subscription recovery apply skipped: another subscription update is running", "info");
+        mark_pending_reload("subscription_update_busy");
+        return;
+    }
+    if (!acquire_runtime_lock(RELOAD_LOCK_DIR, false)) {
+        release_runtime_lock(SUBSCRIPTION_UPDATE_LOCK_DIR);
+        log_message("Deferred subscription recovery apply skipped: tachyon reload is already running", "info");
+        mark_pending_reload("reload_busy");
+        return;
+    }
+
+    let ok = subscription_runtime_apply_changed("deferred subscription recovery");
+    release_runtime_lock(RELOAD_LOCK_DIR);
+    release_runtime_lock(SUBSCRIPTION_UPDATE_LOCK_DIR);
+    run_pending_reload_if_requested();
+    exit(ok ? 0 : 1);
+}
+
 function subscription_update_common_locked(force, target_section, target_source_index) {
     let result = subscription_cache_capture([
         "update-request",
@@ -3629,54 +3755,7 @@ function subscription_update_common_locked(force, target_section, target_source_
         return true;
     }
 
-    log_message("Reloading sing-box to apply updated subscriptions", "info");
-    if (!module_success([ LIB_DIR + "/server/service.uc", "prepare-all-defaults" ]))
-        return false;
-    if (!module_success([ LIB_DIR + "/config/validator.uc", "validate-runtime" ])) {
-        log_message("Runtime config validation failed. Aborted.", "fatal");
-        return false;
-    }
-
-    if (!singbox_runtime_success([ "configure-service" ]))
-        return false;
-    let sing_box_config_path = option(uci_settings(), "config_path", "");
-    let sing_box_config_hash_before = file_md5(sing_box_config_path);
-    let sing_box_pid_before = trim(module_output([ LIB_DIR + "/service/state.uc", "sing-box-service-runtime-pid" ]));
-    module_success([ DNS_FAILOVER_UC, "stop-runtime" ]);
-    if (!singbox_runtime_success([ "init-config", "0", "1", "1" ])) {
-        module_success([ DNS_FAILOVER_UC, "start-runtime" ]);
-        log_message("Failed to rebuild sing-box after subscription update", "error");
-        return false;
-    }
-    module_success([ PRIORITY_UC, "stop-runtime" ]);
-
-    // Attempt a graceful in-place reload via SIGHUP first.
-    // sing-box 1.10+ hot-swaps its config without tearing down the process,
-    // so active TCP sessions (Telegram, etc.) are preserved.
-    // Fall back to a full restart only when SIGHUP reload fails.
-    let sighup_ok = service_state_success([ "sighup-sing-box-runtime", sing_box_pid_before ]);
-    if (!sighup_ok) {
-        log_message("SIGHUP reload failed; falling back to full sing-box restart", "warn");
-        if (!service_state_success([
-            "reload-sing-box-runtime",
-            sing_box_pid_before,
-            sing_box_config_hash_before,
-            file_md5(sing_box_config_path)
-        ])) {
-            module_success([ PRIORITY_UC, "start-runtime" ]);
-            module_success([ DNS_FAILOVER_UC, "start-runtime" ]);
-            return false;
-        }
-    }
-    if (!module_success([ PRIORITY_UC, "start-runtime" ])) {
-        log_message("Failed to restart Priority runtime after subscription update", "error");
-        return false;
-    }
-    if (!module_success([ DNS_FAILOVER_UC, "start-runtime" ])) {
-        log_message("Failed to restart DNS failover runtime after subscription update", "error");
-        return false;
-    }
-    if (!write_current_reload_state_clean())
+    if (!subscription_runtime_apply_changed("updated subscriptions"))
         return false;
 
     if (failed > 0)
@@ -3907,6 +3986,8 @@ else if (mode == "subscription-update")
     subscription_update(ARGV[1], ARGV[2]);
 else if (mode == "subscription-update-if-due")
     subscription_update_if_due();
+else if (mode == "subscription-deferred-recovery-apply")
+    subscription_deferred_recovery_apply();
 else if (mode == "subscription-update-async")
     subscription_update_async(ARGV[1], ARGV[2]);
 else if (mode == "subscription-update-status")

@@ -31,6 +31,7 @@ const ROUTING_ACTIONS = [
   "anytls",
   "snell",
   "mieru",
+  "naive",
   "sudoku",
   "masque",
   "openvpn",
@@ -107,9 +108,11 @@ function isOutboundDetourTargetSection(section, currentSectionId) {
       "anytls",
       "snell",
       "mieru",
+      "naive",
       "sudoku",
       "masque",
       "openvpn",
+      "fptn",
     ].includes(action)
   );
 }
@@ -161,9 +164,11 @@ function isDnsDetourTargetSection(section, currentSectionId) {
       "anytls",
       "snell",
       "mieru",
+      "naive",
       "sudoku",
       "masque",
       "openvpn",
+      "fptn",
     ].includes(action)
   ) {
     return true;
@@ -499,6 +504,7 @@ const actionProvidersAvailabilityState = {
   fptnInstalled: false,
   torInstalled: false,
   singBoxExtended: false,
+  singBoxTachyonCore: false,
 };
 let actionProvidersAvailabilityPromise = null;
 let actionProvidersAvailabilityLoader = null;
@@ -535,6 +541,8 @@ function normalizeProtocolName(protocol) {
     case "wireguard":
     case "wg":
       return "WireGuard";
+    case "vpn":
+      return "WG/AWG";
     case "hysteria2":
     case "hy2":
       return "Hysteria2";
@@ -702,6 +710,12 @@ function updateActionProvidersAvailabilityState(nextState) {
     );
   }
 
+  if (typeof nextState.singBoxTachyonCore !== "undefined") {
+    actionProvidersAvailabilityState.singBoxTachyonCore = Boolean(
+      nextState.singBoxTachyonCore,
+    );
+  }
+
   if (typeof nextState.singBoxExtended !== "undefined") {
     actionProvidersAvailabilityState.singBoxExtended = Boolean(
       nextState.singBoxExtended,
@@ -728,8 +742,13 @@ function updateActionProvidersAvailabilityFromSystemInfo(systemInfo) {
     byedpiInstalled: Boolean(systemInfo.byedpi_installed),
     wdttInstalled: Boolean(systemInfo.wdtt_installed),
     olcrtcInstalled: Boolean(systemInfo.olcrtc_installed),
-    fptnInstalled: Boolean(systemInfo.fptn_installed),
+    // FPTN is compiled into tachyon-core itself, so the built-in flag makes
+    // the action available even with no fptn package on disk.
+    fptnInstalled: Boolean(
+      systemInfo.fptn_installed || systemInfo.sing_box_fptn,
+    ),
     singBoxExtended: Boolean(systemInfo.sing_box_extended),
+    singBoxTachyonCore: Boolean(systemInfo.sing_box_tachyon_core),
     torInstalled: Boolean(systemInfo.tor_installed),
   });
 }
@@ -745,6 +764,20 @@ if (typeof window !== "undefined") {
   });
 }
 
+function refreshVpnUrlHints() {
+  if (typeof document === "undefined") return;
+  const supported = main.supportsVpnUrl();
+  const hint = supported ? "; vpn:// (AWG, LX / tachyon-core)" : "";
+  document.querySelectorAll("[data-tachyon-vpn-url-hint]").forEach((node) => {
+    node.textContent = hint;
+  });
+  document
+    .querySelectorAll("[data-tachyon-amnezia-configs]")
+    .forEach((node) => {
+      node.style.display = supported ? "" : "none";
+    });
+}
+
 if (main.store && typeof main.store.subscribe === "function") {
   main.store.subscribe((next, _prev, diff) => {
     if (!diff || diff.diagnosticsSystemInfo) {
@@ -752,6 +785,8 @@ if (main.store && typeof main.store.subscribe === "function") {
         next.diagnosticsSystemInfo,
       );
     }
+    if (!diff || diff.diagnosticsSystemInfo || diff.activeEngine)
+      refreshVpnUrlHints();
   });
 }
 
@@ -845,6 +880,8 @@ function filteredOutboundMetadataFromCache(cache) {
   const countries = plainObject(metadata.countries);
   const protocols = plainObject(metadata.protocols);
   const transports = plainObject(metadata.transports);
+  const securities = plainObject(metadata.securities);
+  const ports = plainObject(metadata.ports);
   const candidateTags = Array.isArray(cache.urltestCandidateTags)
     ? cache.urltestCandidateTags
     : [];
@@ -854,6 +891,8 @@ function filteredOutboundMetadataFromCache(cache) {
     countries: {},
     protocols: {},
     transports: {},
+    securities: {},
+    ports: {},
   };
 
   if (candidateTags.length > 0) {
@@ -873,6 +912,12 @@ function filteredOutboundMetadataFromCache(cache) {
       }
       if (transports[tag] != null) {
         result.transports[tag] = transports[tag];
+      }
+      if (securities[tag] != null) {
+        result.securities[tag] = securities[tag];
+      }
+      if (ports[tag] != null) {
+        result.ports[tag] = ports[tag];
       }
     });
     return result;
@@ -898,6 +943,16 @@ function filteredOutboundMetadataFromCache(cache) {
       result.transports[tag] = transport;
     }
   });
+  Object.entries(securities).forEach(([tag, security]) => {
+    if (!groups[tag]) {
+      result.securities[tag] = security;
+    }
+  });
+  Object.entries(ports).forEach(([tag, port]) => {
+    if (!groups[tag]) {
+      result.ports[tag] = port;
+    }
+  });
 
   return result;
 }
@@ -910,6 +965,8 @@ function readOutboundMetadataFromSectionCache(section_id) {
       countries: {},
       protocols: {},
       transports: {},
+      securities: {},
+      ports: {},
     });
   }
 
@@ -921,7 +978,259 @@ function readOutboundMetadataFromSectionCache(section_id) {
       countries: {},
       protocols: {},
       transports: {},
+      securities: {},
+      ports: {},
     }));
+}
+
+function extractCountryFromFlagEmojiName(name) {
+  const str = `${name || ""}`;
+  const chars = Array.from(str);
+  for (let i = 0; i + 1 < chars.length; i += 1) {
+    const cp1 = chars[i].codePointAt(0);
+    const cp2 = chars[i + 1].codePointAt(0);
+    if (cp1 >= 0x1f1e6 && cp1 <= 0x1f1ff && cp2 >= 0x1f1e6 && cp2 <= 0x1f1ff) {
+      const code =
+        String.fromCharCode(65 + (cp1 - 0x1f1e6)) +
+        String.fromCharCode(65 + (cp2 - 0x1f1e6));
+      if (COUNTRY_CODES.includes(code)) {
+        return code;
+      }
+    }
+  }
+  return "";
+}
+
+function portMatchesFilterCondition(portNum, condition) {
+  const cond = `${condition || ""}`.trim();
+  if (!cond) return false;
+  const dash = cond.indexOf("-");
+  if (dash < 0) {
+    return Number.parseInt(cond, 10) === portNum;
+  }
+  const start = Number.parseInt(cond.slice(0, dash), 10);
+  const end = Number.parseInt(cond.slice(dash + 1), 10);
+  if (Number.isNaN(start) || Number.isNaN(end)) return false;
+  return portNum >= start && portNum <= end;
+}
+
+function evaluateLiveServerFilterPreview(metadata, filterSpec) {
+  const meta = plainObject(metadata);
+  const namesMap = plainObject(meta.names);
+  const countriesMap = plainObject(meta.countries);
+  const protocolsMap = plainObject(meta.protocols);
+  const transportsMap = plainObject(meta.transports);
+  const securitiesMap = plainObject(meta.securities);
+  const portsMap = plainObject(meta.ports);
+
+  const filterMode = `${filterSpec.filterMode || "disabled"}`.trim();
+  const detectMethod =
+    `${filterSpec.detectServerCountry || "flag_emoji"}`.trim();
+  const normalizeArr = (arr) =>
+    (Array.isArray(arr) ? arr : arr ? [arr] : [])
+      .map((v) => `${v || ""}`.trim())
+      .filter(Boolean);
+
+  const includeCountries = normalizeArr(filterSpec.includeCountries).map((c) =>
+    c.toUpperCase(),
+  );
+  const includeOutbounds = normalizeArr(filterSpec.includeOutbounds);
+  const includeRegexes = normalizeArr(filterSpec.includeRegex);
+  const includeProxyParams =
+    `${filterSpec.includeProxyParameters || "0"}` === "1";
+  const includeProtocols = normalizeArr(filterSpec.includeProtocols).map((p) =>
+    p.toLowerCase(),
+  );
+  const includeTransports = normalizeArr(filterSpec.includeTransports).map(
+    (t) => t.toLowerCase(),
+  );
+  const includeSecurities = normalizeArr(filterSpec.includeSecurities).map(
+    (s) => s.toLowerCase(),
+  );
+  const includePorts = normalizeArr(filterSpec.includePorts);
+
+  const excludeCountries = normalizeArr(filterSpec.excludeCountries).map((c) =>
+    c.toUpperCase(),
+  );
+  const excludeOutbounds = normalizeArr(filterSpec.excludeOutbounds);
+  const excludeRegexes = normalizeArr(filterSpec.excludeRegex);
+  const excludeProxyParams =
+    `${filterSpec.excludeProxyParameters || "0"}` === "1";
+  const excludeProtocols = normalizeArr(filterSpec.excludeProtocols).map((p) =>
+    p.toLowerCase(),
+  );
+  const excludeTransports = normalizeArr(filterSpec.excludeTransports).map(
+    (t) => t.toLowerCase(),
+  );
+  const excludeSecurities = normalizeArr(filterSpec.excludeSecurities).map(
+    (s) => s.toLowerCase(),
+  );
+  const excludePorts = normalizeArr(filterSpec.excludePorts);
+
+  const compileRegexList = (patterns) =>
+    patterns
+      .map((pat) => {
+        try {
+          return new RegExp(pat);
+        } catch (_e) {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+  const includeCompiledRegexes = compileRegexList(includeRegexes);
+  const excludeCompiledRegexes = compileRegexList(excludeRegexes);
+
+  const seenTypeCounts = new Map();
+  const entries = [];
+
+  Object.entries(namesMap).forEach(([tag, rawName]) => {
+    const name = `${rawName || tag}`.trim();
+    if (!name) return;
+    const protocol = `${protocolsMap[tag] || ""}`.trim();
+    const transport = `${transportsMap[tag] || ""}`.trim();
+    const security = `${securitiesMap[tag] || ""}`.trim();
+    const port = Number.parseInt(`${portsMap[tag] || ""}`, 10) || 0;
+    const typeLabel = formatOutboundTypeLabel(protocol, transport);
+    const nameWithType = typeLabel ? `${name} [${typeLabel}]` : name;
+    const count = (seenTypeCounts.get(nameWithType) || 0) + 1;
+    seenTypeCounts.set(nameWithType, count);
+    const indexedLabel =
+      count > 1 ? `${nameWithType} (#${count})` : nameWithType;
+
+    const flagCountry = extractCountryFromFlagEmojiName(name);
+    const metaCountry = `${countriesMap[tag] || ""}`.trim().toUpperCase();
+    const country =
+      detectMethod === "flag_emoji" ? flagCountry : metaCountry || flagCountry;
+
+    entries.push({
+      tag,
+      name,
+      label: indexedLabel,
+      nameWithType,
+      country,
+      protocol: protocol.toLowerCase(),
+      transport: transport.toLowerCase(),
+      security: security.toLowerCase(),
+      port,
+    });
+  });
+
+  const matchesCandidate = (
+    entry,
+    nameFilter,
+    compiledRegexes,
+    countryFilter,
+    proxyParamsEnabled,
+    operator,
+    protocols,
+    transports,
+    securities,
+    ports,
+  ) => {
+    const nameMatched =
+      nameFilter.includes(entry.name) ||
+      nameFilter.includes(entry.tag) ||
+      nameFilter.includes(entry.nameWithType) ||
+      nameFilter.includes(entry.label) ||
+      compiledRegexes.some((rx) => rx.test(entry.name));
+    const countryMatched =
+      Boolean(entry.country) && countryFilter.includes(entry.country);
+    const baseConfigured =
+      nameFilter.length > 0 ||
+      compiledRegexes.length > 0 ||
+      countryFilter.length > 0;
+    let baseMatches = nameMatched || countryMatched;
+
+    const attrMatches = (val, selected) =>
+      selected.length === 0 ? true : Boolean(val) && selected.includes(val);
+    const portMatches = (portNum, selected) =>
+      selected.length === 0
+        ? true
+        : portNum > 0 &&
+          selected.some((cond) => portMatchesFilterCondition(portNum, cond));
+
+    if (proxyParamsEnabled && operator === "or") {
+      const anyParam =
+        (protocols.length > 0 && attrMatches(entry.protocol, protocols)) ||
+        (transports.length > 0 && attrMatches(entry.transport, transports)) ||
+        (securities.length > 0 && attrMatches(entry.security, securities)) ||
+        (ports.length > 0 && portMatches(entry.port, ports));
+      return baseMatches || anyParam;
+    }
+
+    if (proxyParamsEnabled) {
+      if (!baseConfigured) {
+        baseMatches = true;
+      }
+      const allParams =
+        attrMatches(entry.protocol, protocols) &&
+        attrMatches(entry.transport, transports) &&
+        attrMatches(entry.security, securities) &&
+        portMatches(entry.port, ports);
+      return baseMatches && allParams;
+    }
+
+    return baseMatches;
+  };
+
+  const matchedServers = [];
+  const excludedServers = [];
+
+  entries.forEach((entry) => {
+    if (!filterMode || filterMode === "disabled" || filterMode === "all") {
+      matchedServers.push(entry);
+      return;
+    }
+
+    const isIncluded = matchesCandidate(
+      entry,
+      includeOutbounds,
+      includeCompiledRegexes,
+      includeCountries,
+      includeProxyParams,
+      "and",
+      includeProtocols,
+      includeTransports,
+      includeSecurities,
+      includePorts,
+    );
+    const isExcluded = matchesCandidate(
+      entry,
+      excludeOutbounds,
+      excludeCompiledRegexes,
+      excludeCountries,
+      excludeProxyParams,
+      "or",
+      excludeProtocols,
+      excludeTransports,
+      excludeSecurities,
+      excludePorts,
+    );
+
+    let keep = true;
+    if (filterMode === "include") {
+      keep = isIncluded;
+    } else if (filterMode === "exclude") {
+      keep = !isExcluded;
+    } else if (filterMode === "mixed") {
+      keep = isIncluded && !isExcluded;
+    }
+
+    if (keep) {
+      matchedServers.push(entry);
+    } else {
+      excludedServers.push(entry);
+    }
+  });
+
+  return {
+    totalCount: entries.length,
+    matchedCount: matchedServers.length,
+    excludedCount: excludedServers.length,
+    matchedServers,
+    excludedServers,
+  };
 }
 
 function loadOutboundNameChoices(section_id) {
@@ -1487,9 +1796,60 @@ const SettingsUIDynamicList = ui.DynamicList.extend({
         "\u2699",
       ),
     );
+
+    // Optional per-row on/off. Opt-in through setItemEnabled so the widget stays
+    // generic: a list without it renders exactly as before.
+    //
+    // The write is staged through uci.save() and read back from UCI rather than
+    // kept in widget state, because the row is re-rendered from the list value
+    // and any local copy would be lost on the next render - the checkbox would
+    // snap back while the section was still unapplied.
+    if (typeof this.options.setItemEnabled === "function") {
+      const checkbox = E("input", {
+        type: "checkbox",
+        class: "cbi-input-checkbox fkp-dynlist-enabled",
+        "aria-label": _("Enabled"),
+        "aria-disabled": this.options.disabled ? "true" : null,
+      });
+
+      const applyEnabled = (next) => {
+        if (this.options.disabled) {
+          return;
+        }
+        this.options.setItemEnabled(
+          dynamicListItemCurrentValue(item, value),
+          next,
+        );
+        checkbox.checked = next;
+        checkbox.indeterminate = false;
+      };
+
+      checkbox.checked = this.options.setItemEnabled(
+        dynamicListItemCurrentValue(item, value),
+      );
+
+      checkbox.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        applyEnabled(checkbox.checked);
+      });
+      checkbox.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        applyEnabled(!checkbox.checked);
+      });
+
+      item.insertBefore(checkbox, item.firstChild);
+    }
   },
   handleClick(event) {
-    if (event.target.closest(".fkp-dynlist-settings")) {
+    if (
+      event.target.closest(".fkp-dynlist-settings") ||
+      event.target.closest(".fkp-dynlist-enabled")
+    ) {
       return;
     }
 
@@ -1928,6 +2288,14 @@ function getOutboundTypeForName(section_id, name) {
     return found;
   }
 
+  currentSourceOptionValues(section_id, "selector_amnezia_configs").forEach(
+    (value) => {
+      const config = parseAmneziaConfig(value);
+      if (config && config.name === name) found = "AmneziaWG";
+    },
+  );
+  if (found) return found;
+
   currentSourceOptionValues(section_id, "outbound_jsons").forEach((jsonStr) => {
     if (found) {
       return;
@@ -2037,7 +2405,48 @@ function currentLiveDynamicListValues(section_id, optionName) {
     values.push(pendingValue);
   }
 
+  if (!values.length && widget.tagName === "INPUT" && widget.value) {
+    // A plain form.Value rather than a DynamicList: the fptn access token is
+    // a scalar input, so there are no list items to read.
+    const scalar = `${widget.value}`.trim();
+    if (scalar) values.push(scalar);
+  }
+
   return values;
+}
+
+// Node names inside an fptn access token: the backend emits one outbound per
+// `servers[]` entry, so the draft picker needs those names before the section
+// is saved. fptnb: is brotli — the backend decodes it through the core
+// binary, and the draft waits for the saved state.
+function fptnTokenServerNames(value) {
+  let token = `${value || ""}`.trim();
+  const hashIdx = token.indexOf("#");
+  if (hashIdx >= 0) {
+    token = token.slice(0, hashIdx);
+  }
+  if (token.startsWith("fptnb:") || token.startsWith("fptnb//") || token.startsWith("fptnb://")) return [];
+
+  let body = null;
+  if (token.startsWith("fptn://")) body = token.slice(7);
+  else if (token.startsWith("fptn:")) body = token.slice(5);
+  if (body === null) return [];
+  if (body.startsWith("//")) body = body.slice(2);
+
+  try {
+    const b64 = body
+      .replace(/[\r\n\t =]/g, "")
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+    const payload = JSON.parse(
+      atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)),
+    );
+    return (Array.isArray(payload.servers) ? payload.servers : [])
+      .map((server) => `${(server && server.name) || ""}`.trim())
+      .filter(Boolean);
+  } catch (_error) {
+    return [];
+  }
 }
 
 function currentDraftOutboundNames(section_id) {
@@ -2045,8 +2454,20 @@ function currentDraftOutboundNames(section_id) {
 
   currentSourceOptionValues(section_id, "selector_proxy_links").forEach(
     (value, index) => {
-      const name = main.getProxyUrlName(`${value || ""}`);
-      names.push(name || `${section_id}-${index + 1}-out`);
+      const valStr = `${value || ""}`.trim();
+      const fptnServers = fptnTokenServerNames(valStr);
+      if (fptnServers.length > 0) {
+        fptnServers.forEach((sName) => names.push(sName));
+      } else {
+        const name = main.getProxyUrlName(valStr);
+        names.push(name || `${section_id}-${index + 1}-out`);
+      }
+    },
+  );
+  currentSourceOptionValues(section_id, "selector_amnezia_configs").forEach(
+    (value) => {
+      const config = parseAmneziaConfig(value);
+      if (config) names.push(config.name);
     },
   );
   currentSourceOptionValues(section_id, "interfaces").forEach((itemId) => {
@@ -2065,6 +2486,9 @@ function currentDraftOutboundNames(section_id) {
     if (tag) {
       names.push(tag);
     }
+  });
+  currentSourceOptionValues(section_id, "access_token").forEach((value) => {
+    fptnTokenServerNames(value).forEach((name) => names.push(name));
   });
 
   return names;
@@ -2177,9 +2601,11 @@ function isDownloadThroughTargetSection(section, currentSectionId) {
       "anytls",
       "snell",
       "mieru",
+      "naive",
       "sudoku",
       "masque",
       "openvpn",
+      "fptn",
     ].includes(action)
   ) {
     return true;
@@ -2543,6 +2969,386 @@ function addProxyParameterFilterOptions(itemSection, options) {
   });
 }
 
+function findSectionFilterOption(ownerOption, key) {
+  const sec = ownerOption && ownerOption.section;
+  if (!sec || !Array.isArray(sec.children)) return null;
+  for (let i = 0; i < sec.children.length; i += 1) {
+    if (sec.children[i] && sec.children[i].option === key) {
+      return sec.children[i];
+    }
+  }
+  return null;
+}
+
+function readLiveFilterOptionValue(ownerOption, itemId, key, fallback = "") {
+  const opt = findSectionFilterOption(ownerOption, key);
+  if (opt) {
+    try {
+      const uiEl =
+        typeof opt.getUIElement === "function"
+          ? opt.getUIElement(itemId)
+          : null;
+      if (uiEl && typeof uiEl.getValue === "function") {
+        const val = uiEl.getValue();
+        if (val != null) return val;
+      }
+    } catch (_e) {}
+    try {
+      if (typeof opt.formvalue === "function") {
+        const val = opt.formvalue(itemId);
+        if (val != null) return val;
+      }
+    } catch (_e) {}
+  }
+  const mapVal = optionMapValue(ownerOption, itemId, key);
+  return mapVal !== "" && mapVal != null ? mapVal : fallback;
+}
+
+function addLiveServerFilterPreviewOption(optionTarget, config = {}) {
+  const optionKey = config.optionKey || "_server_filter_preview";
+  const dependencies = Array.isArray(config.dependencies)
+    ? config.dependencies
+    : [];
+  const resolveSectionId =
+    typeof config.resolveSectionId === "function"
+      ? config.resolveSectionId
+      : (itemId) => itemId || "Main";
+  const keys = Object.assign(
+    {
+      filterMode: "filter_mode",
+      detectServerCountry: "detect_server_country",
+      includeCountries: "include_countries",
+      includeOutbounds: "include_outbounds",
+      includeRegex: "include_regex",
+      includeProxyParameters: "include_proxy_parameters",
+      includeProtocols: "include_protocols",
+      includeTransports: "include_transports",
+      includeSecurities: "include_securities",
+      includePorts: "include_ports",
+      excludeCountries: "exclude_countries",
+      excludeOutbounds: "exclude_outbounds",
+      excludeRegex: "exclude_regex",
+      excludeProxyParameters: "exclude_proxy_parameters",
+      excludeProtocols: "exclude_protocols",
+      excludeTransports: "exclude_transports",
+      excludeSecurities: "exclude_securities",
+      excludePorts: "exclude_ports",
+    },
+    config.keys || {},
+  );
+
+  const o = optionTarget.option(
+    form.DummyValue,
+    optionKey,
+    _("Live filter preview"),
+    _("Preview matched and excluded servers in real time before saving."),
+  );
+  dependencies.forEach((dep) => o.depends(dep));
+
+  o.renderWidget = function (itemId) {
+    const ownerOption = this;
+    let showDetails = false;
+    let cachedMeta = null;
+    let timerId = null;
+
+    const statusBadge = E(
+      "span",
+      {
+        class: "badge",
+        style:
+          "display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:#28a745;color:#fff;",
+      },
+      _("Loading servers..."),
+    );
+
+    const summaryText = E(
+      "span",
+      { style: "font-size:12px;opacity:0.85;" },
+      "",
+    );
+
+    const detailsBox = E("div", {
+      style:
+        "display:none;margin-top:8px;padding:8px 10px;border-radius:6px;border:1px solid rgba(128,128,128,0.2);background:rgba(128,128,128,0.04);max-height:180px;overflow-y:auto;font-size:12px;",
+    });
+
+    const toggleBtn = E(
+      "button",
+      {
+        type: "button",
+        class: "btn cbi-button",
+        style: "padding:1px 8px;min-height:24px;font-size:11px;",
+        click: function (ev) {
+          ev.preventDefault();
+          showDetails = !showDetails;
+          detailsBox.style.display = showDetails ? "block" : "none";
+          toggleBtn.textContent = showDetails
+            ? _("Hide servers")
+            : _("Show servers");
+        },
+      },
+      _("Show servers"),
+    );
+
+    const refreshBtn = E(
+      "button",
+      {
+        type: "button",
+        class: "btn cbi-button",
+        style: "padding:1px 8px;min-height:24px;font-size:11px;",
+        click: function (ev) {
+          ev.preventDefault();
+          cachedMeta = null;
+          updatePreview();
+        },
+      },
+      _("Refresh preview"),
+    );
+
+    function collectCurrentSpec() {
+      return {
+        filterMode: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.filterMode,
+          "disabled",
+        ),
+        detectServerCountry: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.detectServerCountry,
+          "flag_emoji",
+        ),
+        includeCountries: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includeCountries,
+          [],
+        ),
+        includeOutbounds: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includeOutbounds,
+          [],
+        ),
+        includeRegex: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includeRegex,
+          [],
+        ),
+        includeProxyParameters: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includeProxyParameters,
+          "0",
+        ),
+        includeProtocols: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includeProtocols,
+          [],
+        ),
+        includeTransports: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includeTransports,
+          [],
+        ),
+        includeSecurities: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includeSecurities,
+          [],
+        ),
+        includePorts: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.includePorts,
+          [],
+        ),
+        excludeCountries: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludeCountries,
+          [],
+        ),
+        excludeOutbounds: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludeOutbounds,
+          [],
+        ),
+        excludeRegex: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludeRegex,
+          [],
+        ),
+        excludeProxyParameters: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludeProxyParameters,
+          "0",
+        ),
+        excludeProtocols: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludeProtocols,
+          [],
+        ),
+        excludeTransports: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludeTransports,
+          [],
+        ),
+        excludeSecurities: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludeSecurities,
+          [],
+        ),
+        excludePorts: readLiveFilterOptionValue(
+          ownerOption,
+          itemId,
+          keys.excludePorts,
+          [],
+        ),
+      };
+    }
+
+    function renderDetails(preview) {
+      detailsBox.innerHTML = "";
+      if (preview.totalCount === 0) {
+        detailsBox.appendChild(
+          E(
+            "div",
+            { style: "opacity:0.75;" },
+            _("No cached servers found for this section yet."),
+          ),
+        );
+        return;
+      }
+
+      const renderServerGroup = (title, list, badgeBg) => {
+        if (!list.length) return null;
+        return E("div", { style: "margin-bottom:6px;" }, [
+          E(
+            "div",
+            { style: "font-weight:600;margin-bottom:4px;font-size:11px;" },
+            `${title} (${list.length}):`,
+          ),
+          E(
+            "div",
+            { style: "display:flex;flex-wrap:wrap;gap:4px;" },
+            list.slice(0, 60).map((srv) =>
+              E(
+                "span",
+                {
+                  style: `display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;background:${badgeBg};border:1px solid rgba(128,128,128,0.25);`,
+                },
+                srv.label,
+              ),
+            ),
+          ),
+        ]);
+      };
+
+      const matchedNode = renderServerGroup(
+        _("Matched servers"),
+        preview.matchedServers,
+        "rgba(40,167,69,0.12)",
+      );
+      const excludedNode = renderServerGroup(
+        _("Excluded servers"),
+        preview.excludedServers,
+        "rgba(220,53,69,0.10)",
+      );
+      if (matchedNode) detailsBox.appendChild(matchedNode);
+      if (excludedNode) detailsBox.appendChild(excludedNode);
+      if (!matchedNode && !excludedNode) {
+        detailsBox.appendChild(
+          E("div", { style: "opacity:0.75;" }, _("No servers matched.")),
+        );
+      }
+    }
+
+    function updatePreview() {
+      const targetSection = resolveSectionId(itemId) || "Main";
+      const metaPromise = cachedMeta
+        ? Promise.resolve(cachedMeta)
+        : readOutboundMetadataFromSectionCache(targetSection).then((m) => {
+            cachedMeta = m;
+            return m;
+          });
+
+      metaPromise.then((meta) => {
+        const spec = collectCurrentSpec();
+        const preview = evaluateLiveServerFilterPreview(meta, spec);
+
+        if (preview.totalCount === 0) {
+          statusBadge.style.background = "#6c757d";
+          statusBadge.textContent = _("0 servers cached");
+          summaryText.textContent = _(
+            "Save & update subscriptions once to populate the server cache.",
+          );
+        } else if (preview.matchedCount === 0) {
+          statusBadge.style.background = "#dc3545";
+          statusBadge.textContent = `${_("Matched")}: 0 / ${preview.totalCount}`;
+          summaryText.textContent = _(
+            "Warning: current filter excludes all servers!",
+          );
+        } else {
+          statusBadge.style.background = "#28a745";
+          statusBadge.textContent = `${_("Matched")}: ${preview.matchedCount} / ${preview.totalCount}`;
+          summaryText.textContent = `${_("Excluded")}: ${preview.excludedCount}`;
+        }
+        renderDetails(preview);
+      });
+    }
+
+    function scheduleUpdate() {
+      if (timerId) clearTimeout(timerId);
+      timerId = setTimeout(updatePreview, 80);
+    }
+
+    const root = E(
+      "div",
+      {
+        class: "tachyon-live-filter-preview",
+        style: "padding:4px 0;",
+      },
+      [
+        E(
+          "div",
+          { style: "display:flex;flex-wrap:wrap;align-items:center;gap:8px;" },
+          [statusBadge, summaryText, toggleBtn, refreshBtn],
+        ),
+        detailsBox,
+      ],
+    );
+
+    setTimeout(() => {
+      const scopeEl =
+        root.closest(".cbi-section") ||
+        root.closest(".modal") ||
+        root.parentElement;
+      if (scopeEl && !scopeEl._tachyonFilterPreviewBound) {
+        scopeEl._tachyonFilterPreviewBound = true;
+        scopeEl.addEventListener("change", scheduleUpdate, true);
+        scopeEl.addEventListener("input", scheduleUpdate, true);
+        scopeEl.addEventListener("click", scheduleUpdate, true);
+      }
+      updatePreview();
+    }, 60);
+
+    return root;
+  };
+
+  return o;
+}
+
 function urlTestUrlChoices() {
   return Array.isArray(main.LATENCY_TEST_URL_OPTIONS)
     ? main.LATENCY_TEST_URL_OPTIONS
@@ -2601,6 +3407,7 @@ function optionMapValue(option, section_id, key) {
 
 function subscriptionUrlSettingsKeys() {
   return [
+    "enabled",
     "subscription_update_enabled",
     "subscription_update_interval",
     "download_via_proxy_enabled",
@@ -2619,6 +3426,8 @@ function subscriptionUrlSettingsKeys() {
     "show_dashboard_metadata",
     "prefix_nodes",
     "node_prefix",
+    "node_prefix_bg",
+    "node_prefix_color",
     "include_urltest_groups",
     "hide_urltest_group_outbounds",
     "hide_detour_outbounds",
@@ -2628,6 +3437,7 @@ function subscriptionUrlSettingsKeys() {
 
 function defaultSubscriptionUrlSettings() {
   return {
+    enabled: "1",
     subscription_update_enabled: "1",
     subscription_update_interval: "1h",
     download_via_proxy_enabled: "0",
@@ -2646,6 +3456,8 @@ function defaultSubscriptionUrlSettings() {
     show_dashboard_metadata: "1",
     prefix_nodes: "0",
     node_prefix: "",
+    node_prefix_bg: "",
+    node_prefix_color: "",
     include_urltest_groups: "1",
     hide_urltest_group_outbounds: "1",
     hide_detour_outbounds: "1",
@@ -2849,6 +3661,17 @@ function addSubscriptionUrlItemOptions(itemSection, options = {}) {
 
   let o = itemSection.option(
     form.Flag,
+    "enabled",
+    _("Enabled"),
+    _(
+      "Use this subscription. A disabled one is neither downloaded nor added to the config",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
+
+  o = itemSection.option(
+    form.Flag,
     "subscription_update_enabled",
     _("Subscription auto update"),
     _("Update this subscription automatically"),
@@ -3017,9 +3840,229 @@ function addSubscriptionUrlItemOptions(itemSection, options = {}) {
   o.default = "0";
   o.rmempty = false;
 
-  o = itemSection.option(form.Value, "node_prefix", _("Prefix text"));
+  const isRu =
+    _("Add prefix to nodes") !== "Add prefix to nodes" ||
+    (typeof document !== "undefined" &&
+      document.documentElement &&
+      document.documentElement.lang === "ru");
+  const tr = (en, ru) => (isRu ? ru : _(en));
+
+  const prefixTextOption = itemSection.option(
+    form.Value,
+    "node_prefix",
+    _("Prefix text"),
+  );
+  prefixTextOption.depends("prefix_nodes", "1");
+  prefixTextOption.rmempty = false;
+
+  const prefixBgOption = itemSection.option(
+    form.Value,
+    "node_prefix_bg",
+    tr("Prefix background color", "Цвет фона префикса"),
+    tr(
+      "Select a preset background color or enter any HEX/CSS color (leave empty for automatic palette)",
+      "Выберите цвет фона из базового набора или укажите свой HEX/CSS-цвет (пусто — авто-палитра)",
+    ),
+  );
+  prefixBgOption.depends("prefix_nodes", "1");
+  prefixBgOption.rmempty = true;
+  prefixBgOption.placeholder = tr("Auto (by name)", "Авто (по названию)");
+  [
+    ["", tr("Auto (by name)", "Авто (по названию)")],
+    ["#1e3a8a", tr("Blue (Indigo) — #1e3a8a", "Синий (Индиго) — #1e3a8a")],
+    [
+      "#065f46",
+      tr("Emerald (Green) — #065f46", "Изумрудный (Зелёный) — #065f46"),
+    ],
+    ["#78350f", tr("Amber (Gold) — #78350f", "Янтарный (Золотой) — #78350f")],
+    ["#4c1d95", tr("Purple (Violet) — #4c1d95", "Фиолетовый — #4c1d95")],
+    ["#831843", tr("Rose (Pink) — #831843", "Розовый — #831843")],
+    ["#155e75", tr("Cyan (Teal) — #155e75", "Бирюзовый — #155e75")],
+    ["#7c2d12", tr("Orange — #7c2d12", "Оранжевый — #7c2d12")],
+    ["#7f1d1d", tr("Red — #7f1d1d", "Красный — #7f1d1d")],
+    ["#334155", tr("Slate (Dark Gray) — #334155", "Графитовый — #334155")],
+  ].forEach(([val, label]) => prefixBgOption.value(val, label));
+
+  const prefixColorOption = itemSection.option(
+    form.Value,
+    "node_prefix_color",
+    tr("Prefix text color", "Цвет текста префикса"),
+    tr(
+      "Select a preset text color or enter any HEX/CSS color (leave empty for automatic palette)",
+      "Выберите цвет текста из базового набора или укажите свой HEX/CSS-цвет (пусто — авто-палитра)",
+    ),
+  );
+  prefixColorOption.depends("prefix_nodes", "1");
+  prefixColorOption.rmempty = true;
+  prefixColorOption.placeholder = tr("Auto (by name)", "Авто (по названию)");
+  [
+    ["", tr("Auto (by name)", "Авто (по названию)")],
+    ["#ffffff", tr("White — #ffffff", "Белый — #ffffff")],
+    ["#93c5fd", tr("Light Blue — #93c5fd", "Голубой — #93c5fd")],
+    ["#6ee7b7", tr("Mint Green — #6ee7b7", "Мятно-зелёный — #6ee7b7")],
+    ["#fcd34d", tr("Amber Gold — #fcd34d", "Золотистый — #fcd34d")],
+    ["#c4b5fd", tr("Lavender — #c4b5fd", "Лавандовый — #c4b5fd")],
+    ["#f9a8d4", tr("Light Pink — #f9a8d4", "Светло-розовый — #f9a8d4")],
+    ["#67e8f9", tr("Cyan — #67e8f9", "Бирюзовый — #67e8f9")],
+    ["#fdba74", tr("Peach Orange — #fdba74", "Персиковый — #fdba74")],
+    ["#fca5a5", tr("Light Red — #fca5a5", "Светло-красный — #fca5a5")],
+    ["#e2e8f0", tr("Light Silver — #e2e8f0", "Светло-серый — #e2e8f0")],
+  ].forEach(([val, label]) => prefixColorOption.value(val, label));
+
+  o = itemSection.option(
+    form.DummyValue,
+    "_prefix_color_presets",
+    tr("Quick color palette", "Быстрый выбор палитры"),
+    tr(
+      "Click a ready-made badge theme or use the color pickers to set background and text colors",
+      "Нажмите на готовый стиль бейджа или выберите произвольные цвета пипеткой",
+    ),
+  );
   o.depends("prefix_nodes", "1");
-  o.rmempty = false;
+  o.renderWidget = function (section_id) {
+    const presets = [
+      {
+        label: tr("Auto", "Авто"),
+        bg: "",
+        color: "",
+        previewBg: "rgba(59, 130, 246, 0.24)",
+        previewColor: "#93c5fd",
+      },
+      { label: tr("Blue", "Синий"), bg: "#1e3a8a", color: "#93c5fd" },
+      { label: tr("Emerald", "Изумруд"), bg: "#065f46", color: "#6ee7b7" },
+      { label: tr("Amber", "Янтарь"), bg: "#78350f", color: "#fcd34d" },
+      { label: tr("Purple", "Фиолет"), bg: "#4c1d95", color: "#c4b5fd" },
+      { label: tr("Rose", "Розовый"), bg: "#831843", color: "#f9a8d4" },
+      { label: tr("Cyan", "Циан"), bg: "#155e75", color: "#67e8f9" },
+      { label: tr("Orange", "Оранж"), bg: "#7c2d12", color: "#fdba74" },
+      { label: tr("Red", "Красный"), bg: "#7f1d1d", color: "#fca5a5" },
+      { label: tr("Slate", "Графит"), bg: "#334155", color: "#e2e8f0" },
+    ];
+
+    const previewBadge = E(
+      "span",
+      {
+        style:
+          "display:inline-flex;align-items:center;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:0.03em;border:1px solid rgba(147,197,253,0.45);background:#1e3a8a;color:#93c5fd;box-shadow:0 1px 2px rgba(0,0,0,0.2);",
+      },
+      "Префикс",
+    );
+
+    const bgColorInput = E("input", {
+      type: "color",
+      value: "#1e3a8a",
+      title: tr("Pick background color", "Выбрать цвет фона"),
+      style:
+        "width:28px;height:26px;padding:0;border:1px solid rgba(148,163,184,0.35);border-radius:5px;cursor:pointer;background:transparent;",
+      change: function (ev) {
+        const val = ev.target.value;
+        const uiEl = prefixBgOption.getUIElement(section_id);
+        if (uiEl) uiEl.setValue(val);
+        updatePreview();
+      },
+    });
+
+    const textColorInput = E("input", {
+      type: "color",
+      value: "#93c5fd",
+      title: tr("Pick text color", "Выбрать цвет текста"),
+      style:
+        "width:28px;height:26px;padding:0;border:1px solid rgba(148,163,184,0.35);border-radius:5px;cursor:pointer;background:transparent;",
+      change: function (ev) {
+        const val = ev.target.value;
+        const uiEl = prefixColorOption.getUIElement(section_id);
+        if (uiEl) uiEl.setValue(val);
+        updatePreview();
+      },
+    });
+
+    function updatePreview() {
+      const textUi = prefixTextOption.getUIElement(section_id);
+      const bgUi = prefixBgOption.getUIElement(section_id);
+      const colUi = prefixColorOption.getUIElement(section_id);
+      const txt =
+        (textUi && textUi.getValue ? textUi.getValue() : "") ||
+        tr("Prefix", "Префикс");
+      const bg = (bgUi && bgUi.getValue ? bgUi.getValue() : "") || "#1e3a8a";
+      const col =
+        (colUi && colUi.getValue ? colUi.getValue() : "") || "#93c5fd";
+      previewBadge.textContent = txt.trim() || tr("Prefix", "Префикс");
+      previewBadge.style.background = bg;
+      previewBadge.style.color = col;
+      previewBadge.style.borderColor = col;
+      if (/^#[0-9a-fA-F]{6}$/.test(bg)) bgColorInput.value = bg;
+      if (/^#[0-9a-fA-F]{6}$/.test(col)) textColorInput.value = col;
+    }
+
+    const pills = presets.map((p) => {
+      const pBg = p.bg || p.previewBg;
+      const pCol = p.color || p.previewColor;
+      return E(
+        "button",
+        {
+          type: "button",
+          class: "btn cbi-button",
+          style: `padding:2px 8px;min-height:24px;line-height:1.3;font-size:11px;font-weight:700;border-radius:6px;background:${pBg};color:${pCol};border:1px solid ${pCol};cursor:pointer;`,
+          click: function (ev) {
+            ev.preventDefault();
+            const bgUi = prefixBgOption.getUIElement(section_id);
+            const colUi = prefixColorOption.getUIElement(section_id);
+            if (bgUi) bgUi.setValue(p.bg);
+            if (colUi) colUi.setValue(p.color);
+            updatePreview();
+          },
+        },
+        p.label,
+      );
+    });
+
+    setTimeout(updatePreview, 60);
+
+    return E(
+      "div",
+      {
+        style: "display:flex;flex-direction:column;gap:8px;padding:4px 0;",
+      },
+      [
+        E(
+          "div",
+          { style: "display:flex;flex-wrap:wrap;gap:6px;align-items:center;" },
+          pills,
+        ),
+        E(
+          "div",
+          {
+            style:
+              "display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:12px;opacity:0.9;",
+          },
+          [
+            E(
+              "span",
+              { style: "display:inline-flex;align-items:center;gap:6px;" },
+              [bgColorInput, E("span", {}, tr("Background", "Пипетка фона"))],
+            ),
+            E(
+              "span",
+              { style: "display:inline-flex;align-items:center;gap:6px;" },
+              [textColorInput, E("span", {}, tr("Text", "Пипетка текста"))],
+            ),
+            E(
+              "span",
+              { style: "display:inline-flex;align-items:center;gap:6px;" },
+              [
+                E(
+                  "span",
+                  { style: "opacity:0.75;" },
+                  tr("Preview:", "Предпросмотр:"),
+                ),
+                previewBadge,
+              ],
+            ),
+          ],
+        ),
+      ],
+    );
+  };
 
   o = itemSection.option(
     form.Flag,
@@ -3349,6 +4392,16 @@ function addUrlTestItemOptions(itemSection, options = {}) {
       addProxyParameterFilterOptions(itemSection, excludeProxyParameterOptions);
     }
   });
+
+  addLiveServerFilterPreviewOption(itemSection, {
+    optionKey: "_urltest_filter_preview",
+    dependencies: [
+      { filter_mode: "include" },
+      { filter_mode: "exclude" },
+      { filter_mode: "mixed" },
+    ],
+    resolveSectionId: (itemId) => parentSectionForItem(itemId) || "Main",
+  });
 }
 
 function priorityLevelSettingsForValidation(groupId, levelId, option) {
@@ -3570,6 +4623,21 @@ function addPriorityLevelItemOptions(itemSection, options = {}) {
     } else if (key === "exclude_regex") {
       addProxyParameterFilterOptions(itemSection, excludeProxyParameterOptions);
     }
+  });
+
+  addLiveServerFilterPreviewOption(itemSection, {
+    optionKey: "_priority_level_filter_preview",
+    dependencies: [
+      { direct: "0", filter_mode: "include" },
+      { direct: "0", filter_mode: "exclude" },
+      { direct: "0", filter_mode: "mixed" },
+    ],
+    resolveSectionId: (itemId) => parentSectionForItem(itemId) || "Main",
+    keys: {
+      includeCountries: "country",
+      includeOutbounds: "server_name",
+      includeRegex: "regex",
+    },
   });
 }
 
@@ -3828,15 +4896,17 @@ function addDashboardServerFilterOptions(section) {
   );
   o.default = "disabled";
   o.depends("action", "connection");
+  o.depends("action", "fptn");
 
   o = optionSection.option(
     form.ListValue,
     "dashboard_detect_server_country",
     _("Detect server country"),
   );
-  ["exclude", "include", "mixed"].forEach((mode) =>
-    o.depends({ action: "connection", dashboard_filter_mode: mode }),
-  );
+  ["exclude", "include", "mixed"].forEach((mode) => {
+    o.depends({ action: "connection", dashboard_filter_mode: mode });
+    o.depends({ action: "fptn", dashboard_filter_mode: mode });
+  });
   serverCountryDetectionChoices().forEach((choice) =>
     o.value(choice.value, choice.label),
   );
@@ -3852,6 +4922,7 @@ function addDashboardServerFilterOptions(section) {
   );
   o.default = "0";
   o.depends("action", "connection");
+  o.depends("action", "fptn");
   o.modalonly = true;
 
   const includeProxyParameterOptions = {
@@ -3863,6 +4934,8 @@ function addDashboardServerFilterOptions(section) {
     dependencies: [
       { action: "connection", dashboard_filter_mode: "include" },
       { action: "connection", dashboard_filter_mode: "mixed" },
+      { action: "fptn", dashboard_filter_mode: "include" },
+      { action: "fptn", dashboard_filter_mode: "mixed" },
     ],
     protocolDescription: _(
       "Show only servers with one of the selected protocols.",
@@ -3886,6 +4959,8 @@ function addDashboardServerFilterOptions(section) {
     dependencies: [
       { action: "connection", dashboard_filter_mode: "exclude" },
       { action: "connection", dashboard_filter_mode: "mixed" },
+      { action: "fptn", dashboard_filter_mode: "exclude" },
+      { action: "fptn", dashboard_filter_mode: "mixed" },
     ],
     protocolDescription: _("Hide servers with one of the selected protocols."),
     transportDescription: _(
@@ -3955,9 +5030,10 @@ function addDashboardServerFilterOptions(section) {
       label,
       description,
     );
-    modes.forEach((mode) =>
-      list.depends({ action: "connection", dashboard_filter_mode: mode }),
-    );
+    modes.forEach((mode) => {
+      list.depends({ action: "connection", dashboard_filter_mode: mode });
+      list.depends({ action: "fptn", dashboard_filter_mode: mode });
+    });
     list.rmempty = true;
     if (choices) {
       choices.forEach((choice) => list.value(choice.value, choice.label));
@@ -4008,6 +5084,39 @@ function addDashboardServerFilterOptions(section) {
         excludeProxyParameterOptions,
       );
     }
+  });
+
+  addLiveServerFilterPreviewOption(optionSection, {
+    optionKey: "_dashboard_server_filter_preview",
+    dependencies: [
+      { action: "connection", dashboard_filter_mode: "include" },
+      { action: "connection", dashboard_filter_mode: "exclude" },
+      { action: "connection", dashboard_filter_mode: "mixed" },
+      { action: "fptn", dashboard_filter_mode: "include" },
+      { action: "fptn", dashboard_filter_mode: "exclude" },
+      { action: "fptn", dashboard_filter_mode: "mixed" },
+    ],
+    resolveSectionId: (sectionId) => sectionId || "Main",
+    keys: {
+      filterMode: "dashboard_filter_mode",
+      detectServerCountry: "dashboard_detect_server_country",
+      includeCountries: "dashboard_include_countries",
+      includeOutbounds: "dashboard_include_outbounds",
+      includeRegex: "dashboard_include_regex",
+      includeProxyParameters: "dashboard_include_proxy_parameters",
+      includeProtocols: "dashboard_include_protocols",
+      includeTransports: "dashboard_include_transports",
+      includeSecurities: "dashboard_include_securities",
+      includePorts: "dashboard_include_ports",
+      excludeCountries: "dashboard_exclude_countries",
+      excludeOutbounds: "dashboard_exclude_outbounds",
+      excludeRegex: "dashboard_exclude_regex",
+      excludeProxyParameters: "dashboard_exclude_proxy_parameters",
+      excludeProtocols: "dashboard_exclude_protocols",
+      excludeTransports: "dashboard_exclude_transports",
+      excludeSecurities: "dashboard_exclude_securities",
+      excludePorts: "dashboard_exclude_ports",
+    },
   });
 }
 
@@ -4507,6 +5616,286 @@ function validatePriorityGroupItemsBeforeSave(section_id, values) {
   return true;
 }
 
+function parseAmneziaConfig(value) {
+  try {
+    if (typeof value !== "string" || value.length > 262144) return null;
+    const config = JSON.parse(value);
+    return config &&
+      typeof config.name === "string" &&
+      typeof config.config === "string"
+      ? config
+      : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function amneziaConfigLink(name, config) {
+  const bytes = new TextEncoder().encode(`# ${name.trim()}\n${config}`);
+  if (bytes.length > 65536) return null;
+  // Encode UTF-8 without placing keys in a URL visible to the user.
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `vpn://${btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
+}
+
+function amneziaConfigTextForSave(original, edited) {
+  // Textareas normalize CRLF; preserve an unchanged uploaded file verbatim.
+  return original.replace(/\r\n?/g, "\n") === edited ? original : edited;
+}
+
+function validateAmneziaConfig(name, config) {
+  name = `${name || ""}`.trim();
+  if (
+    !name ||
+    /[\x00-\x1f\x7f]/.test(name) ||
+    new TextEncoder().encode(name).length > 200
+  ) {
+    return _(
+      "Enter a display name of up to 200 bytes without control characters",
+    );
+  }
+  if (!config || config.includes("\0")) return _("Invalid Amnezia .conf file");
+  const link = amneziaConfigLink(name, config);
+  if (!link)
+    return _("Amnezia configuration must not exceed 64 KiB including its name");
+  const validation = main.validateProxyUrl(link);
+  if (!validation.valid) return _("Invalid Amnezia .conf file");
+  // The shared backend parser validates the same AWG fields before applying.
+  const fields = {};
+  for (const line of config.split("\n")) {
+    const match = line.trim().match(/^([^#=]+)\s*=\s*(.*?)\s*$/);
+    if (match)
+      fields[match[1].trim().toLowerCase().replace(/_/g, "")] = match[2];
+  }
+  const ranges = [
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "contentpaddingaddition",
+    "rekeyaftertime",
+    "rekeytimeout",
+    "rejectaftertime",
+    "keepalivetimeout",
+    "maxhandshakeattempts",
+    "persistentkeepalive",
+    "persistentkeepaliveinterval",
+  ];
+  for (const key of ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4", ...ranges]) {
+    if (fields[key] == null || (ranges.includes(key) && fields[key] === ""))
+      continue;
+    const range = fields[key].match(/^(\d+)(?:-(\d+))?$/);
+    if (
+      !range ||
+      (!ranges.includes(key) && range[2] != null) ||
+      Number(range[1]) > Number(range[2] != null ? range[2] : range[1]) ||
+      Number(range[2] != null ? range[2] : range[1]) > 4294967295
+    )
+      return _("Invalid Amnezia .conf file");
+  }
+  if (
+    fields.mtu != null &&
+    (!/^\d+$/.test(fields.mtu) ||
+      Number(fields.mtu) < 576 ||
+      Number(fields.mtu) > 65535)
+  )
+    return _("Invalid Amnezia .conf file");
+  if (
+    fields.headerprotectionkey &&
+    (!/^[A-Za-z0-9+/]{43}=$/.test(fields.headerprotectionkey) ||
+      atob(fields.headerprotectionkey).length !== 32)
+  )
+    return _("Invalid Amnezia .conf file");
+  for (const key of ["randomtrailers", "disablecookies"]) {
+    if (
+      fields[key] != null &&
+      !/^(1|true|on|yes|0|false|off|no)$/i.test(fields[key])
+    )
+      return _("Invalid Amnezia .conf file");
+  }
+  return true;
+}
+
+function showAmneziaConfigSettingsModal(
+  section_id,
+  itemValue,
+  _option,
+  widget,
+  itemNode,
+  context = {},
+) {
+  if (context.adding && !itemValue) {
+    const input = E("input", {
+      type: "file",
+      accept: ".conf",
+      multiple: true,
+      hidden: true,
+      "data-tachyon-amnezia-upload": "1",
+      style: "display:none!important",
+      "aria-hidden": "true",
+      tabindex: "-1",
+    });
+    input.addEventListener("cancel", () => input.remove());
+    input.addEventListener("change", () => {
+      const files = Array.from(input.files || []);
+      input.remove();
+      if (!files.length) return;
+      if (files.length > 1) {
+        // Several files at once: each becomes its own item straight away —
+        // a review modal per file would be noise. Content is validated per
+        // file; duplicates and anything else are caught on save.
+        for (const file of files) {
+          if (!/\.conf$/i.test(file.name) || file.size > 65536) {
+            ui.addNotification(
+              null,
+              E(
+                "p",
+                _("%s: select an Amnezia .conf file up to 64 KiB").format(
+                  file.name,
+                ),
+              ),
+            );
+            continue;
+          }
+          const reader = new FileReader();
+          reader.onerror = () =>
+            ui.addNotification(
+              null,
+              E("p", _("Cannot read the Amnezia .conf file")),
+            );
+          reader.onload = () => {
+            const config = `${reader.result || ""}`.replace(/^\uFEFF/, "");
+            const name = file.name.replace(/\.conf$/i, "");
+            const result = validateAmneziaConfig(name, config);
+            if (result !== true) {
+              ui.addNotification(
+                null,
+                E("p", "%s: %s".format(file.name, result)),
+              );
+              return;
+            }
+            addDynamicListItem(widget, JSON.stringify({ name, config }));
+          };
+          reader.readAsText(file);
+        }
+        return;
+      }
+      const file = files[0];
+      if (!/\.conf$/i.test(file.name) || file.size > 65536) {
+        ui.addNotification(
+          null,
+          E("p", _("Select an Amnezia .conf file up to 64 KiB")),
+        );
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = () =>
+        ui.addNotification(
+          null,
+          E("p", _("Cannot read the Amnezia .conf file")),
+        );
+      reader.onload = () => {
+        const config = `${reader.result || ""}`.replace(/^\uFEFF/, "");
+        showAmneziaConfigSettingsModal(
+          section_id,
+          JSON.stringify({ name: file.name.replace(/\.conf$/i, ""), config }),
+          _option,
+          widget,
+          itemNode,
+          context,
+        );
+      };
+      reader.readAsText(file);
+    });
+    const oldInput = document.querySelector("[data-tachyon-amnezia-upload]");
+    if (oldInput) oldInput.remove();
+    document.body.appendChild(input);
+    input.click();
+    return;
+  }
+  const config = parseAmneziaConfig(itemValue) || { name: "", config: "" };
+  const map = new form.JSONMap({
+    settings: { name: config.name, config: config.config },
+  });
+  const itemSection = map.section(form.NamedSection, "settings");
+  itemSection.anonymous = true;
+  itemSection.addremove = false;
+  const nameOption = itemSection.option(form.Value, "name", _("Display name"));
+  nameOption.rmempty = false;
+  nameOption.validate = function (_id, value) {
+    const result = validateAmneziaConfig(
+      value,
+      configOption.formvalue("settings") || config.config,
+    );
+    if (result !== true) return result;
+    const names = currentDraftOutboundNames(section_id);
+    if (!context.adding) {
+      const index = names.indexOf(config.name);
+      if (index >= 0) names.splice(index, 1);
+    }
+    if (widget && widget.node) {
+      for (const item of widget.node.querySelectorAll(".item")) {
+        if (item === itemNode) continue;
+        const other = parseAmneziaConfig(dynamicListItemCurrentValue(item, ""));
+        if (other) names.push(other.name.trim());
+      }
+    }
+    return names.includes(`${value || ""}`.trim())
+      ? _("This display name is already in use")
+      : true;
+  };
+  const configOption = itemSection.option(
+    form.TextValue,
+    "config",
+    _("Amnezia .conf"),
+    _(
+      "Private keys are stored on the router. DNS and command hooks from the file are not applied.",
+    ),
+  );
+  configOption.rows = 12;
+  configOption.wrap = "off";
+  configOption.rmempty = false;
+  configOption.validate = function (_id, value) {
+    return validateAmneziaConfig(
+      nameOption.formvalue("settings") || config.name,
+      `${value || ""}`,
+    );
+  };
+  configureTextareaOption(configOption);
+  return renderStackedJsonSettingsModal(
+    _("Amnezia configuration"),
+    map,
+    (settings) => {
+      const value = JSON.stringify({
+        name: `${settings.name || ""}`.trim(),
+        config: amneziaConfigTextForSave(config.config, settings.config),
+      });
+      if (context.adding) addDynamicListItem(widget, value);
+      else {
+        setDynamicListItemValue(itemNode, value);
+        updateDynamicListItemLabel(itemNode, settings.name.trim());
+        if (widget && widget.node)
+          widget.dispatchCbiDynlistChange(widget.node, value);
+      }
+    },
+  );
+}
+
+function validateAmneziaConfigsBeforeSave(_section_id, values) {
+  const names = new Set();
+  for (const value of normalizeDynamicListItems(values)) {
+    const config = parseAmneziaConfig(value);
+    if (!config) return _("Invalid Amnezia .conf file");
+    const result = validateAmneziaConfig(config.name, config.config);
+    if (result !== true) return result;
+    if (names.has(config.name.trim()))
+      return _("This display name is already in use");
+    names.add(config.name.trim());
+  }
+  return true;
+}
+
 function showOutboundJsonSettingsModal(
   _section_id,
   itemValue,
@@ -4662,6 +6051,7 @@ function ensureActionProvidersAvailabilityLoaded() {
           zapret2Installed: Boolean(capabilities?.zapret2Installed),
           byedpiInstalled: Boolean(capabilities?.byedpiInstalled),
           singBoxExtended: Boolean(capabilities?.singBoxExtended),
+          singBoxTachyonCore: Boolean(capabilities?.singBoxTachyonCore),
         });
         return actionProvidersAvailabilityState;
       })
@@ -4756,6 +6146,10 @@ function isSingBoxExtendedForUi() {
   return actionProvidersAvailabilityState.singBoxExtended;
 }
 
+function isTachyonCoreForUi() {
+  return actionProvidersAvailabilityState.singBoxTachyonCore;
+}
+
 function getRuleConfiguredAction(section_id) {
   const action = uci.get(UCI_PACKAGE, section_id, "action");
   return action ? `${action}` : null;
@@ -4773,6 +6167,8 @@ function getActionOptionLabel(action) {
       return "Bypass";
     case "connection":
       return "Connection";
+    case "group":
+      return _("Group");
     case "dns":
       return "DNS";
     case "vpn":
@@ -4800,8 +6196,10 @@ function getActionOptionLabel(action) {
       return "Snell";
     case "mieru":
       return "Mieru";
+    case "naive":
+      return "NaiveProxy";
     case "sudoku":
-      return "Sudoku";
+      return isTachyonCoreForUi() ? _("Sudoku (не реализован)") : "Sudoku";
     case "masque":
       return "MASQUE";
     case "openvpn":
@@ -4887,7 +6285,13 @@ function populateActionOptionValues(option) {
   delete option.vallist;
 
   option.value("connection", getActionOptionLabel("connection"));
-  if (isSingBoxExtendedForUi()) {
+  // A group merges other sections into one flat URLTest; it is plain urltest
+  // machinery, so it needs no variant gate.
+  option.value("group", getActionOptionLabel("group"));
+  // NaiveProxy ships an outbound in every core we support, so it needs no
+  // variant gate of its own.
+  option.value("naive", getActionOptionLabel("naive"));
+  if (isSingBoxExtendedForUi() || isTachyonCoreForUi()) {
     option.value("awg", getActionOptionLabel("awg"));
     option.value("warp", getActionOptionLabel("warp"));
     option.value("masque", getActionOptionLabel("masque"));
@@ -7761,7 +9165,9 @@ function validateCustomRulesetReference(value) {
   return validateFileReference(
     value,
     [".srs", ".json", ".lst", ".txt"],
-    _("Rule set must be an HTTP(S) URL or a local .srs / .json / .lst / .txt path"),
+    _(
+      "Rule set must be an HTTP(S) URL or a local .srs / .json / .lst / .txt path",
+    ),
     { allowRemoteWithoutExtension: true },
   );
 }
@@ -7970,6 +9376,8 @@ function createSectionContent(section) {
 
   section.tab("settings", _("Settings"));
   section.tab("conditions", _("Conditions"));
+  section.tab("servers", _("Servers"));
+  section.tab("awg_manual", _("Manual setup"));
 
   o = section.taboption("settings", form.Flag, "enabled", _("Enable"));
   o.default = "1";
@@ -8028,9 +9436,35 @@ function createSectionContent(section) {
 
   const super_validate = o.validate;
   o.validate = function (section_id, value) {
+    // mieru is implemented in tachyon-core (outbound/mieru.rs + inbound/mieru.rs
+    // and its type is in KNOWN_OUTBOUND_TYPES), so only sudoku stays blocked.
+    if (isTachyonCoreForUi() && value === "sudoku") {
+      return _("This protocol is not implemented in tachyon-core yet");
+    }
     return super_validate
       ? super_validate.apply(this, [section_id, value])
       : true;
+  };
+
+  const originalActionRenderWidget = o.renderWidget;
+  o.renderWidget = function (section_id, option_index, cfgvalue) {
+    const node = originalActionRenderWidget.apply(this, arguments);
+    if (isTachyonCoreForUi()) {
+      Promise.resolve(node).then((elem) => {
+        if (!elem) return;
+        const disabledItems = elem.querySelectorAll
+          ? elem.querySelectorAll(
+              '[data-value="sudoku"], option[value="sudoku"]',
+            )
+          : [];
+        disabledItems.forEach((opt) => {
+          opt.disabled = true;
+          opt.setAttribute("disabled", "disabled");
+          opt.classList.add("disabled");
+        });
+      });
+    }
+    return node;
   };
 
   o.default = "connection";
@@ -8048,6 +9482,33 @@ function createSectionContent(section) {
       }
       return this.cfgvalue(section_id);
     });
+  };
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "group_members",
+    _("Group members"),
+    _(
+      "Sections merged into one flat URLTest group: their rules keep matching traffic, but all their servers are selected together by one URLTest. DPI, marker and route-only sections cannot be members.",
+    ),
+  );
+  o.depends("action", "group");
+  o.modalonly = true;
+  o.rmempty = false;
+  o.placeholder = _("Select sections to merge");
+  configureLiveDynamicListChoices(o, (section_id) =>
+    getOutboundDetourTargetSections(section_id).map((targetSection) => ({
+      value: getUciSectionName(targetSection),
+      label: getUciSectionLabel(targetSection),
+    })),
+  );
+  o.validate = function (section_id, value) {
+    const members = L.toArray(value != null ? value : []);
+    if (!members.filter(Boolean).length) {
+      return _("Select at least one section to merge");
+    }
+    return true;
   };
 
   o = section.taboption(
@@ -8461,8 +9922,9 @@ function createSectionContent(section) {
   );
   o.depends("action", "fptn");
   o.password = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.modalonly = true;
+  outboundNameSourceOptions.set("access_token", o);
 
   o = section.taboption(
     "settings",
@@ -8764,24 +10226,27 @@ function createSectionContent(section) {
           },
           [
             E("div", {}, [
-              E("strong", {}, _("Total lines: ")),
+              E("strong", {}, _("Total lines:") + " "),
               `${result.totalLines}`,
             ]),
             E("div", {}, [
-              E("strong", {}, _("Parsed records: ")),
+              E("strong", {}, _("Parsed records:") + " "),
               `${result.entries.length}`,
             ]),
             E("div", {}, [
-              E("strong", {}, _("Skipped loopback: ")),
+              E("strong", {}, _("Skipped loopback:") + " "),
               `${result.skippedLoopback}`,
             ]),
             E("div", {}, [
-              E("strong", {}, _("Skipped comments/invalid: ")),
+              E("strong", {}, _("Skipped comments/invalid:") + " "),
               `${result.skippedComments + result.skippedInvalid}`,
             ]),
-            E("div", {}, [E("strong", {}, _("New domains: ")), `${newCount}`]),
             E("div", {}, [
-              E("strong", {}, _("Updated/duplicates: ")),
+              E("strong", {}, _("New domains:") + " "),
+              `${newCount}`,
+            ]),
+            E("div", {}, [
+              E("strong", {}, _("Updated/duplicates:") + " "),
               `${updatedCount}`,
             ]),
           ],
@@ -9316,13 +10781,15 @@ function createSectionContent(section) {
                       );
                     } else {
                       msg =
-                        _("Update failed: ") + (data.error || res.stderr || "");
+                        _("Update failed:") +
+                        " " +
+                        (data.error || res.stderr || "");
                     }
                   } catch (e) {
                     msg =
                       res.stdout ||
                       res.stderr ||
-                      _("Finished with code ") + res.code;
+                      _("Finished with code") + " " + res.code;
                   }
                   ui.addNotification(
                     null,
@@ -9403,8 +10870,30 @@ function createSectionContent(section) {
     return s;
   };
 
+  // An AmneziaWG section is set up one of three ways; a heading per way keeps
+  // the long option list readable. LuCI renders the label on the left and this
+  // markup on the right.
+  function addAwgModeTitle(key, title, description) {
+    const o = section.taboption("servers", form.DummyValue, key, title);
+    o.modalonly = true;
+    o.rawhtml = true;
+    o.depends("action", "awg");
+    o.cfgvalue = function () {
+      return `<span style="opacity:.75">${description}</span>`;
+    };
+    return o;
+  }
+
+  addAwgModeTitle(
+    "_awg_mode_generate",
+    _("Generate for 2.0"),
+    _(
+      "Generate an AmneziaWG 2.0 configuration from a Cloudflare WARP account. Only 2.0 can be generated: WARP does not run AmneziaWG, so 3.0 and 3.1 cannot be produced here — load a .conf for those.",
+    ),
+  );
+
   o = section.taboption(
-    "settings",
+    "servers",
     form.Button,
     "_generate_warp",
     _("AmneziaWG Generator"),
@@ -9520,7 +11009,8 @@ function createSectionContent(section) {
           resetAfter(2500);
           showStatusModal(
             _("Error"),
-            _("Failed to generate WARP config: ") +
+            _("Failed to generate WARP config:") +
+              " " +
               (response?.stderr || "Unknown error"),
             true,
           );
@@ -9534,7 +11024,8 @@ function createSectionContent(section) {
             resetAfter(2500);
             showStatusModal(
               _("Error"),
-              _("Failed to generate WARP config: ") +
+              _("Failed to generate WARP config:") +
+                " " +
                 (data.message || "Unknown error"),
               true,
             );
@@ -9613,7 +11104,7 @@ function createSectionContent(section) {
           resetAfter(2500);
           showStatusModal(
             _("Error"),
-            _("Failed to parse WARP config: ") + err.message,
+            _("Failed to parse WARP config:") + " " + err.message,
             true,
           );
         }
@@ -9623,7 +11114,7 @@ function createSectionContent(section) {
         resetAfter(2500);
         showStatusModal(
           _("Error"),
-          _("Error running generator: ") + error.message,
+          _("Error running generator:") + " " + error.message,
           true,
         );
       });
@@ -9631,7 +11122,7 @@ function createSectionContent(section) {
 
   // ── Load .conf button ──────────────────────────────────────────────────────
   o = section.taboption(
-    "settings",
+    "servers",
     form.Button,
     "_load_awg_conf",
     _("Load .conf config"),
@@ -9712,7 +11203,6 @@ function createSectionContent(section) {
       style: "display:none",
     });
 
-    const icon = E("span", {}, ["📂"]);
     const label = E("span", { class: "twg-label" }, [_("Load .conf")]);
     const btn = E(
       "button",
@@ -9721,7 +11211,7 @@ function createSectionContent(section) {
         type: "button",
         style: "display:inline-flex;align-items:center;gap:8px;",
       },
-      [icon, label],
+      [label],
     );
 
     const setBtn = (state, text) => {
@@ -9756,7 +11246,7 @@ function createSectionContent(section) {
           setTimeout(() => setBtn("", null), 2500);
           ui.addNotification(
             _("Error"),
-            E("p", {}, _("Failed to parse file: ") + err.message),
+            E("p", {}, _("Failed to parse file:") + " " + err.message),
             "danger",
           );
           return;
@@ -9964,7 +11454,7 @@ function createSectionContent(section) {
   };
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Value,
     "awg_local_address",
     _("Local Address"),
@@ -9976,7 +11466,7 @@ function createSectionContent(section) {
   o.validate = validateRequiredText;
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Value,
     "awg_private_key",
     _("Private Key"),
@@ -9987,7 +11477,7 @@ function createSectionContent(section) {
   o.validate = validateRequiredText;
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Value,
     "awg_peer_public_key",
     _("Peer Public Key"),
@@ -9998,7 +11488,7 @@ function createSectionContent(section) {
   o.validate = validateRequiredText;
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Value,
     "awg_server_address",
     _("Server Address"),
@@ -10009,7 +11499,7 @@ function createSectionContent(section) {
   o.validate = validateRequiredText;
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Value,
     "awg_server_port",
     _("Server Port"),
@@ -10021,7 +11511,7 @@ function createSectionContent(section) {
   o.validate = validateRequiredText;
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Value,
     "awg_preshared_key",
     _("Preshared Key"),
@@ -10030,7 +11520,7 @@ function createSectionContent(section) {
   o.rmempty = true;
   o.depends("action", "awg");
 
-  o = section.taboption("settings", form.Value, "awg_mtu", _("MTU"));
+  o = section.taboption("awg_manual", form.Value, "awg_mtu", _("MTU"));
   o.datatype = "uinteger";
   o.placeholder = "1280";
   o.modalonly = true;
@@ -10038,7 +11528,7 @@ function createSectionContent(section) {
   o.depends("action", "awg");
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Value,
     "awg_keepalive",
     _("Persistent Keepalive"),
@@ -10056,7 +11546,7 @@ function createSectionContent(section) {
   o.depends("action", "awg");
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.ListValue,
     "awg_version",
     _("AmneziaWG Version"),
@@ -10096,7 +11586,7 @@ function createSectionContent(section) {
 
   // ── AmneziaWG obfuscation parameters (NATIVE LUCI CBI STYLE) ──────────────
   const addAwgParam = (name, title, desc, def) => {
-    let opt = section.taboption("settings", form.Value, name, title, desc);
+    let opt = section.taboption("awg_manual", form.Value, name, title, desc);
     opt.modalonly = true;
     opt.rmempty = false;
     opt.default = def;
@@ -10116,7 +11606,7 @@ function createSectionContent(section) {
   addAwgParam("awg_h3", _("Underload Packet Magic Header (H3)"), "", "3");
   addAwgParam("awg_h4", _("Underload Packet Magic Header (H4)"), "", "4");
   const addAwgPayloadParam = (name, title, desc, def) => {
-    let opt = section.taboption("settings", form.Value, name, title, desc);
+    let opt = section.taboption("awg_manual", form.Value, name, title, desc);
     opt.modalonly = true;
     opt.rmempty = false;
     opt.default = def;
@@ -10140,7 +11630,7 @@ function createSectionContent(section) {
 
   // ── AmneziaWG 3.0 & 3.1 Advanced Parameters ───────────────────────────────
   const addAwgV3Param = (name, title, desc) => {
-    let opt = section.taboption("settings", form.Value, name, title, desc);
+    let opt = section.taboption("awg_manual", form.Value, name, title, desc);
     opt.modalonly = true;
     opt.rmempty = true;
     opt.depends({ action: "awg", awg_version: "3.0" });
@@ -10149,7 +11639,7 @@ function createSectionContent(section) {
   };
 
   const addAwgV31Param = (name, title, desc) => {
-    let opt = section.taboption("settings", form.Value, name, title, desc);
+    let opt = section.taboption("awg_manual", form.Value, name, title, desc);
     opt.modalonly = true;
     opt.rmempty = true;
     opt.depends({ action: "awg", awg_version: "3.1" });
@@ -10193,7 +11683,7 @@ function createSectionContent(section) {
   );
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Flag,
     "awg_random_trailers",
     _("Random Trailers"),
@@ -10205,7 +11695,7 @@ function createSectionContent(section) {
   o.depends({ action: "awg", awg_version: "3.1" });
 
   o = section.taboption(
-    "settings",
+    "awg_manual",
     form.Flag,
     "awg_disable_cookies",
     _("Disable Cookies"),
@@ -10380,7 +11870,7 @@ function createSectionContent(section) {
   o.default = "4";
   o.depends("action", "snell");
 
-  // ── Mieru (sing-box-extended) ─────────────────────────────────────────────
+  // ── Mieru (sing-box-extended, tachyon-core) ──────────────────────────────
 
   o = section.taboption(
     "settings",
@@ -10439,6 +11929,61 @@ function createSectionContent(section) {
   o.password = true;
   o.depends("action", "mieru");
   o.validate = validateRequiredText;
+
+  // ── NaiveProxy (every core) ──────────────────────────────────────────────
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "naive_server",
+    _("Server Address"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("action", "naive");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "naive_server_port",
+    _("Server Port"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.datatype = "port";
+  o.depends("action", "naive");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "naive_username",
+    _("Username"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("action", "naive");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "naive_password",
+    _("Password"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.password = true;
+  o.depends("action", "naive");
+  o.validate = validateRequiredText;
+
+  // NaiveProxy always speaks HTTPS. The SNI defaults to the server address,
+  // and tachyon-core refuses tls.insecure outright, so there is deliberately
+  // no skip-verification option here.
+  o = section.taboption("settings", form.Value, "naive_sni", _("SNI"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "naive");
 
   // ── Sudoku (sing-box-extended) ────────────────────────────────────────────
 
@@ -10557,7 +12102,10 @@ function createSectionContent(section) {
         result.tls_crypt = tagContent;
       else if (tagName === "auth-user-pass" || tagName === "auth_user_pass") {
         result.auth_user_pass_required = true;
-        const creds = tagContent.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+        const creds = tagContent
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
         if (creds.length >= 1) result.username = creds[0];
         if (creds.length >= 2) result.password = creds[1];
       }
@@ -10580,7 +12128,9 @@ function createSectionContent(section) {
           result.server = parts[1];
           if (parts[2] && /^\d+$/.test(parts[2])) result.port = parts[2];
           if (parts[3] && /^(udp|tcp)/i.test(parts[3])) {
-            result.proto = parts[3].toLowerCase().startsWith("tcp") ? "tcp" : "udp";
+            result.proto = parts[3].toLowerCase().startsWith("tcp")
+              ? "tcp"
+              : "udp";
           }
         }
       } else if (cmd === "port" && parts[1] && /^\d+$/.test(parts[1])) {
@@ -10634,7 +12184,6 @@ function createSectionContent(section) {
       style: "display:none",
     });
 
-    const icon = E("span", {}, ["📂"]);
     const label = E("span", { class: "twg-label" }, [_("Load .ovpn")]);
     const btn = E(
       "button",
@@ -10643,7 +12192,7 @@ function createSectionContent(section) {
         type: "button",
         style: "display:inline-flex;align-items:center;gap:8px;",
       },
-      [icon, label],
+      [label],
     );
 
     const setBtn = (state, text) => {
@@ -10692,7 +12241,11 @@ function createSectionContent(section) {
           setTimeout(() => setBtn("", null), 2500);
           ui.addNotification(
             _("Error"),
-            E("p", {}, _("Failed to parse OpenVPN config: ") + err.message),
+            E(
+              "p",
+              {},
+              _("Failed to parse OpenVPN config:") + " " + err.message,
+            ),
             "danger",
           );
           return;
@@ -10725,17 +12278,32 @@ function createSectionContent(section) {
         setBtn("success", _("Loaded!"));
         setTimeout(() => setBtn("", null), 2000);
 
-        if (parsed.auth_user_pass_required && (!parsed.username || !parsed.password)) {
+        if (
+          parsed.auth_user_pass_required &&
+          (!parsed.username || !parsed.password)
+        ) {
           ui.addNotification(
             _("OpenVPN Credentials Required"),
-            E("p", {}, _("OpenVPN config loaded. Please enter your username and password below.")),
+            E(
+              "p",
+              {},
+              _(
+                "OpenVPN config loaded. Please enter your username and password below.",
+              ),
+            ),
             "info",
           );
           const uEl =
-            document.getElementById(`cbid.${UCI_PACKAGE}.${section_id}.openvpn_username`) ||
-            document.getElementById(`widget.cbid.${UCI_PACKAGE}.${section_id}.openvpn_username`);
+            document.getElementById(
+              `cbid.${UCI_PACKAGE}.${section_id}.openvpn_username`,
+            ) ||
+            document.getElementById(
+              `widget.cbid.${UCI_PACKAGE}.${section_id}.openvpn_username`,
+            );
           if (uEl) {
-            const input = uEl.querySelector ? uEl.querySelector("input") || uEl : uEl;
+            const input = uEl.querySelector
+              ? uEl.querySelector("input") || uEl
+              : uEl;
             if (input && input.focus) input.focus();
           }
         } else {
@@ -10906,7 +12474,9 @@ function createSectionContent(section) {
     form.ListValue,
     "openvpn_key_direction",
     _("TLS Auth Key Direction"),
-    _("Key direction for tls-auth (0 = server, 1 = client, empty = bidirectional)"),
+    _(
+      "Key direction for tls-auth (0 = server, 1 = client, empty = bidirectional)",
+    ),
   );
   o.modalonly = true;
   o.rmempty = true;
@@ -10935,24 +12505,119 @@ function createSectionContent(section) {
     "selector_proxy_links",
     _("Connection URL"),
     _(
-      "vless://, vmess://, ss://, trojan://, socks4/5://, http/s://, hy2/hysteria2:// links",
+      "vless://, vmess://, ss://, trojan://, socks4/5://, http/s://, hy2/hysteria2:// links, fptn://",
     ),
   );
   o.depends("action", "connection");
+  o.depends("action", "fptn");
   o.rmempty = true;
   o.modalonly = true;
-  o.validate = function (_section_id, value) {
+  const originalVpnUrlRender = o.render;
+  o.render = function () {
+    return Promise.resolve(originalVpnUrlRender.apply(this, arguments)).then(
+      (node) => {
+        const description =
+          node && node.querySelector(".cbi-value-description");
+        if (description) {
+          description.appendChild(
+            E(
+              "span",
+              { "data-tachyon-vpn-url-hint": "1" },
+              main.supportsVpnUrl() ? "; vpn:// (AWG, LX / tachyon-core)" : "",
+            ),
+          );
+          refreshVpnUrlHints();
+        }
+        return node;
+      },
+    );
+  };
+  o.validate = function (section_id, value) {
     if (!value || value.length === 0) {
       return true;
     }
 
     const validation = main.validateProxyUrl(value);
-    return validation.valid ? true : validation.message;
+    if (!validation.valid) {
+      return validation.message;
+    }
+
+    // An FPTN section dials with an fptn: / fptnb: access token and nothing
+    // else — the generator silently ignores any other link pasted here.
+    if (
+      uci.get(UCI_PACKAGE, section_id, "action") === "fptn" &&
+      !/^fptnb?:/.test(value)
+    ) {
+      return _("FPTN section accepts only fptn:// or fptnb:// links");
+    }
+
+    return true;
   };
   o.onchange = function (_event, section_id) {
     refreshDashboardFilterChoiceWidgets(section_id);
   };
   outboundNameSourceOptions.set("selector_proxy_links", o);
+
+  addAwgModeTitle(
+    "_awg_mode_import",
+    _("Load several configs"),
+    _(
+      "Import several AmneziaWG .conf files. They are combined into one group: Tachyon picks the fastest and the URLTest / Priority groups below can select among them.",
+    ),
+  );
+
+  o = section.taboption(
+    "servers",
+    ButtonAddSettingsDynamicList,
+    "selector_amnezia_configs",
+    _("Amnezia configurations"),
+    _(
+      "Import .conf files for AmneziaWG 2.0, 3.0 and 3.1. Available with sing-box LX and tachyon-core.",
+    ),
+  );
+  o.depends("action", "awg");
+  o.rmempty = true;
+  o.retain = true;
+  o.modalonly = true;
+  o.addButtonLabel = `\u{1F4C1} ${_("Load .conf")}`;
+  o.renderItemSettingsModal = showAmneziaConfigSettingsModal;
+  o.renderListItemLabel = function (_id, value) {
+    const config = parseAmneziaConfig(value);
+    return E(
+      "span",
+      { class: "fkp-dynlist-label" },
+      config ? config.name : _("Invalid Amnezia .conf file"),
+    );
+  };
+  o.inputValueForItem = function (_id, value) {
+    const parsed = parseAmneziaConfig(value);
+    return (parsed && parsed.name) || value;
+  };
+  o.validateItemsOnSave = validateAmneziaConfigsBeforeSave;
+  o.validate = function (_id, value) {
+    return !value ? true : validateAmneziaConfigsBeforeSave(_id, [value]);
+  };
+  const originalAmneziaIsActive = o.isActive;
+  o.isActive = function () {
+    return (
+      main.supportsVpnUrl() && originalAmneziaIsActive.apply(this, arguments)
+    );
+  };
+  const originalAmneziaRender = o.render;
+  o.render = function () {
+    return Promise.resolve(originalAmneziaRender.apply(this, arguments)).then(
+      (node) => {
+        if (node) {
+          node.setAttribute("data-tachyon-amnezia-configs", "1");
+          refreshVpnUrlHints();
+          node.style.display = main.supportsVpnUrl() ? "" : "none";
+        }
+        return node;
+      },
+    );
+  };
+  o.onListChange = refreshDashboardFilterChoiceWidgets;
+  outboundNameSourceOptions.set("selector_amnezia_configs", o);
 
   o = section.taboption(
     "settings",
@@ -11026,6 +12691,35 @@ function createSectionContent(section) {
     });
   };
   o.validate = validateSubscriptionUrlEntry;
+
+  // On/off right in the list, next to the gear and the remove button. A
+  // subscription_url child section is named after its URL, so the value in the
+  // row is the UCI section id and the flag can be read and written directly.
+  //
+  // Returns the current state when called with no `next`, otherwise flips it and
+  // stages the change. Default is enabled: a section written before the flag
+  // existed has no `enabled` option, and treating that as "off" would silently
+  // disable every existing subscription the first time the page opened.
+  o.setItemEnabled = function (value, next) {
+    const itemId = `${value || ""}`;
+    if (
+      !itemId ||
+      !isExistingChildItem(section_id, itemId, "subscription_url")
+    ) {
+      return true;
+    }
+
+    const raw = uci.get(UCI_PACKAGE, itemId, "enabled");
+    const isEnabled = raw == null || raw === "" || raw === "1";
+
+    if (next == null || next === isEnabled) {
+      return isEnabled;
+    }
+
+    uci.set(UCI_PACKAGE, itemId, "enabled", next ? "1" : "0");
+    uci.save();
+    return next;
+  };
   o.validate = function (section_id, value) {
     return validateSubscriptionUrlEntry(
       section_id,
@@ -11137,6 +12831,8 @@ function createSectionContent(section) {
     _("Server group for automatic lowest-latency selection"),
   );
   o.depends("action", "connection");
+  o.depends("action", "fptn");
+  o.depends("action", "awg");
   o.rmempty = true;
   o.modalonly = true;
   o.addButtonLabel = _("+ Add URLTest");
@@ -11196,6 +12892,8 @@ function createSectionContent(section) {
     _("Server group for priority failover"),
   );
   o.depends("action", "connection");
+  o.depends("action", "fptn");
+  o.depends("action", "awg");
   o.rmempty = true;
   o.modalonly = true;
   o.addButtonLabel = _("+ Add priority");
@@ -11239,6 +12937,7 @@ function createSectionContent(section) {
   o.default = "0";
   o.rmempty = false;
   o.depends("action", "connection");
+  o.depends("action", "fptn");
   o.depends("action", "awg");
   o.modalonly = true;
   o.write = function (section_id, value) {
@@ -11275,6 +12974,7 @@ function createSectionContent(section) {
   );
   o.rmempty = false;
   o.depends({ action: "connection", outbound_detour_enabled: "1" });
+  o.depends({ action: "fptn", outbound_detour_enabled: "1" });
   o.depends({ action: "awg", outbound_detour_enabled: "1" });
   o.modalonly = true;
   o.load = function (section_id) {
@@ -11303,6 +13003,7 @@ function createSectionContent(section) {
   o.default = "0";
   o.rmempty = false;
   o.depends("action", "connection");
+  o.depends("action", "fptn");
   o.modalonly = true;
 
   o = section.taboption(
@@ -11321,6 +13022,32 @@ function createSectionContent(section) {
   o.default = "";
   o.rmempty = true;
   o.depends("action", "connection");
+  o.depends("action", "fptn");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "fail_policy",
+    _("Section Fail Policy"),
+    _(
+      "Action when this section's outbound is quarantined or fails health probes: Keep (normal routing), Fail-Closed (block matching traffic to prevent IP leaks), or Fail-Open (bypass directly).",
+    ),
+  );
+  o.value("keep", _("Keep (default behavior)"));
+  o.value("block", _("Fail-Closed (Block / Kill-switch)"));
+  o.value("direct", _("Fail-Open (Direct bypass)"));
+  o.default = "keep";
+  o.rmempty = true;
+  o.depends("action", "connection");
+  o.depends("action", "fptn");
+  o.depends("action", "awg");
+  o.depends("action", "byedpi");
+  o.depends("action", "wdtt");
+  o.depends("action", "olcrtc");
+  o.depends("action", "zapret");
+  o.depends("action", "zapret2");
+  o.depends("action", "outbound");
   o.modalonly = true;
 
   o = section.taboption(
@@ -11333,6 +13060,7 @@ function createSectionContent(section) {
   o.default = "0";
   o.rmempty = false;
   o.depends("action", "connection");
+  o.depends("action", "fptn");
   o.depends("action", "awg");
   o.depends("action", "byedpi");
   o.depends("action", "wdtt");
@@ -11350,6 +13078,7 @@ function createSectionContent(section) {
   );
   o.rmempty = false;
   o.depends({ action: "connection", mixed_proxy_enabled: "1" });
+  o.depends({ action: "fptn", mixed_proxy_enabled: "1" });
   o.depends({ action: "awg", mixed_proxy_enabled: "1" });
   o.depends({ action: "byedpi", mixed_proxy_enabled: "1" });
   o.depends({ action: "zapret", mixed_proxy_enabled: "1" });
@@ -11378,6 +13107,7 @@ function createSectionContent(section) {
   o.default = "0";
   o.rmempty = false;
   o.depends({ action: "connection", mixed_proxy_enabled: "1" });
+  o.depends({ action: "fptn", mixed_proxy_enabled: "1" });
   o.depends({ action: "awg", mixed_proxy_enabled: "1" });
   o.depends({ action: "byedpi", mixed_proxy_enabled: "1" });
   o.depends({ action: "zapret", mixed_proxy_enabled: "1" });
@@ -11393,6 +13123,11 @@ function createSectionContent(section) {
   o.rmempty = false;
   o.depends({
     action: "connection",
+    mixed_proxy_enabled: "1",
+    mixed_proxy_auth_enabled: "1",
+  });
+  o.depends({
+    action: "fptn",
     mixed_proxy_enabled: "1",
     mixed_proxy_auth_enabled: "1",
   });
@@ -11438,6 +13173,11 @@ function createSectionContent(section) {
     mixed_proxy_auth_enabled: "1",
   });
   o.depends({
+    action: "fptn",
+    mixed_proxy_enabled: "1",
+    mixed_proxy_auth_enabled: "1",
+  });
+  o.depends({
     action: "awg",
     mixed_proxy_enabled: "1",
     mixed_proxy_auth_enabled: "1",
@@ -11478,6 +13218,7 @@ function createSectionContent(section) {
   o.default = "0";
   o.rmempty = false;
   o.depends("action", "connection");
+  o.depends("action", "fptn");
   o.modalonly = true;
   o.cfgvalue = function (section_id) {
     const value = uci.get(
@@ -11532,6 +13273,7 @@ function createSectionContent(section) {
     "anytls",
     "snell",
     "mieru",
+    "naive",
     "sudoku",
     "masque",
     "openvpn",
@@ -11589,6 +13331,7 @@ function createSectionContent(section) {
     "anytls",
     "snell",
     "mieru",
+    "naive",
     "sudoku",
     "masque",
     "openvpn",
@@ -11992,6 +13735,7 @@ const ACTION_COLORS = {
   anytls: "#16a085",
   snell: "#2c3e50",
   mieru: "#34495e",
+  naive: "#1f618d",
   sudoku: "#7f8c8d",
   masque: "#8e44ad",
   openvpn: "#e74c3c",
@@ -12359,33 +14103,25 @@ async function matchCommunityList(secName, community, query, type) {
     const checkMatch = (res) => {
       if (!res || res.code !== 0) return false;
       const output = (res.stdout || "") + (res.stderr || "");
-      return output.trim() !== "";
+      return (
+        /\[\d+\]\s*match/.test(output) ||
+        (output.includes("match") && !output.includes("no match"))
+      );
     };
 
+    const matchArgs = [
+      "rule-set",
+      "match",
+      srsPath,
+      ...(type === "ip" ? ["--ip", query] : ["--domain", query]),
+    ];
+
     // Try /usr/bin/sing-box first
-    let res = await fs
-      .exec("/usr/bin/sing-box", [
-        "rule-set",
-        "match",
-        srsPath,
-        query,
-        "-f",
-        "binary",
-      ])
-      .catch(() => null);
+    let res = await fs.exec("/usr/bin/sing-box", matchArgs).catch(() => null);
     if (checkMatch(res)) return true;
 
     // Fallback to /usr/sbin/sing-box
-    res = await fs
-      .exec("/usr/sbin/sing-box", [
-        "rule-set",
-        "match",
-        srsPath,
-        query,
-        "-f",
-        "binary",
-      ])
-      .catch(() => null);
+    res = await fs.exec("/usr/sbin/sing-box", matchArgs).catch(() => null);
     if (checkMatch(res)) return true;
   }
 

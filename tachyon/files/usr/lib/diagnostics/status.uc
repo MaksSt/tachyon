@@ -536,24 +536,6 @@ function firewall_required_protocols_open(port, required_proto) {
     return true;
 }
 
-function server_required_inbound_proto(protocol) {
-    protocol = as_string(protocol);
-    if (protocol == "json_inbound")
-        print("\n");
-    else
-        print(protocol == "hysteria2" || protocol == "tuic" ? "udp" : "tcp", "\n");
-}
-
-function server_runtime_type_for_protocol(protocol) {
-    protocol = as_string(protocol);
-    if (protocol == "json_inbound")
-        print("\n");
-    else if (protocol == "mtproto")
-        print("mtproxy\n");
-    else
-        print(protocol, "\n");
-}
-
 function arg_bool(value) {
     return value === true || value == "true" || value == "1" || value == 1;
 }
@@ -1051,6 +1033,13 @@ function inbound_runtime_ok(protocol, runtime_exists, runtime_type, runtime_list
     if (runtime_type != expected_type)
         return 0;
 
+    // An endpoint-schema AWG (lx / tachyon-core) carries no listen field -
+    // singbox/servers.uc deletes it before pushing the object into endpoints -
+    // so the port is the only thing left to match here; the socket itself is
+    // checked by the separate listening probe.
+    if (protocol == "awg" && runtime_type == "wireguard" && runtime_listen == "")
+        return runtime_port_text == listen_port ? 1 : 0;
+
     if (protocol == "tailscale")
         return 1;
 
@@ -1323,6 +1312,8 @@ function render_flag_line(value, key, ok_message, fail_message) {
 }
 
 function sing_box_core_label(value) {
+    if (flag_is_one(value.sing_box_tachyon_core))
+        return "tachyon-core";
     if (flag_is_one(value.sing_box_extended) && flag_is_one(value.sing_box_compressed))
         return "extended-compressed";
     if (flag_is_one(value.sing_box_extended) && flag_is_one(value.sing_box_lx))
@@ -1361,19 +1352,26 @@ function format_sing_box_version(value, version) {
 
 function render_global_sing_box_check() {
     let value = object_or_empty(read_stdin_json());
+    let is_core = flag_is_one(value.sing_box_tachyon_core);
+    let name = is_core ? "Tachyon Core" : "Sing-box";
 
-    render_flag_line(value, "sing_box_installed", "\u2705 Sing-box installed", "\u274c Sing-box installed");
-    render_flag_line(value, "sing_box_version_ok", "\u2705 Sing-box version is compatible (newer than 1.12.4)", "\u274c Sing-box version is not compatible (older than 1.12.4)");
+    render_flag_line(value, "sing_box_installed", "\u2705 " + name + " installed", "\u274c " + name + " installed");
+    if (is_core)
+        render_flag_line(value, "sing_box_version_ok", "\u2705 " + name + " version is compatible", "\u274c " + name + " version is not compatible");
+    else
+        render_flag_line(value, "sing_box_version_ok", "\u2705 Sing-box version is compatible (newer than 1.12.4)", "\u274c Sing-box version is not compatible (older than 1.12.4)");
 
-    if (flag_is_one(value.sing_box_extended))
+    if (is_core)
+        print_line("Tachyon Core detected");
+    else if (flag_is_one(value.sing_box_extended))
         print_line("Sing-box extended detected");
     else
         print_line("Sing-box regular build detected");
 
-    render_flag_line(value, "sing_box_service_exist", "\u2705 Sing-box service exist", "\u274c Sing-box service exist");
-    render_flag_line(value, "sing_box_autostart_disabled", "\u2705 Sing-box autostart disabled", "\u274c Sing-box autostart disabled");
-    render_flag_line(value, "sing_box_process_running", "\u2705 Sing-box process running", "\u274c Sing-box process running");
-    render_flag_line(value, "sing_box_ports_listening", "\u2705 Sing-box listening ports", "\u274c Sing-box listening ports");
+    render_flag_line(value, "sing_box_service_exist", "\u2705 " + name + " service exist", "\u274c " + name + " service exist");
+    render_flag_line(value, "sing_box_autostart_disabled", "\u2705 " + name + " autostart disabled", "\u274c " + name + " autostart disabled");
+    render_flag_line(value, "sing_box_process_running", "\u2705 " + name + " process running", "\u274c " + name + " process running");
+    render_flag_line(value, "sing_box_ports_listening", "\u2705 " + name + " listening ports", "\u274c " + name + " listening ports");
 }
 
 function render_global_system_info() {
@@ -1960,10 +1958,6 @@ else if (mode == "firewall-port-open")
     exit(firewall_port_open_for_proto(ARGV[1], ARGV[2]) ? 0 : 1);
 else if (mode == "firewall-required-protocols-open")
     exit(firewall_required_protocols_open(ARGV[1], ARGV[2]) ? 0 : 1);
-else if (mode == "server-required-inbound-proto")
-    server_required_inbound_proto(ARGV[1]);
-else if (mode == "server-runtime-type-for-protocol")
-    server_runtime_type_for_protocol(ARGV[1]);
 else if (mode == "server-listen-requires-firewall")
     exit(server_listen_requires_firewall(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
 else if (mode == "server-port-listening")

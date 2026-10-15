@@ -212,7 +212,7 @@ function domain_matches_regex(target_domain, pattern) {
 
 const KNOWN_COMMUNITY_DOMAINS = {
     telegram: [ "t.me", "telegram.org", "telegram.me", "telesco.pe", "tdesktop.com", "telegra.ph" ],
-    discord: [ "discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discordstatus.com", "watchanimeattheoffice.net" ],
+    discord: [ "discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discordstatus.com", "watchanimeattheoffice.net", "discord-attachments-uploads-prd.storage.googleapis.com" ],
     meta: [ "facebook.com", "instagram.com", "whatsapp.com", "fbcdn.net", "cdninstagram.com", "meta.com", "threads.net", "messenger.com" ],
     twitter: [ "twitter.com", "x.com", "twimg.com", "t.co", "x.co" ],
     youtube: [ "youtube.com", "googlevideo.com", "ytimg.com", "youtu.be", "ggpht.com" ],
@@ -222,8 +222,9 @@ const KNOWN_COMMUNITY_DOMAINS = {
 
 const KNOWN_COMMUNITY_SUBNETS = {
     telegram: [
-        "91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22",
-        "91.108.20.0/22", "91.108.56.0/22", "149.154.160.0/20", "185.76.151.0/24"
+        "5.28.192.0/18", "91.105.192.0/23", "91.108.4.0/22", "91.108.8.0/21",
+        "91.108.16.0/21", "91.108.56.0/22", "95.161.64.0/20", "149.154.160.0/20",
+        "185.76.151.0/24", "194.221.0.0/16"
     ],
     discord: [
         "162.158.0.0/15"

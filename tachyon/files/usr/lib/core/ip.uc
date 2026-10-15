@@ -281,8 +281,8 @@ function is_cloudflare_shared_cidr(value) {
 // Discord documents and where allocations above 50100 do occur.
 const DISCORD_VOICE_PORTS_NFT = "443, 5000-5020, 3478, 19294-19344, 50000-65535";
 const DISCORD_VOICE_PORT_RANGES = [ "443:443", "5000:5020", "3478:3478", "19294:19344", "50000:65535" ];
-const DISCORD_MEDIA_PORTS_NFT = "2053, 2083, 2087, 2096, 8443";
-const DISCORD_MEDIA_PORT_RANGES = [ "2053:2053", "2083:2083", "2087:2087", "2096:2096", "8443:8443" ];
+const DISCORD_MEDIA_PORTS_NFT = "443, 1080, 2053, 2083, 2087, 2096, 8443";
+const DISCORD_MEDIA_PORT_RANGES = [ "443:443", "1080:1080", "2053:2053", "2083:2083", "2087:2087", "2096:2096", "8443:8443" ];
 const DEFAULT_DISCORD_VOICE_SUBNETS = [ "104.16.0.0/12", "162.158.0.0/15", "172.64.0.0/13", "2606:4700::/32" ];
 // Discord's edge is spread across 162.159.128.0/20: discord.com answers on
 // .128, .135, .136, .137 and .138. The old /21 stopped at .135.255, so roughly
@@ -290,6 +290,30 @@ const DEFAULT_DISCORD_VOICE_SUBNETS = [ "104.16.0.0/12", "162.158.0.0/15", "172.
 // and bypassed it without zapret. The whole /20 is CLOUDFLARENET (RIPE), the
 // operator Discord already runs on, so widening sweeps in nothing unrelated.
 const DISCORD_DEDICATED_SUBNETS = [ "162.159.128.0/20" ];
+
+// Telegram Datacenter & Edge Subnets (AS44907, AS59930, AS62014, AS62041).
+// Desktop and mobile Telegram apps connect to hardcoded MTProto Datacenter IPs
+// directly without issuing DNS queries; these CIDRs ensure traffic is redirected
+// and routed to proxy/desync outbounds even when offline or before ruleset downloads.
+const DEFAULT_TELEGRAM_SUBNETS = [
+    "5.28.192.0/18",
+    "91.105.192.0/23",
+    "91.108.4.0/22",
+    "91.108.8.0/21",
+    "91.108.16.0/21",
+    "91.108.56.0/22",
+    "95.161.64.0/20",
+    "149.154.160.0/20",
+    "185.76.151.0/24",
+    "194.221.0.0/16"
+];
+
+const DEFAULT_TELEGRAM_SUBNETS6 = [
+    "2001:67c:4e8::/48",
+    "2001:b28:f23c::/47",
+    "2001:b28:f23f::/48",
+    "2a0a:f280::/32"
+];
 
 return {
     valid_ipv4,
@@ -313,6 +337,8 @@ return {
     DISCORD_MEDIA_PORTS_NFT,
     DISCORD_MEDIA_PORT_RANGES,
     DEFAULT_DISCORD_VOICE_SUBNETS,
-    DISCORD_DEDICATED_SUBNETS
+    DISCORD_DEDICATED_SUBNETS,
+    DEFAULT_TELEGRAM_SUBNETS,
+    DEFAULT_TELEGRAM_SUBNETS6
 };
 

@@ -124,6 +124,23 @@ export const styles = `
     box-sizing: border-box;
 }
 
+/* The runtime quarantined this section: sing-box refused the config it
+   produced, so the section is not loaded while everything else runs. */
+.tachyon_dashboard-page__outbound-section--error {
+    border-color: var(--error-color-medium, red);
+}
+
+.tachyon_dashboard-page__outbound-section__config-error-badge {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--error-color-medium, red);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: help;
+}
+
 .tachyon_dashboard-page__outbound-section__title-section {
     display: flex;
     align-items: center;
@@ -490,6 +507,68 @@ export const styles = `
     max-width: 100%;
     overflow-wrap: anywhere;
     word-break: break-word;
+}
+
+.tachyon_proto-popover-trigger {
+    position: relative;
+    cursor: help;
+}
+
+.tachyon_proto-popover {
+    display: none;
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    z-index: 10050;
+    min-width: 220px;
+    max-width: 310px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(20, 24, 33, 0.97);
+    color: #f1f5f9;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    font-size: 11.5px;
+    line-height: 1.4;
+    text-align: left;
+    pointer-events: none;
+    white-space: normal;
+}
+
+.tachyon_proto-popover-trigger:hover .tachyon_proto-popover {
+    display: block;
+}
+
+.tachyon_proto-popover__header {
+    font-weight: 700;
+    font-size: 12px;
+    color: #60a5fa;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+    padding-bottom: 4px;
+    margin-bottom: 5px;
+    word-break: break-word;
+}
+
+.tachyon_proto-popover__row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    padding: 1.5px 0;
+}
+
+.tachyon_proto-popover__label {
+    color: #94a3b8;
+    font-weight: 500;
+    flex: 0 0 auto;
+}
+
+.tachyon_proto-popover__val {
+    color: #f8fafc;
+    font-family: monospace;
+    font-weight: 600;
+    text-align: right;
+    word-break: break-all;
 }
 
 .tachyon_dashboard-page .btn.tachyon_dashboard-page__outbound-grid__item__copy-button {

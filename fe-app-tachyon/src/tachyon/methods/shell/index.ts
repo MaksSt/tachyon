@@ -388,10 +388,14 @@ export const TachyonShellMethods = {
     callBaseMethod<unknown>(Tachyon.AvailableMethods.GLOBAL_CHECK, [
       masked ? 'masked' : 'raw',
     ]),
-  doctor: async () =>
-    callBaseMethod<string>(Tachyon.AvailableMethods.DOCTOR, [], {
-      timeout: 30000,
-    }),
+  doctor: async (fix = false) =>
+    callBaseMethod<string>(
+      Tachyon.AvailableMethods.DOCTOR,
+      fix ? ['--fix'] : [],
+      {
+        timeout: 60000,
+      },
+    ),
   aiDoctor: async () =>
     callBaseMethod<unknown>(Tachyon.AvailableMethods.AI_DOCTOR, [], {
       timeout: 60000,
@@ -719,15 +723,20 @@ export const TachyonShellMethods = {
     ),
   componentListReleases: async (
     component: Tachyon.ComponentName,
-    count = 3,
+    count = 5,
+    page = 1,
   ) => {
+    const args = [
+      Tachyon.AvailableMethods.COMPONENT_LIST_RELEASES,
+      component,
+      String(count),
+    ];
+    if (page > 1) {
+      args.push(String(page));
+    }
     const response = await executeShellCommand({
       command: '/usr/bin/tachyon',
-      args: [
-        Tachyon.AvailableMethods.COMPONENT_LIST_RELEASES,
-        component,
-        String(count),
-      ],
+      args,
       timeout: 25_000,
     });
     const parsed = parseJsonArrayOutput<Tachyon.ComponentRelease>(

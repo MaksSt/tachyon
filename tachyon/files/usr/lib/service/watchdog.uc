@@ -9,6 +9,10 @@ let events = require("core.events");
 let event_controller = require("service.event_controller");
 let smart_detect = require("service.smart_detect");
 let smart_plus = require("service.smart_detect_plus");
+let smart_probe = require("service.smart_detect_probe");
+let smart_plus_job = null;
+let smart_plus_seen = null;
+let watchdog_shutting_down = false;
 
 let reconciler = null;
 try {
@@ -187,12 +191,59 @@ function process_running(pid, expected_name) {
     return fs.stat("/proc/" + pid) != null;
 }
 
-function stop_runtime() {
+// The legacy listener is a shell + tail + read-loop pipeline. Its recorded PID
+// is only the outer shell; a worker crash leaves the other stages orphaned.
+// Match only this FIFO's exact stages, and recheck PID identity before signals.
+function stop_honeypot_listeners() {
+    let identity = require("core.process");
+    let candidates = [];
+    let directory = fs.opendir("/proc");
+    if (!directory) return 0;
+    let entry;
+    while ((entry = directory.read()) != null) {
+        if (match(entry, /^[0-9]+$/) == null) continue;
+        let raw = fs.readfile("/proc/" + entry + "/cmdline");
+        if (!raw) continue;
+        let args = split(raw, "\x00");
+        let is_tail = args[0] == "tail" && args[1] == "-f" &&
+            args[2] == "/tmp/tachyon_honeypot.fifo" && args[3] == "";
+        let is_shell = (args[0] == "/bin/sh" || args[0] == "sh") && args[1] == "-c" &&
+            index(args[2] || "", "tail -f /tmp/tachyon_honeypot.fifo | while read ip; do ") >= 0 &&
+            index(args[2] || "", "nft add element inet ") >= 0 &&
+            index(args[2] || "", " tachyon_honeypot ") >= 0;
+        if (!is_tail && !is_shell) continue;
+        let start = identity.process_starttime(entry);
+        if (start != null) push(candidates, { pid: entry, start, raw });
+    }
+    directory.close();
+    function still_matches(item) {
+        return identity.process_starttime(item.pid) == item.start &&
+            fs.readfile("/proc/" + item.pid + "/cmdline") == item.raw;
+    }
+    let stopped = 0;
+    for (let item in candidates) {
+        if (still_matches(item) && command_success_from_args(["kill", "-TERM", item.pid])) stopped++;
+    }
+    // One bounded wait for all stages, rather than seconds per accumulated PID.
+    for (let attempt = 0; attempt < 20; attempt++) {
+        let alive = false;
+        for (let item in candidates) if (still_matches(item)) { alive = true; break; }
+        if (!alive) break;
+        sleep(100);
+    }
+    for (let item in candidates) {
+        if (still_matches(item)) command_success_from_args(["kill", "-KILL", item.pid]);
+    }
+    remove_file("/var/run/tachyon_honeypot_listener.pid");
+    return stopped;
+}
+
+function stop_runtime(worker_exit) {
     // The supervisor first: while it lives it would respawn whatever we kill
     // below. It has no SIGTERM handler, so the wait only exists to give it a
     // chance to notice before the SIGKILL fallback.
     let sup_pid = trim(fs.readfile(SUPERVISOR_PID_FILE) || "");
-    if (process_running(sup_pid, "ucode")) {
+    if (!worker_exit && process_running(sup_pid, "ucode")) {
         command_success_from_args([ "kill", sup_pid ]);
         let sup_wait = 50; // 5 seconds
         while (sup_wait > 0 && process_running(sup_pid, "ucode")) {
@@ -203,10 +254,10 @@ function stop_runtime() {
             command_success_from_args([ "kill", "-9", sup_pid ]);
         }
     }
-    remove_file(SUPERVISOR_PID_FILE);
+    if (!worker_exit) remove_file(SUPERVISOR_PID_FILE);
 
     let pid = trim(fs.readfile(PID_FILE) || "");
-    if (process_running(pid, "ucode")) {
+    if (!worker_exit && process_running(pid, "ucode")) {
         command_success_from_args([ "kill", pid ]);
         let wait_limit = 50; // 5 seconds
         while (wait_limit > 0 && process_running(pid, "ucode")) {
@@ -218,26 +269,15 @@ function stop_runtime() {
         }
     }
     remove_file(PID_FILE);
+    smart_probe.cleanup();
+    smart_plus_job = null;
 
     // Kill orphaned logread -f processes. These accumulate when watchdog is
     // killed without proper cleanup (e.g. SIGTERM from procd during restart).
     // BusyBox lacks pkill, so we use pgrep + kill via common.kill_orphaned_logread().
     system(common.kill_orphaned_logread());
 
-    // Stop Honeypot listener
-    let hp_pid = trim(fs.readfile("/var/run/tachyon_honeypot_listener.pid") || "");
-    if (process_running(hp_pid)) {
-        command_success_from_args([ "kill", hp_pid ]);
-        let wait_limit = 20; // 2 seconds
-        while (wait_limit > 0 && process_running(hp_pid)) {
-            sleep(100);
-            wait_limit--;
-        }
-        if (process_running(hp_pid)) {
-            command_success_from_args([ "kill", "-9", hp_pid ]);
-        }
-    }
-    remove_file("/var/run/tachyon_honeypot_listener.pid");
+    stop_honeypot_listeners();
     remove_file("/tmp/tachyon_honeypot.fifo");
     remove_file(PROXY_RESTART_LOCK);
 
@@ -326,12 +366,18 @@ function smart_detect_apply_plus_domains(entries) {
         return [];
     }
     // Settings may have changed while synchronous probes were running.
-    if (!smart_plus.capture_enabled(c.get_all(CONFIG_NAME, "settings"))) return [];
+    let cfg = c.get_all(CONFIG_NAME, "settings");
+    if (!smart_plus.capture_enabled(cfg)) return [];
+    let exclusions = require("service.smart_detect_exclusions");
+    if (!exclusions.state(cfg).ready) return [];
     let written = [];
     let added = [];
     let dirty = false;
     let per_section = {};
     for (let entry in entries) {
+        let domain = exclusions.target(entry.source_domain || entry.domain, cfg, entry.domain);
+        if (domain == null) continue;
+        entry = {...entry, domain};
         let sec = c.get_all(CONFIG_NAME, entry.section);
         if (!sec) continue;
         let values = per_section[entry.section] || smart_plus.domain_values(
@@ -385,7 +431,12 @@ function smart_detect_apply_domains(entries) {
     if (smart_plus.mode(settings()) == "plus") return smart_detect_apply_plus_domains(entries);
     let c = uci_core.cursor();
     if (!c || length(entries) == 0) return [];
+    c.unload(CONFIG_NAME);
     c.load(CONFIG_NAME);
+    if (length(c.changes(CONFIG_NAME) || {})) return [];
+    let cfg = c.get_all(CONFIG_NAME, "settings");
+    let exclusions = require("service.smart_detect_exclusions");
+    if (!exclusions.state(cfg).ready) return [];
 
     let written = [];
     let per_section = {};
@@ -393,6 +444,7 @@ function smart_detect_apply_domains(entries) {
         let sec_name = trim(as_string(entry.section));
         let domain = trim(as_string(entry.domain));
         if (sec_name == "" || domain == "") continue;
+        if (exclusions.excluded(domain, cfg)) continue;
         let sec = c.get_all(CONFIG_NAME, sec_name);
         if (!sec) continue;
         let existing = sec.user_domains;
@@ -1394,7 +1446,7 @@ function heal_community_subnet_sets(ev) {
     ai_heal_subnet_cache();
     let rec_res = execute_reconciler_subsystem("nftables", false);
     if (rec_res == null || !rec_res.ok)
-        bg_system("/usr/bin/tachyon reload_firewall");
+        log_message("Community subnet repopulation could not complete — preserving existing firewall rules", "warn");
 
     // Re-read the sets and say what actually happened.
     //
@@ -2107,20 +2159,38 @@ function smart_detect_direct_curl_argv() {
     }
 }
 
+let cached_observe_dns = null;
+let cached_observe_dns_mtime = 0;
+let cached_observe_dns_path = "";
 function smart_detect_observe_dns() {
     let ctx = controller.create_tick_context();
     let cfg_path = as_string(ctx.settings.config_path || "/etc/sing-box/config.json");
-    let runtime = common.read_json_file(cfg_path);
     let engine = "sing-box";
     try { engine = require("core.engine").get_active(); } catch (e) {}
     let is_singbox = engine == "sing-box";
     let state_path = getenv("TACHYON_DNS_FAILOVER_STATE_FILE") ||
         (getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/dns-failover.json";
     let failover = common.read_json_file(state_path) || {};
-    let dns = is_singbox ? runtime?.dns : {
-        type: ctx.settings.dns_type, servers: ctx.settings.dns_server,
-        bootstrap: ctx.settings.bootstrap_dns_server, detour: ctx.settings.dns_detour
-    };
+    let dns = null;
+    if (is_singbox) {
+        let st = (fs && type(fs.stat) == "function") ? fs.stat(cfg_path) : null;
+        if (st && cached_observe_dns_path == cfg_path && cached_observe_dns_mtime == st.mtime) {
+            dns = cached_observe_dns;
+        } else {
+            let runtime = common.read_json_file(cfg_path);
+            dns = runtime?.dns;
+            if (st) {
+                cached_observe_dns = dns;
+                cached_observe_dns_mtime = st.mtime;
+                cached_observe_dns_path = cfg_path;
+            }
+        }
+    } else {
+        dns = {
+            type: ctx.settings.dns_type, servers: ctx.settings.dns_server,
+            bootstrap: ctx.settings.bootstrap_dns_server, detour: ctx.settings.dns_detour
+        };
+    }
     let signature = dns ? sprintf("%J", {
         engine, pid: is_singbox ? ctx.singbox_pid : null, dns,
         main_index: failover.main_index, bootstrap_index: failover.bootstrap_index
@@ -2144,17 +2214,79 @@ function smart_detect_defer(domain, queued, seen, dns_error) {
 }
 
 // Plus uses a separate queue/seen file so Default keeps its upstream cooldown.
-function smart_detect_process_plus(cfg) {
+let smart_plus_last_prune = 0;
+function smart_detect_plus_seen() {
+    let path = (getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/smart_detect_plus_seen.json";
+    if (smart_plus_seen == null) {
+        smart_plus_seen = common.read_json_file(path) || common.read_json_file("/etc/tachyon/smart_detect_plus_seen.json") || {};
+        if (type(smart_plus_seen) != "object") smart_plus_seen = {};
+    }
     let now = time();
-    if (now - smart_plus_last_run < 10) return;
+    if (now - smart_plus_last_prune >= 30) {
+        smart_plus_last_prune = now;
+        for (let domain in keys(smart_plus_seen))
+            if (smart_plus_seen[domain] < now - 300) delete smart_plus_seen[domain];
+    }
+    return smart_plus_seen;
+}
+function smart_detect_plus_save_seen() {
+    let path = (getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon") + "/smart_detect_plus_seen.json";
+    if (common.write_json_file(path, smart_plus_seen)) fs.chmod(path, 0600);
+}
+
+function smart_detect_is_domain_excluded(domain, cfg) {
+    return require("service.smart_detect_exclusions").excluded(domain, cfg);
+}
+
+let smart_detect_exclusion_warning = null;
+function smart_detect_exclusions_ready(cfg) {
+    let state = require("service.smart_detect_exclusions").state(cfg);
+    let missing = join(", ", state.missing);
+    if (!state.ready && missing != smart_detect_exclusion_warning)
+        log_message("Smart Detect: waiting for exclusion presets: " + missing + "; update lists to populate the cache", "warn");
+    smart_detect_exclusion_warning = state.ready ? null : missing;
+    return state.ready;
+}
+
+function smart_detect_process_plus(cfg) {
+    if (!smart_detect_exclusions_ready(cfg)) return;
+    let now = time();
     let before_dns = smart_detect_observe_dns();
-    if (!before_dns.ready) return;
-    let path = "/etc/tachyon/smart_detect_plus_seen.json";
-    let seen = common.read_json_file(path) || {};
-    for (let domain in keys(seen))
-        if (seen[domain] < now - 300) delete seen[domain];
+    let seen = smart_detect_plus_seen();
+    if (smart_plus_job != null) {
+        let job = smart_plus_job;
+        if (!before_dns.ready || before_dns.signature != job.signature) job.invalid = true;
+        let decision = smart_probe.poll(job.task);
+        if (decision == null) return;
+        smart_probe.stop(job.task);
+        smart_plus_job = null;
+        // A transient DNS change during the probe must also invalidate its result.
+        if (job.invalid || cfg.smart_detect != "1" || smart_plus.mode(cfg) != "plus" ||
+            job.selection != sprintf("%J", cfg.smart_detect_sections || []) ||
+            index(smart_detect_get_proxy_sections(), job.target) < 0) decision = {defer:true};
+        if (decision.act) {
+            let target_domain = require("service.smart_detect_exclusions").target(
+                job.domain, cfg, smart_plus.main_domain(job.domain));
+            if (target_domain == null || smart_detect_is_domain_excluded(job.domain, cfg) || smart_detect_is_domain_excluded(target_domain, cfg)) {
+                decision = {seen:true};
+            } else if (!length(smart_detect_apply_domains([{section:job.target, domain:target_domain, source_domain:job.domain}]))) {
+                decision = {defer:true};
+            }
+        }
+        if (decision.defer) {
+            job.item.queued = time();
+            smart_plus.queue_candidate(pending_smart_plus, {...job.item, domain:job.domain}, time(), PENDING_SMART_DOMAINS_MAX);
+            if (decision.dns_error) { smart_detect_dns_state.changed_at = time(); smart_detect_dns_state.ready = false; }
+        } else if (decision.seen) {
+            seen[job.domain] = time();
+            delete pending_smart_plus[job.domain];
+            smart_detect_plus_save_seen();
+        }
+        return;
+    }
+    if (now - smart_plus_last_run < 10 || !before_dns.ready) return;
     for (let domain in keys(pending_smart_plus)) {
-        if (pending_smart_plus[domain].queued < now - 300 || seen[domain])
+        if (pending_smart_plus[domain].queued < now - 300 || seen[domain] || smart_detect_is_domain_excluded(domain, cfg))
             delete pending_smart_plus[domain];
     }
     let domains = smart_plus.queue_order(pending_smart_plus, keys(pending_smart_plus));
@@ -2172,39 +2304,24 @@ function smart_detect_process_plus(cfg) {
     let domain = domains[0];
     let item = pending_smart_plus[domain];
     delete pending_smart_plus[domain];
-    let decision;
+    let task = null;
     try {
-        decision = smart_plus.probe(domain, item, "127.0.0.1:" + port,
-            smart_detect_direct_curl_argv(), smart_detect.probe_status);
+        task = smart_probe.start({domain, item, proxy_addr:"127.0.0.1:" + port,
+            direct_flags:smart_detect_direct_curl_argv()});
     } catch (e) {
         log_message("Smart Detect Plus: failed to probe " + domain + ": " + as_string(e), "err");
-        decision = { defer: true };
     }
-    // Re-observe after all synchronous curl calls, even when Direct recovered.
-    let after_dns = smart_detect_observe_dns();
-    if (!after_dns.ready || after_dns.signature != before_dns.signature)
-        decision = { defer: true };
-    if (decision.act) {
-        let main = smart_plus.main_domain(domain);
-        if (main == null) decision = { seen: true };
-        else if (!length(smart_detect_apply_domains([{ section: target, domain: main, source_domain: domain }])))
-            decision = { defer: true };
-    }
-    if (decision.defer) {
+    if (task == null) {
         item.queued = time();
-        pending_smart_plus[domain] = item;
-        if (decision.dns_error) {
-            smart_detect_dns_state.changed_at = time();
-            smart_detect_dns_state.ready = false;
-        }
-    } else if (decision.seen) seen[domain] = time();
-    fs.mkdir("/etc/tachyon");
-    fs.writefile(path, sprintf("%J", seen));
+        smart_plus.queue_candidate(pending_smart_plus, {...item,domain}, time(), PENDING_SMART_DOMAINS_MAX);
+    } else smart_plus_job = {task,domain,item,target,signature:before_dns.signature,
+        selection:sprintf("%J", cfg.smart_detect_sections || []),invalid:false};
 }
 
 function smart_detect_process_pending() {
     let cfg = settings();
     if (cfg.smart_detect != "1") {
+        if (smart_plus_job != null) { smart_probe.stop(smart_plus_job.task); smart_plus_job = null; }
         pending_smart_plus = {};
         pending_smart_domains = {};
         smart_detect_dns_state = {};
@@ -2294,6 +2411,8 @@ function smart_detect_process_pending() {
     let to_add = [];
 
     for (let domain in candidate_domains) {
+        if (!smart_detect_exclusions_ready(cfg)) return;
+        if (smart_detect_is_domain_excluded(domain, cfg)) continue;
         let item = queued_candidates[domain];
         try {
         // No nslookup pre-check: the direct probe already reports an
@@ -2468,21 +2587,7 @@ function setup_honeypot_listener() {
     system("mkfifo /tmp/tachyon_honeypot.fifo >/dev/null 2>&1");
     system("chmod 0660 /tmp/tachyon_honeypot.fifo >/dev/null 2>&1");
 
-    let hp_pid = trim(fs.readfile("/var/run/tachyon_honeypot_listener.pid") || "");
-    if (hp_pid != "" && match(hp_pid, /^[0-9]+$/) != null) {
-        if (process_running(hp_pid)) {
-            command_success_from_args([ "kill", hp_pid ]);
-            let wait_limit = 20;
-            while (wait_limit > 0 && process_running(hp_pid)) {
-                sleep(100);
-                wait_limit--;
-            }
-            if (process_running(hp_pid)) {
-                command_success_from_args([ "kill", "-9", hp_pid ]);
-            }
-        }
-    }
-    remove_file("/var/run/tachyon_honeypot_listener.pid");
+    stop_honeypot_listeners();
 
     let fifo_fd = fs.open("/tmp/tachyon_honeypot.fifo", "r+");
     if (uloop && fifo_fd) {
@@ -2787,6 +2892,7 @@ function worker() {
         cfg = current_ctx.settings;
         let mode = cfg.smart_detect == "1" ? smart_plus.mode(cfg) : "disabled";
         if (smart_mode_last != null && mode != smart_mode_last) {
+            if (smart_plus_job != null) { smart_probe.stop(smart_plus_job.task); smart_plus_job = null; }
             pending_smart_domains = {};
             pending_smart_plus = {};
             smart_detect_streaks = {};
@@ -2931,6 +3037,40 @@ function telegram_worker_restart() {
     command_status("/usr/bin/tachyon telegram_start >/dev/null 2>&1");
 }
 
+function on_disk_tachyon_version() {
+    let env_ver = getenv("TACHYON_VERSION");
+    if (env_ver != null && env_ver != "")
+        return env_ver;
+
+    for (let path in [
+        "/usr/lib/opkg/info/tachyon.control",
+        "/usr/lib/opkg/info/luci-app-tachyon.control"
+    ]) {
+        let content = fs.readfile(path);
+        if (content != null) {
+            let m = match(content, /Version:\s*([0-9]+\.[0-9]+\.[0-9]+)/);
+            if (m && m[1]) return m[1];
+        }
+    }
+
+    let apk_db = fs.readfile("/lib/apk/db/installed");
+    if (apk_db != null) {
+        let lines = split(as_string(apk_db), "\n");
+        let current_pkg = "";
+        for (let line in lines) {
+            let pm = match(line, /^P:(.+)$/);
+            if (pm && pm[1]) {
+                current_pkg = trim(pm[1]);
+            } else if ((current_pkg == "tachyon" || current_pkg == "luci-app-tachyon") && match(line, /^V:/)) {
+                let vm = match(line, /^V:([0-9]+\.[0-9]+\.[0-9]+)/);
+                if (vm && vm[1]) return vm[1];
+            }
+        }
+    }
+
+    return as_string(require("core.constants").TACHYON_VERSION || "");
+}
+
 function check_telegram_worker() {
     let tcfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
     if (as_string(tcfg.enabled || "0") != "1")
@@ -2958,14 +3098,14 @@ function check_telegram_worker() {
     let hb = split(heartbeat, " ");
     let age = time() - int(hb[0] || 0);
     if (age <= 300) {
-        let installed = as_string(require("core.constants").TACHYON_VERSION || "");
+        let installed = on_disk_tachyon_version();
         let running = length(hb) > 1 ? hb[1] : "";
         // An empty stamp means a worker from before this field existed; leave it
         // alone rather than restart it on every single tick.
         if (running == "" || running == installed)
             return;
 
-        log_message(sprintf("Telegram worker was started on %s but %s is installed; restarting it.", running, installed), "warn");
+        log_message(sprintf("Telegram worker was started on %s but %s is installed on disk; restarting it.", running, installed), "warn");
         command_status("/usr/bin/tachyon telegram_stop >/dev/null 2>&1");
         telegram_worker_last_restart = 0;
         telegram_worker_restart();
@@ -3034,6 +3174,16 @@ function reap_dead_jobs() {
         log_message(sprintf("Reaped %d stale job state file(s)", removed), "info");
 }
 
+function check_watchdog_outdated() {
+    let installed = on_disk_tachyon_version();
+    let my_version = as_string(require("core.constants").TACHYON_VERSION || "");
+    if (installed == "" || my_version == "" || installed == my_version)
+        return;
+
+    log_message(sprintf("Watchdog running version %s but %s is installed on disk; restarting tachyon service.", my_version, installed), "warn");
+    bg_system("/etc/init.d/tachyon restart >/dev/null 2>&1");
+}
+
 function perform_slow_checks() {
     controller.probe_slow(current_ctx);
     safe_call(ai_heal_dns_loop, "ai_heal_dns_loop");
@@ -3042,6 +3192,7 @@ function perform_slow_checks() {
     safe_call(check_tailscale_worker, "check_tailscale_worker");
     safe_call(check_section_failover, "check_section_failover");
     safe_call(reap_dead_jobs, "reap_dead_jobs");
+    safe_call(check_watchdog_outdated, "check_watchdog_outdated");
 }
 
 let last_keepalive_write = 0;
@@ -3087,8 +3238,8 @@ let last_keepalive_write = 0;
         uloop.timer(10000, tick);
 
         log_message("Watchdog running in event-driven uloop mode (fast: 15s, normal: adaptive, slow: 300s).", "info");
-        signal("SIGTERM", function(sig) { log_message("SIGTERM received, shutting down", "info"); stop_runtime(); exit(0); });
-        signal("SIGINT", function(sig) { log_message("SIGINT received, shutting down", "info"); stop_runtime(); exit(0); });
+        signal("SIGTERM", function(sig) { if (watchdog_shutting_down) return; watchdog_shutting_down = true; log_message("SIGTERM received, shutting down", "info"); stop_runtime(true); exit(0); });
+        signal("SIGINT", function(sig) { if (watchdog_shutting_down) return; watchdog_shutting_down = true; log_message("SIGINT received, shutting down", "info"); stop_runtime(true); exit(0); });
         uloop.run();
     } else {
         log_message("uloop not available. Running Watchdog in legacy fallback loop mode (fast: 15s, normal: adaptive, slow: 300s).", "warn");
@@ -3100,8 +3251,8 @@ let last_keepalive_write = 0;
         // read of the log stream, which is its own piece of work.
         log_message("uloop not available: log-driven detection is inactive " +
             "(Smart Detect, OOM detection, URLTest switch). Probe-based checks are unaffected.", "warn");
-        signal("SIGTERM", function(sig) { log_message("SIGTERM received, shutting down", "info"); stop_runtime(); exit(0); });
-        signal("SIGINT", function(sig) { log_message("SIGINT received, shutting down", "info"); stop_runtime(); exit(0); });
+        signal("SIGTERM", function(sig) { if (watchdog_shutting_down) return; watchdog_shutting_down = true; log_message("SIGTERM received, shutting down", "info"); stop_runtime(true); exit(0); });
+        signal("SIGINT", function(sig) { if (watchdog_shutting_down) return; watchdog_shutting_down = true; log_message("SIGINT received, shutting down", "info"); stop_runtime(true); exit(0); });
         // The fallback loop must keep the same pacing as the uloop tick. It
         // used to run all three tiers every 15s, so the slow tier (mixed-proxy
         // port, section failover, tailscale, telegram) fired 20x too often and

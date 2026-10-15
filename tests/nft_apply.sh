@@ -241,6 +241,22 @@ assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tproxy\tmeta\tma
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tmeta\tmark\t0x00200000\tcounter\treturn' "runtime outbound return"
 assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle_output\tjump\tpriority_output_rules' "runtime priority output jump"
 assert_contains "$NFT_LOG" $'nft\tinsert\trule\tinet\tTachyonTable\tmangle\tudp\tdport\t123\treturn' "runtime ntp exclusion"
+assert_contains "$NFT_LOG" $'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t!=\t@tachyon_interfaces\treturn' "runtime non-client early return"
+assert_line_before "$NFT_LOG" \
+  $'nft\tadd\trule\tinet\tTachyonTable\tmangle\tjump\tparental_control' \
+  $'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t!=\t@tachyon_interfaces\treturn' \
+  "runtime non-client early return runs after parental control"
+assert_line_before "$NFT_LOG" \
+  $'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t!=\t@tachyon_interfaces\treturn' \
+  $'nft\tadd\trule\tinet\tTachyonTable\tmangle\tjump\tpriority_rules' \
+  "runtime non-client early return runs before client-only classification"
+
+: > "$NFT_LOG"
+nft_ucode nft-create-runtime-base TachyonTable localv4 tachyon_subnets tachyon_ports tachyon_ip_ports tachyon_interfaces "" 0x00100000 0x00200000 198.18.0.0/15 1602 0 "" "" "" "" "" 0
+if grep -Fq $'mangle\tiifname\t!=' "$NFT_LOG"; then
+  fail "non-client early return must be absent when no client interface is configured"
+fi
+: > "$NFT_LOG"
 
 cat >"$WORK_DIR/runtime-base-uci.state" <<'EOF_UCI'
 tachyon.settings=settings
@@ -574,6 +590,25 @@ assert_contains "$NFT_LOG" $'198.51.100.220 . 53,198.51.100.220 . 5353,198.51.10
 if grep -Fq '198.51.100.221' "$NFT_LOG" || grep -Fq '198.51.100.222' "$NFT_LOG"; then
   fail "json ruleset section ports should intersect rule-owned port filters"
 fi
+
+# Flat UDP-only rulesets must use the UDP priority sets for both families.
+# A same-port TCP packet must not be caught by the imported UDP rule.
+for proto in udp tcp; do
+  printf '{"version":3,"rules":[{"network":"%s","ip_cidr":["192.0.2.0/24","2001:db8::/32"],"port":[50008]}]}\n' "$proto" > "$json_ruleset"
+  : > "$NFT_LOG"
+  nft_ucode nft-add-json-ruleset-subnets-for-section-fixture "$WORK_DIR/populate-fixture.json" inline_no_ports "$json_ruleset" "protocol fixture" TachyonTable unused unused "$unscoped_json" "$scoped_json" 5000
+  prefix=tachyon_rule_inline_no_ports
+  if [ "$proto" = udp ]; then prefix="${prefix}_udp"; fi
+  assert_contains "$NFT_LOG" "$prefix"$'_ip_ports\t{ 192.0.2.0/24 . 50008 }' "$proto IPv4 port import"
+  assert_contains "$NFT_LOG" "$prefix"$'_ip6_ports\t{ 2001:db8::/32 . 50008 }' "$proto IPv6 port import"
+  if [ "$proto" = udp ]; then
+    if grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_ip_ports\t{' "$NFT_LOG" || grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_ip6_ports\t{' "$NFT_LOG"; then
+      fail "UDP ruleset populated TCP priority sets"
+    fi
+  elif grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_udp_ip_ports\t{' "$NFT_LOG" || grep -Fq $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_rule_inline_no_ports_udp_ip6_ports\t{' "$NFT_LOG"; then
+    fail "TCP ruleset populated UDP priority sets"
+  fi
+done
 
 : > "$NFT_LOG"
 nft_ucode nft-add-community-subnet-file-for-section-fixture "$WORK_DIR/populate-fixture.json" inline_no_ports discord "$plain_subnets" TachyonTable tachyon_subnets tachyon_ip_ports tachyon_interfaces tachyon_discord_subnets 0x00100000 5000

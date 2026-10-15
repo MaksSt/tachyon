@@ -454,11 +454,17 @@ function strip_revision_suffix(value) {
     return matched ? matched[1] : as_string(value);
 }
 
+function strip_tachyon_suffix(value) {
+    let matched = match(as_string(value), /^(.*)-tachyon\.[0-9]+$/);
+    return matched ? matched[1] : as_string(value);
+}
+
 function updates_normalize_sing_box_version(value) {
     value = as_string(value);
-    if (str_startswith(value, "v"))
+    if (str_startswith(value, "v") || str_startswith(value, "V"))
         value = substr(value, 1);
 
+    value = strip_tachyon_suffix(value);
     print(first_version_token(strip_plus_metadata(value)), "\n");
 }
 
@@ -557,6 +563,27 @@ function updates_archive_member_path(member_name) {
     for (let line in split(read_stdin(), "\n")) {
         let path = trim(as_string(line));
         if (path != "" && common.path_basename(path) == member_name) {
+            print(path, "\n");
+            return;
+        }
+    }
+}
+
+function updates_archive_member_prefix(prefix) {
+    prefix = as_string(prefix);
+
+    for (let line in split(read_stdin(), "\n")) {
+        let path = trim(as_string(line));
+        if (path == "")
+            continue;
+        let name = common.path_basename(path);
+        // The archive holds the binary and its .sha256 sidecar, and only the
+        // first is ours. Matching on ".sha256" rather than "any dot" is
+        // deliberate: the version is part of the name, so "tachyon-core-aarch64-0.0.1"
+        // carries two dots and a blanket dot test would discard the binary itself.
+        if (name == "" || str_endswith(name, ".sha256") || str_endswith(name, ".sig") || str_endswith(name, ".txt"))
+            continue;
+        if (str_startswith(name, prefix)) {
             print(path, "\n");
             return;
         }
@@ -749,6 +776,38 @@ function sing_box_extended_arch_suffix(host_arch, distrib_arch) {
         print("riscv64\n");
     else if (host_arch == "s390x")
         print("s390x\n");
+    else
+        exit(1);
+}
+
+// tachyon-core names its assets after the Rust target triple, not after Go's
+// GOARCH: the release ships aarch64-musl where sing-box-extended ships arm64,
+// and x86_64-musl where that one ships amd64. Reusing the sing-box suffix
+// resolves to nothing and the install fails with "no asset".
+//
+// OpenWrt is musl throughout, so only the musl names are ever produced - taking
+// the gnu build onto a musl router would not link.
+function tachyon_core_arch_suffix(host_arch, distrib_arch) {
+    host_arch = as_string(host_arch);
+    distrib_arch = as_string(distrib_arch);
+
+    if (str_contains(distrib_arch, "mipsel") || str_contains(distrib_arch, "mipsle"))
+        host_arch = "mipsel";
+    else if (str_contains(distrib_arch, "mips64el") || str_contains(distrib_arch, "mips64le"))
+        host_arch = "mips64el";
+
+    if (host_arch == "aarch64")
+        print("aarch64-musl\n");
+    else if (str_startswith(host_arch, "armv7"))
+        print("armv7-musl\n");
+    else if (str_startswith(host_arch, "armv6"))
+        print("armv6-musl\n");
+    else if (host_arch == "x86_64")
+        print("x86_64-musl\n");
+    else if (host_arch == "mips")
+        print("mips-musl\n");
+    else if (host_arch == "mipsel" || host_arch == "mipsle")
+        print("mipsel-musl\n");
     else
         exit(1);
 }
@@ -1191,6 +1250,54 @@ function sing_box_extended_release_tag() {
     print(highest_release_tag(candidates), "\n");
 }
 
+// Tachyon's own core, packaged from github.com/Dushnilin/tachyon-core.
+//
+// The assets are named `tachyon-core-<arch>-<version>.tar.gz` with the binary
+// inside, so the arch is in the middle of the name rather than at the end the way
+// sing-box-lx spells it. That is why this cannot reuse the suffix matcher: an
+// arch-specific prefix is what has to be matched here.
+const TACHYON_CORE_RELEASE_REPO = "Dushnilin/tachyon-core";
+
+function tachyon_core_release_tag() {
+    let candidates = [];
+    for (let release in releases_array_or_wrapped(read_stdin_json())) {
+        if (type(release) != "object")
+            continue;
+        if (release.draft === true || release.prerelease === true)
+            continue;
+        let tag = as_string(release.tag_name || "");
+        let lowered = lc(tag);
+        // A core release carries no fork marker, so nothing else has to be
+        // excluded the way lx excludes alpha/beta/rc.
+        if (tag != "" && !str_contains(lowered, "alpha") && !str_contains(lowered, "beta") && !str_contains(lowered, "rc"))
+            push(candidates, tag);
+    }
+    print(highest_release_tag(candidates), "\n");
+}
+
+function tachyon_core_asset_url(arch_suffix) {
+    let release = object_or_empty(read_stdin_json());
+
+    arch_suffix = as_string(arch_suffix);
+    if (arch_suffix == "")
+        exit(1);
+
+    let prefix = "tachyon-core-" + arch_suffix + "-";
+    let alt_prefix = "tachyon-core-" + replace(arch_suffix, "-musl", "") + "-";
+
+    for (let asset in array_or_empty(release.assets)) {
+        if (type(asset) != "object")
+            continue;
+        let name = as_string(asset.name || "");
+        if ((str_startswith(name, prefix) || str_startswith(name, alt_prefix)) && str_endswith(name, ".tar.gz")) {
+            print(as_string(asset.browser_download_url || ""), "\n");
+            return;
+        }
+    }
+
+    exit(1);
+}
+
 function sing_box_lx_release_tag() {
     let candidates = [];
     for (let release in releases_array_or_wrapped(read_stdin_json())) {
@@ -1551,6 +1658,8 @@ else if (mode == "updates-zip-inner-package-path")
     updates_zip_inner_package_path(ARGV[1], ARGV[2], ARGV[3]);
 else if (mode == "updates-archive-member-path")
     updates_archive_member_path(ARGV[1]);
+else if (mode == "updates-archive-member-prefix")
+    updates_archive_member_prefix(ARGV[1]);
 else if (mode == "updates-opkg-arch-list")
     updates_opkg_arch_list();
 else if (mode == "updates-arch-candidates")
@@ -1561,10 +1670,16 @@ else if (mode == "file-whitespace-list")
     file_whitespace_list(ARGV[1]);
 else if (mode == "sing-box-extended-arch-suffix")
     sing_box_extended_arch_suffix(ARGV[1], ARGV[2]);
+else if (mode == "tachyon-core-arch-suffix")
+    tachyon_core_arch_suffix(ARGV[1], ARGV[2]);
 else if (mode == "sing-box-extended-asset-url")
     sing_box_extended_asset_url(ARGV[1], ARGV[2], ARGV[3]);
 else if (mode == "sing-box-lx-asset-url")
     sing_box_lx_asset_url(ARGV[1]);
+else if (mode == "tachyon-core-asset-url")
+    tachyon_core_asset_url(ARGV[1]);
+else if (mode == "tachyon-core-release-tag")
+    tachyon_core_release_tag();
 else if (mode == "sing-box-extended-package-asset-url")
     sing_box_extended_package_asset_url(ARGV[1], ARGV[2]);
 else if (mode == "updates-opkg-package-installed")

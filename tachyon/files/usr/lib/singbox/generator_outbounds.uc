@@ -6,9 +6,14 @@ let runtime_constants = require("singbox.constants");
 let runtime_subscription = require("singbox.subscription");
 let runtime_country = require("singbox.country");
 let runtime_dns = require("singbox.dns");
+let core_profile = require("singbox.core_profile");
 let runtime_url = require("core.url");
 let subscription_share_link = require("subscription.share_link");
 let connections = require("config.connections");
+let subscription_wireguard = require("subscription.wireguard");
+let subscription_amnezia = require("subscription.amnezia_config");
+let exec = require("core.exec");
+let core_ip = require("core.ip");
 
 let as_string = common.as_string;
 let option = common.option;
@@ -164,6 +169,12 @@ function supported_subscription_outbound(outbound) {
     if (type(outbound) != "object")
         return false;
     let t = as_string(outbound.type);
+    if (t == "wireguard") {
+        let peer = array_or_empty(outbound.peers)[0];
+        return type(peer) == "object" && !is_dummy_outbound_server(peer.address, peer.port) &&
+            as_string(outbound.private_key) != "" && as_string(peer.public_key) != "" &&
+            length(array_or_empty(outbound.address)) > 0;
+    }
     if (subscription_group_outbound(outbound))
         return true;
     if (t == "direct" || t == "selector" || t == "urltest" || t == "dns" || t == "block")
@@ -469,6 +480,26 @@ function tls_alpn_array(value, transport) {
     return value == "" ? [] : split(value, ",");
 }
 
+// Which TLS field this build accepts for a pin. The answer comes from the
+// capability model in singbox/runtime.uc rather than from a second copy of the
+// rules: two copies of "which field does this core take" is exactly how the
+// generator and the validator ended up disagreeing about the same binary, and a
+// disagreement here is silent - the pin is simply dropped from the config.
+//
+// SB_VERSION_OVERRIDE still wins, because the whole point of it is to generate a
+// config for a build that is not the one installed.
+function certificate_pin_field() {
+    let override = trim(as_string(getenv("SB_VERSION_OVERRIDE") || ""));
+    let version = override != ""
+        ? override
+        : trim(as_string(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version") || ""));
+    let variant = trim(as_string(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant") || ""));
+
+    // With no state file to go on, let the model look at the installed binary
+    // rather than guessing from an empty version.
+    return core_profile.pin_field(version, variant);
+}
+
 function apply_link_tls(outbound, scheme, query) {
     query = object_or_empty(query);
     let security = as_string(query.security || "");
@@ -488,8 +519,13 @@ function apply_link_tls(outbound, scheme, query) {
     if (bool_query(query.allowInsecure || query.insecure || ""))
         tls.insecure = true;
     let certificate_pin = common.certificate_pin_base64(as_string(query.pcs || ""));
-    if (certificate_pin != "")
-        tls.certificate_sha256 = [ certificate_pin ];
+    if (certificate_pin != "") {
+        let pin_field = certificate_pin_field();
+        if (pin_field != "")
+            tls[pin_field] = [ certificate_pin ];
+        else
+            warn("this sing-box build has no usable TLS pin field; certificate pin from the link ignored\n");
+    }
 
     let alpn = tls_alpn_array(query.alpn, query.type);
     if (length(alpn) > 0)
@@ -507,6 +543,15 @@ function apply_link_tls(outbound, scheme, query) {
             public_key: as_string(query.pbk || ""),
             short_id: as_string(query.sid || "")
         };
+        // Only carry the flag when the link actually asks for it. Injecting it
+        // unconditionally broke two things: sing-box-lx and stock sing-box reject
+        // the field outright, and a server doing plain X25519 cannot complete a
+        // handshake that demands the hybrid exchange.
+        let mlkem_preference = query.support_x25519mlkem768;
+        if (mlkem_preference == null)
+            mlkem_preference = query.supportX25519MLKEM768;
+        if (mlkem_preference != null)
+            tls.reality.support_x25519mlkem768 = bool_query(mlkem_preference);
     }
     outbound.tls = tls;
 }
@@ -909,8 +954,183 @@ function manual_tuic_outbound(link, tag_name) {
     return outbound;
 }
 
-function manual_link_outbound(link, tag_name) {
+function ensure_imported_vpn_lx() {
+    let variant = trim(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant") || "");
+    let version = trim(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version") || "");
+    if (variant != "lx" && variant != "tachyon-core" && index(version, "-lx") < 0 && index(version, "-tachyon.") < 0)
+        ctx.runtime_generate_unsupported("vpn:// import is available only with sing-box-lx or tachyon-core");
+}
+
+// An fptn outbound exists only in tachyon-core's protocol list: on every other
+// core the emitted config would be rejected outright, so refuse with a clear
+// error instead of shipping a broken config. fptn_transport_mode() is the one
+// resolver that already knows the answer — native exists on tachyon-core only.
+function ensure_fptn_outbound_supported() {
+    if (connections && connections.fptn_transport_mode() != "native")
+        ctx.runtime_generate_unsupported("fptn:// links require tachyon-core; this core cannot dial FPTN");
+}
+
+function add_imported_wireguard_endpoint(config, endpoint) {
+    ensure_imported_vpn_lx();
+    if (type(endpoint) == "object") {
+        if (endpoint.address != null)
+            endpoint.address = core_ip.normalize_to_cidrs(endpoint.address);
+        if (type(endpoint.peers) == "array") {
+            for (let peer in endpoint.peers) {
+                if (type(peer) == "object" && peer.allowed_ips != null)
+                    peer.allowed_ips = core_ip.normalize_to_cidrs(peer.allowed_ips);
+            }
+        }
+    }
+    push(config.endpoints, endpoint);
+}
+
+// Validate a decoded payload exactly the way core fptn::parse_token does —
+// same field errors, same ranges — so the backend and the core's own token
+// expansion can never disagree about which token is usable. Returns the
+// normalized payload or null.
+function fptn_token_payload(payload) {
+    if (type(payload) != "object")
+        return null;
+    // ucode numbers are "int"/"double", there is no "number" type — and both
+    // fields are integers in fptn::parse_token too.
+    if (payload.version != null && type(payload.version) != "int")
+        return null;
+    if (payload.service_name != null && type(payload.service_name) != "string")
+        return null;
+    if (type(payload.username) != "string" || payload.username == "")
+        return null;
+    if (type(payload.password) != "string" || payload.password == "")
+        return null;
+    if (type(payload.servers) != "array" || length(payload.servers) == 0)
+        return null;
+
+    let servers = [];
+    let seen = {};
+    for (let entry in payload.servers) {
+        if (type(entry) != "object")
+            return null;
+        if (type(entry.name) != "string" || entry.name == "")
+            return null;
+        if (seen[entry.name])
+            return null;
+        if (type(entry.host) != "string" || entry.host == "")
+            return null;
+        if (type(entry.port) != "int" || entry.port < 1 || entry.port > 65535)
+            return null;
+        let fingerprint = "";
+        if (entry.md5_fingerprint != null) {
+            if (type(entry.md5_fingerprint) != "string")
+                return null;
+            fingerprint = entry.md5_fingerprint;
+            if (fingerprint != "" && !match(fingerprint, /^[0-9a-fA-F]{32}$/))
+                return null;
+        }
+        seen[entry.name] = true;
+        push(servers, {
+            name: entry.name,
+            host: entry.host,
+            port: int(entry.port),
+            md5_fingerprint: fingerprint
+        });
+    }
+
+    return {
+        service_name: as_string(payload.service_name || ""),
+        username: payload.username,
+        password: payload.password,
+        servers
+    };
+}
+
+// fptnb: is brotli, which ucode has not got — the core CLI decodes it for us
+// (`tachyon-core fptn decode <token>`). Returns null when the binary is
+// missing or refuses, and the caller falls back to the raw-token form.
+function fptn_token_decode_via_core(token) {
+    let binary = getenv("SB_PREFLIGHT_BINARY") || getenv("TACHYON_SING_BOX_BIN") || "/usr/bin/sing-box";
+    if (fs.stat(binary) == null)
+        return null;
+    let result = exec.run({ argv: [ binary, "fptn", "decode", token ], timeout: 15 });
+    if (result.status != 0)
+        return null;
+    try {
+        return json(result.output);
+    }
+    catch (e) {
+        return null;
+    }
+}
+
+// Decode an access token into its payload, or null for anything undecodable
+// (bad prefix, bad base64, invalid payload). fptn: is base64+JSON inline;
+// fptnb: goes through the core.
+function fptn_token_decode(token) {
+    token = trim(as_string(token));
+    let hash_idx = index(token, "#");
+    if (hash_idx >= 0)
+        token = substr(token, 0, hash_idx);
+
+    let body = null;
+    let compressed = false;
+    if (substr(token, 0, 8) == "fptnb://") {
+        body = substr(token, 8);
+        compressed = true;
+    } else if (substr(token, 0, 6) == "fptnb:") {
+        body = substr(token, 6);
+        if (substr(body, 0, 2) == "//")
+            body = substr(body, 2);
+        compressed = true;
+    } else if (substr(token, 0, 7) == "fptnb//") {
+        body = substr(token, 7);
+        compressed = true;
+    } else if (substr(token, 0, 7) == "fptn://") {
+        body = substr(token, 7);
+    } else if (substr(token, 0, 5) == "fptn:") {
+        body = substr(token, 5);
+        if (substr(body, 0, 2) == "//")
+            body = substr(body, 2);
+    } else {
+        return null;
+    }
+
+    let payload = null;
+    if (compressed) {
+        payload = fptn_token_decode_via_core("fptnb:" + body);
+    } else {
+        let raw = base64_decode_value(body);
+        if (raw == null)
+            return null;
+        try {
+            payload = json(raw);
+        }
+        catch (e) {
+            return null;
+        }
+    }
+    return fptn_token_payload(payload);
+}
+
+function manual_link_outbound(link, tag_name, display_info) {
     let scheme = url_scheme(link);
+    // Preserve the base64 payload; do not URL-decode the complete link first.
+    if (scheme == "vpn") {
+        ensure_imported_vpn_lx();
+        let endpoint = subscription_wireguard.from_vpn(link);
+        if (endpoint == null)
+            ctx.runtime_generate_unsupported("invalid vpn:// export: expected a valid WG/AWG .conf or Amnezia WG/AWG container");
+        if (type(display_info) == "object")
+            display_info.name = subscription_outbound_display_name(endpoint);
+        return copy_subscription_outbound(endpoint, tag_name);
+    }
+    if (scheme == "fptn" || scheme == "fptnb" || index(link, "fptn:") == 0 || index(link, "fptnb:") == 0) {
+        if (type(display_info) == "object")
+            display_info.name = tag_name;
+        return {
+            type: "fptn",
+            tag: tag_name,
+            token: link
+        };
+    }
     if (scheme == "vmess")
         return manual_vmess_outbound(link, tag_name);
 
@@ -933,18 +1153,73 @@ function manual_link_outbound(link, tag_name) {
     ctx.runtime_generate_unsupported("manual proxy link scheme is not supported by sing-box config generation yet");
 }
 
+// fptn:// is a share link whose scheme is not a standard URI scheme the
+// generic parser knows, so recognize it exactly the way manual_link_outbound
+// does — both the //-forms and the bare fptn:/fptnb: forms.
+function is_fptn_link(link) {
+    let scheme = url_scheme(link);
+    return scheme == "fptn" || scheme == "fptnb" ||
+        index(link, "fptn:") == 0 || index(link, "fptnb:") == 0;
+}
+
+// An fptn: link in a connection section is an access token carrying a whole
+// server list, not one server. Expand it here the same way the fptn action
+// does, so the dashboard lists the servers instead of one opaque card. Falls
+// back to false for anything undecodable, and the caller then keeps the raw
+// token for the core to expand itself.
+function add_fptn_manual_members(config, state, section_name, tag_name, link, taken, selector_tags, urltest_candidate_tags) {
+    if (!is_fptn_link(link))
+        return false;
+    ensure_fptn_outbound_supported();
+    let decoded = fptn_token_decode(link);
+    if (decoded == null)
+        return false;
+
+    for (let server in decoded.servers) {
+        let member_tag = tag_name + "/" + server.name;
+        if (taken[member_tag])
+            member_tag = unique_tag(member_tag, taken);
+        taken[member_tag] = true;
+
+        let member = {
+            type: "fptn",
+            tag: member_tag,
+            server: server.host,
+            server_port: server.port,
+            username: decoded.username,
+            password: decoded.password
+        };
+        if (server.md5_fingerprint != "")
+            member.md5_fingerprint = server.md5_fingerprint;
+
+        push(config.outbounds, member);
+        push(selector_tags, member_tag);
+        push(urltest_candidate_tags, member_tag);
+        state.links[member_tag] = as_string(link);
+        runtime_subscription.remember_outbound_metadata(state, member_tag, server.name, member);
+    }
+    return true;
+}
+
 function add_manual_proxy_link(config, state, section_name, manual_index, link, taken, selector_tags, urltest_candidate_tags) {
     let tag_name = outbound_tag(section_name + "-" + manual_index);
     if (taken[tag_name])
         tag_name = unique_tag(tag_name, taken);
     taken[tag_name] = true;
 
-    let outbound = manual_link_outbound(link, tag_name);
+    if (add_fptn_manual_members(config, state, section_name, tag_name, link, taken, selector_tags, urltest_candidate_tags))
+        return tag_name;
+
+    let display_info = {};
+    let outbound = manual_link_outbound(link, tag_name, display_info);
     let display_name = url_fragment(link);
     if (display_name == "")
-        display_name = tag_name;
+        display_name = as_string(display_info.name || tag_name);
     ensure_explicit_outbound_supported(outbound, "manual outbound", display_name);
-    push(config.outbounds, outbound);
+    if (outbound.type == "wireguard")
+        add_imported_wireguard_endpoint(config, outbound);
+    else
+        push(config.outbounds, outbound);
     push(selector_tags, tag_name);
     push(urltest_candidate_tags, tag_name);
 
@@ -1224,7 +1499,11 @@ function add_subscription_source_with_state(config, section, source_index, sourc
             continue;
         }
 
-        push(config.outbounds, outbound);
+        if (outbound.type == "wireguard") {
+            add_imported_wireguard_endpoint(config, outbound);
+        } else {
+            push(config.outbounds, outbound);
+        }
         added++;
         if (!is_group)
             push(urltest_candidate_tags, outbound.tag);
@@ -1249,22 +1528,25 @@ function add_subscription_source_with_state(config, section, source_index, sourc
 function add_connection_subscriptions(config, state, section, taken, selector_tags, urltest_candidate_tags) {
     let subscription_urls = connections.subscription_urls(section);
 
+    // Index 1-based on purpose: the source id is positional, so a disabled URL
+    // must keep its slot instead of the list being renumbered underneath it.
     for (let i = 0; i < length(subscription_urls); i++)
-        add_subscription_source_with_state(
-            config,
-            section,
-            i + 1,
-            subscription_urls[i],
-            taken,
-            selector_tags,
-            urltest_candidate_tags,
-            state,
-            connections.subscription_dashboard_metadata_enabled(section, subscription_urls[i]),
-            connections.subscription_include_urltest_groups(section, subscription_urls[i]),
-            connections.subscription_hide_urltest_group_outbounds(section, subscription_urls[i]),
-            connections.subscription_hide_detour_outbounds(section, subscription_urls[i]),
-            connections.subscription_node_prefix(section, subscription_urls[i])
-        );
+        if (connections.subscription_url_enabled(section, subscription_urls[i]))
+            add_subscription_source_with_state(
+                config,
+                section,
+                i + 1,
+                subscription_urls[i],
+                taken,
+                selector_tags,
+                urltest_candidate_tags,
+                state,
+                connections.subscription_dashboard_metadata_enabled(section, subscription_urls[i]),
+                connections.subscription_include_urltest_groups(section, subscription_urls[i]),
+                connections.subscription_hide_urltest_group_outbounds(section, subscription_urls[i]),
+                connections.subscription_hide_detour_outbounds(section, subscription_urls[i]),
+                connections.subscription_node_prefix(section, subscription_urls[i])
+            );
 }
 
 function add_interface_connection_outbound(config, state, section, interface_index, interface_name, taken, selector_tags, urltest_candidate_tags) {
@@ -1400,7 +1682,14 @@ function outbound_detour_tag_for_section(section) {
         return "";
 
     let detour_section = option(section, "outbound_detour_section", "");
-    return detour_section == "" ? "" : outbound_tag(detour_section);
+    if (detour_section == "")
+        return "";
+    // A deferred or quarantined detour target contributes no outbound at all;
+    // emitting its tag anyway would leave a dangling detour and take the whole
+    // config down at sing-box check time.
+    if (ctx.deferred_sections && ctx.deferred_sections[detour_section])
+        return "";
+    return outbound_tag(detour_section);
 }
 
 function apply_section_detour_to_connection_outbounds(config, start_index, detour_tag) {
@@ -1453,27 +1742,6 @@ function apply_section_packet_encoding_to_connection_outbounds(config, start_ind
     }
 }
 
-// Automatically inject `support_x25519mlkem768: true` into every outbound
-// whose tls.reality is enabled, when the installed sing-box-extended build
-// supports the field (>= 2.7.2). No UCI option needed: the Reality server
-// ignores the hint on old Xray, and new Xray (26.9.x+) requires it.
-function apply_x25519mlkem768_to_reality_outbounds(config, start_index, sb_version) {
-    if (!common.extended_supports_x25519mlkem768(sb_version))
-        return;
-
-    let outbounds = array_or_empty(config.outbounds);
-    for (let i = int(start_index || 0); i < length(outbounds); i++) {
-        let outbound = outbounds[i];
-        if (type(outbound) != "object")
-            continue;
-        if (type(outbound.tls) != "object")
-            continue;
-        if (type(outbound.tls.reality) != "object" || outbound.tls.reality.enabled === false)
-            continue;
-        outbound.tls.reality.support_x25519mlkem768 = true;
-    }
-}
-
 function add_connections_outbound(config, section, taken) {
     let section_name = section[".name"];
     let selector_tags = [];
@@ -1499,17 +1767,22 @@ function add_connections_outbound(config, section, taken) {
         connections.packet_encoding(section)
     );
 
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
-    apply_x25519mlkem768_to_reality_outbounds(
-        config,
-        cascade_start,
-        trim(fs.readfile(sb_version_file) || "")
-    );
-
     if (length(selector_tags) == 0) {
         if (ctx.deferred_sections && ctx.deferred_sections[section_name])
             return;
-        ctx.runtime_generate_unsupported("connection section has no usable outbounds");
+        if (getenv("SB_PREFLIGHT_BINARY")) {
+            let dummy_tag = unique_tag("preflight-dummy-" + section_name, taken);
+            taken[dummy_tag] = true;
+            push(config.outbounds, {
+                type: "direct",
+                tag: dummy_tag
+            });
+            push(selector_tags, dummy_tag);
+            push(urltest_candidate_tags, dummy_tag);
+            runtime_subscription.remember_outbound_metadata(state, dummy_tag, dummy_tag, { type: "direct", tag: dummy_tag });
+        } else {
+            ctx.runtime_generate_unsupported("connection section has no usable outbounds");
+        }
     }
 
     if (ctx.routes.section_needs_country_is(section)) {
@@ -1525,17 +1798,90 @@ function add_connections_outbound(config, section, taken) {
 
     state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
     ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
-    if (!ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
+    if (!getenv("SB_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
+        ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
+}
+
+// An AmneziaWG section carrying imported .conf files is shaped the way an FPTN
+// token is: one endpoint per config, an auto urltest group over them, and the
+// section selector on top — so several configs behave like several servers and
+// the urltest/priority children have something to group. A bare endpoint
+// cannot carry those children, and the Clash API rejects a non-selector as the
+// section tag on every dashboard group switch.
+function add_awg_config_members(config, section) {
+    let section_name = section[".name"];
+    let tag = outbound_tag(section_name);
+    let state = runtime_subscription.new_section_state(section_name);
+    let selector_tags = [];
+    let urltest_candidate_tags = [];
+    let taken = { };
+    taken[tag] = true;
+    let detour = outbound_detour_tag_for_section(section);
+
+    for (let value in connections.amnezia_configs(section)) {
+        let item = subscription_amnezia.parse(value);
+        if (item == null)
+            ctx.runtime_generate_unsupported("Invalid imported Amnezia configuration");
+        let endpoints = subscription_wireguard.from_vpn_endpoints(item.link);
+        if (endpoints == null)
+            ctx.runtime_generate_unsupported("invalid imported Amnezia configuration: " + as_string(item.name));
+        // Every peer of the .conf is its own member: a multi-peer file behaves
+        // like several configs, and each server joins the urltest pool.
+        for (let i = 0; i < length(endpoints); i++) {
+            let display_name = as_string(endpoints[i].tag || item.name);
+            let member_tag = unique_tag(tag + "/" + display_name, taken);
+            taken[member_tag] = true;
+            let member = copy_subscription_outbound(endpoints[i], member_tag);
+            if (detour != "")
+                member.detour = detour;
+            add_imported_wireguard_endpoint(config, member);
+            push(selector_tags, member_tag);
+            push(urltest_candidate_tags, member_tag);
+            runtime_subscription.remember_outbound_metadata(state, member_tag, display_name, member);
+        }
+    }
+
+    // The group the selector defaults to. Same shape as the FPTN expansion;
+    // a section urltest child called "urltest" owns this very tag, and then it
+    // is the group and nothing is emitted here.
+    let text_urltest_tag = "";
+    if (index(connections.urltests(section), "urltest") < 0) {
+        text_urltest_tag = ctx.routes.urltest_outbound_tag(section_name, "urltest");
+        let group_members = [];
+        for (let member_tag in selector_tags)
+            push(group_members, member_tag);
+        let auto_group = {
+            type: "urltest",
+            tag: text_urltest_tag,
+            outbounds: group_members
+        };
+        push(config.outbounds, auto_group);
+        let group_name = option(section, "label", "");
+        if (group_name == "") group_name = text_urltest_tag;
+        runtime_subscription.remember_outbound_metadata(state, text_urltest_tag, group_name, auto_group);
+        runtime_subscription.remember_urltest_group_config(state, text_urltest_tag, {
+            displayName: group_name,
+            outbounds: group_members
+        });
+    }
+
+    state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
+    ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
+    if (!getenv("SB_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
         ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
 }
 
 function add_awg_endpoint(config, section) {
+    if (length(connections.amnezia_configs(section)) > 0) {
+        add_awg_config_members(config, section);
+        return;
+    }
     let tag = outbound_tag(section[".name"]);
     let endpoint = {
         type: "wireguard",
         tag: tag,
         name: tag,
-        address: list_option(section, "awg_local_address"),
+        address: core_ip.normalize_to_cidrs(list_option(section, "awg_local_address")),
         private_key: option(section, "awg_private_key", ""),
         peers: [{
             address: option(section, "awg_server_address", ""),
@@ -1557,6 +1903,11 @@ function add_awg_endpoint(config, section) {
     let sb_version_val = trim(fs.readfile(sb_version_file) || "");
     let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
     let is_lx = sb_variant_val == "lx" || index(sb_version_val, "-lx") >= 0;
+    // tachyon-core reads the AmneziaWG params flat off the wireguard endpoint -
+    // the same layout sing-box-lx uses. Its KNOWN_ENDPOINT_FIELDS has no
+    // "amnezia" wrapper, so a config carrying one is rejected outright.
+    let is_core = ctx.is_tachyon_core != null ? ctx.is_tachyon_core(sb_version_val) : false;
+    let flat_awg = is_lx || is_core;
 
     let keepalive = int_or_range_option(section, "awg_keepalive", 25);
     if (is_lx) {
@@ -1603,10 +1954,10 @@ function add_awg_endpoint(config, section) {
     let j3 = awg_cps_option(section, "awg_j3");
     let itime = int_option(section, "awg_itime", "0");
 
-    if (is_lx) {
-        // sing-box-lx expects AWG fields at the endpoint root (AWG 2.0 schema).
-        // Magic headers accept a single value or an AWG 2.0 "min-max" range;
-        // junk-packet fields are plain integers.
+    if (flat_awg) {
+        // sing-box-lx and tachyon-core expect AWG fields at the endpoint root
+        // (AWG 2.0 schema). Magic headers accept a single value or an AWG 2.0
+        // "min-max" range; junk-packet fields are plain integers.
         endpoint.jc = amnezia.jc;
         endpoint.jmin = amnezia.jmin;
         endpoint.jmax = amnezia.jmax;
@@ -1662,7 +2013,7 @@ function add_awg_endpoint(config, section) {
     if (awg_ver == "3.0" || awg_ver == "3.1") {
         let hpk = option(section, "awg_header_protection_key", "");
         if (hpk != "") {
-            if (is_lx) {
+            if (flat_awg) {
                 if (endpoint.s1 < 12) endpoint.s1 = 20;
                 if (endpoint.s2 < 12) endpoint.s2 = 20;
                 if (endpoint.s3 < 12) endpoint.s3 = 20;
@@ -1679,7 +2030,7 @@ function add_awg_endpoint(config, section) {
 
         let cpa = option(section, "awg_content_padding_addition", "");
         if (cpa != "") {
-            if (is_lx) endpoint.content_padding_addition = cpa;
+            if (flat_awg) endpoint.content_padding_addition = cpa;
             else endpoint.amnezia.content_padding_addition = cpa;
         }
     }
@@ -1687,35 +2038,35 @@ function add_awg_endpoint(config, section) {
     if (awg_ver == "3.1") {
         let rka = option(section, "awg_rekey_after_time", "");
         if (rka != "") {
-            if (is_lx) endpoint.rekey_after_time = rka;
+            if (flat_awg) endpoint.rekey_after_time = rka;
             else endpoint.amnezia.rekey_after_time = rka;
         }
 
         let rkt = option(section, "awg_rekey_timeout", "");
         if (rkt != "") {
-            if (is_lx) endpoint.rekey_timeout = rkt;
+            if (flat_awg) endpoint.rekey_timeout = rkt;
             else endpoint.amnezia.rekey_timeout = rkt;
         }
 
         let rja = option(section, "awg_reject_after_time", "");
         if (rja != "") {
-            if (is_lx) endpoint.reject_after_time = rja;
+            if (flat_awg) endpoint.reject_after_time = rja;
             else endpoint.amnezia.reject_after_time = rja;
         }
 
         let kpt = option(section, "awg_keepalive_timeout", "");
         if (kpt != "") {
-            if (is_lx) endpoint.keepalive_timeout = kpt;
+            if (flat_awg) endpoint.keepalive_timeout = kpt;
             else endpoint.amnezia.keepalive_timeout = kpt;
         }
 
         let mha = option(section, "awg_max_handshake_attempts", "");
         if (mha != "") {
-            if (is_lx) endpoint.max_handshake_attempts = mha;
+            if (flat_awg) endpoint.max_handshake_attempts = mha;
             else endpoint.amnezia.max_handshake_attempts = mha;
         }
 
-        if (is_lx) {
+        if (flat_awg) {
             if (bool_option(section, "awg_random_trailers", false))
                 endpoint.random_trailers = true;
             if (bool_option(section, "awg_disable_cookies", false))
@@ -1753,6 +2104,26 @@ function add_warp_endpoint(config, section) {
     }
 
     let detour = option(section, "warp_detour", "");
+    // NB: was ctx.sing_box_tachyon_core, which nothing ever set - the branch was
+    // dead and tachyon-core got the sing-box-extended masque shape instead.
+    if (ctx.is_tachyon_core != null && ctx.is_tachyon_core(null)) {
+        let masque_out = {
+            type: "masque",
+            tag,
+            server: "162.159.198.2",
+            server_port: 443,
+            profile: "cloudflare",
+            private_key,
+            ip: "172.16.0.2/32"
+        };
+        if (access_token != "")
+            masque_out.auth_token = access_token;
+        if (detour != "")
+            masque_out.detour = outbound_tag(detour);
+        push(config.outbounds, masque_out);
+        return;
+    }
+
     // NB: no "mtu" here. sing-box-extended 2.7.x rejects it on the warp
     // endpoint ("endpoints[0].mtu: json: unknown field \"mtu\"") and aborts the
     // whole config. warp_mtu stays readable for backwards compatibility.
@@ -1811,6 +2182,24 @@ function add_mieru_outbound(config, section) {
         transport: option(section, "mieru_transport", "TCP"),
         username: option(section, "mieru_username", ""),
         password: option(section, "mieru_password", "")
+    });
+}
+
+function add_naive_outbound(config, section) {
+    let tls = { enabled: true };
+    let sni = option(section, "naive_sni", "");
+    if (sni != "")
+        tls.server_name = sni;
+    push(config.outbounds, {
+        type: "naive",
+        tag: outbound_tag(section[".name"]),
+        server: option(section, "naive_server", ""),
+        server_port: int_option(section, "naive_server_port", "0"),
+        username: option(section, "naive_username", ""),
+        password: option(section, "naive_password", ""),
+        // NaiveProxy is HTTPS-only: tachyon-core refuses a naive outbound with
+        // no tls block, and tls.insecure is rejected by it outright.
+        tls: tls
     });
 }
 
@@ -2030,14 +2419,124 @@ function add_olcrtc_outbound(config, section, sections) {
     });
 }
 
+// Emit the section the way a connection section is shaped: one outbound per
+// token server (`<tag>/<name>`), the auto urltest group over them, and the
+// section selector on top — a urltest group as the section tag gets a 400
+// "Must be a Selector" from the Clash API on every dashboard group switch.
+// Returns false when the token cannot be decoded here.
+function add_fptn_token_members(config, section, token) {
+    let section_name = section[".name"];
+    let decoded = fptn_token_decode(token);
+    if (decoded == null)
+        return false;
+
+    let tag = outbound_tag(section_name);
+    let state = runtime_subscription.new_section_state(section_name);
+    let selector_tags = [];
+    let urltest_candidate_tags = [];
+    let detour = outbound_detour_tag_for_section(section);
+
+    for (let server in decoded.servers) {
+        let member = {
+            type: "fptn",
+            tag: tag + "/" + server.name,
+            server: server.host,
+            server_port: server.port,
+            username: decoded.username,
+            password: decoded.password
+        };
+        if (server.md5_fingerprint != "")
+            member.md5_fingerprint = server.md5_fingerprint;
+        if (detour != "")
+            member.detour = detour;
+        push(config.outbounds, member);
+        push(selector_tags, member.tag);
+        push(urltest_candidate_tags, member.tag);
+        runtime_subscription.remember_outbound_metadata(state, member.tag, server.name, member);
+    }
+
+    // The group the selector defaults to. No url/interval/tolerance: this is
+    // the same bare urltest core's own token expansion emits, and the two
+    // shapes must not drift. A section urltest child called "urltest" owns
+    // this very tag, so then it is the group and nothing is emitted here.
+    let text_urltest_tag = "";
+    if (index(connections.urltests(section), "urltest") < 0) {
+        text_urltest_tag = ctx.routes.urltest_outbound_tag(section_name, "urltest");
+        let group_members = [];
+        for (let member_tag in selector_tags)
+            push(group_members, member_tag);
+        let auto_group = {
+            type: "urltest",
+            tag: text_urltest_tag,
+            outbounds: group_members
+        };
+        push(config.outbounds, auto_group);
+        let group_name = decoded.service_name != "" ? decoded.service_name : text_urltest_tag;
+        runtime_subscription.remember_outbound_metadata(state, text_urltest_tag, group_name, auto_group);
+        runtime_subscription.remember_urltest_group_config(state, text_urltest_tag, {
+            displayName: group_name,
+            outbounds: group_members
+        });
+    }
+
+    if (ctx.routes.section_needs_country_is(section)) {
+        let previous_state = read_json_file(runtime_subscription.section_cache_path(section_name));
+        state.outboundMetadata.countries = runtime_country.detect(
+            state.servers,
+            previous_state,
+            option(ctx.runtime_settings(), "bootstrap_dns_server", "77.88.8.8")
+        );
+    }
+    if (ctx.routes.section_has_direct_priority_level(section))
+        state.outboundMetadata.names[runtime_constants.DIRECT_OUTBOUND_TAG] = "Direct";
+
+    state.urltestCandidateTags = unique_string_array(urltest_candidate_tags);
+    ctx.routes.add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag);
+    if (!getenv("SB_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(section_name), state))
+        ctx.runtime_generate_unsupported("failed to write section cache for " + section_name);
+    return true;
+}
+
 // FPTN routes traffic through its TUN interface (tun-fptn) via kernel routing.
 // fwmark 0x00300000 (3145728) → ip rule → routing table 4249 → dev tun-fptn.
+//
+// tachyon-core speaks FPTN itself: in native mode the section expands into
+// per-server outbounds plus a selector — the same shape a connection section
+// gets — instead of a single outbound carrying the access token. The mode
+// comes from the single resolver in config.connections so the generator and
+// the provider runtime can never disagree.
 function add_fptn_outbound(config, section, sections) {
     if (connections && !connections.section_is_active_provider(section, "fptn"))
         return;
+    let tag = outbound_tag(section[".name"]);
+
+    if (connections && connections.fptn_transport_mode() == "native") {
+        // access_token is the canonical field; an fptn:// link pasted into the
+        // section URL list feeds the same resolver, so a pasted token works
+        // everywhere the section is read.
+        let token = connections.fptn_section_token(section);
+        if (token == "")
+            return;
+        if (add_fptn_token_members(config, section, token))
+            return;
+        // Undecodable on this box (brotli without the core binary, malformed
+        // token): hand the raw token to the core, which expands it into the
+        // same members itself.
+        let fptn_out = {
+            type: "fptn",
+            tag,
+            token
+        };
+        let detour = outbound_detour_tag_for_section(section);
+        if (detour != "")
+            fptn_out.detour = detour;
+        push(config.outbounds, fptn_out);
+        return;
+    }
+
     push(config.outbounds, {
         type: "direct",
-        tag: outbound_tag(section[".name"]),
+        tag,
         routing_mark: 3145728
     });
 }
@@ -2071,6 +2570,7 @@ return {
     add_anytls_outbound,
     add_snell_outbound,
     add_mieru_outbound,
+    add_naive_outbound,
     add_sudoku_outbound,
     add_masque_outbound,
     add_openvpn_endpoint,
@@ -2080,5 +2580,7 @@ return {
     add_wdtt_outbound,
     add_olcrtc_outbound,
     add_fptn_outbound,
+    fptn_token_decode,
+    urltest_leaf_candidate_outbound,
     apply_section_packet_encoding_to_connection_outbounds
 };

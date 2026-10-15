@@ -41,6 +41,7 @@ import {
   renderAiChatModal,
   renderStrategyFuzzerModal,
   renderLeakCheckModal,
+  renderRouteExplainModal,
   renderStabilityModal,
   renderAiDoctorModal,
   saveAiDoctorHistory,
@@ -405,6 +406,8 @@ async function fetchDiagnosticsProviderInfo({
         sing_box_tiny: uiState.capabilities.sing_box_tiny,
         sing_box_compressed: uiState.capabilities.sing_box_compressed,
         sing_box_lx: uiState.capabilities.sing_box_lx,
+        sing_box_tachyon_core: uiState.capabilities.sing_box_tachyon_core,
+        sing_box_fptn: uiState.capabilities.sing_box_fptn,
         sing_box_tailscale: uiState.capabilities.sing_box_tailscale,
         sing_box_cert_pin: uiState.capabilities.sing_box_cert_pin,
         zapret_installed: uiState.capabilities.zapret_installed,
@@ -745,11 +748,72 @@ async function handleShowGlobalCheck() {
   }
 }
 
-async function handleRunDoctor() {
+function getDoctorModalTitle(issues: number, fixed: number, report: string) {
+  if (issues > 0 || fixed > 0) {
+    return (
+      _('Doctor repair') +
+      ' \u2014 ' +
+      _('Issues') +
+      ': ' +
+      issues +
+      ', ' +
+      _('Fixed') +
+      ': ' +
+      fixed
+    );
+  }
+
+  if (
+    /safe bypass|аварийного обхода|bypassed|стоковом состоянии|stock (state|internet)/i.test(
+      report,
+    )
+  ) {
+    return _('Doctor repair') + ' \u2014 Safe Bypass';
+  }
+
+  return _('Doctor repair') + ' \u2014 ' + _('No issues found');
+}
+
+function showDoctorModal(report: string, issues: number, fixed: number) {
+  const title = getDoctorModalTitle(issues, fixed, report);
+
+  let isFixing = false;
+  const fixBtn = renderButton({
+    classNames: ['cbi-button-action'],
+    text: _('Fix'),
+    onClick: async () => {
+      if (isFixing) {
+        return;
+      }
+      isFixing = true;
+      (fixBtn as HTMLButtonElement).disabled = true;
+      fixBtn.classList.add('tachyon-partial-button--loading');
+
+      try {
+        await handleRunDoctor(true);
+      } finally {
+        isFixing = false;
+        (fixBtn as HTMLButtonElement).disabled = false;
+        fixBtn.classList.remove('tachyon-partial-button--loading');
+      }
+    },
+  });
+
+  ui.showModal(
+    title,
+    renderModal(report, 'doctor_repair', {
+      initialAutoRefresh: false,
+      extraButtons: [fixBtn],
+    }),
+  );
+}
+
+async function handleRunDoctor(fixParam: boolean | unknown = false) {
+  const fix = fixParam === true;
   setDiagnosticActionLoading('doctor', true);
 
   try {
-    const doctorRes = await TachyonShellMethods.doctor();
+    const doctorRes = await TachyonShellMethods.doctor(fix);
 
     if (!doctorRes || typeof doctorRes !== 'object') {
       showToast(_('Doctor failed') + ': ' + _('Unknown error'), 'error');
@@ -766,29 +830,20 @@ async function handleRunDoctor() {
       const issues = data ? Number(data.issues ?? 0) : 0;
       const fixed = data ? Number(data.fixed ?? 0) : 0;
 
-      const title =
-        issues > 0
-          ? _('Doctor repair') +
-            ' \u2014 ' +
-            _('Issues') +
-            ': ' +
-            issues +
-            ', ' +
-            _('Fixed') +
-            ': ' +
-            fixed
-          : /safe bypass|аварийного обхода|bypassed|стоковом состоянии|stock (state|internet)/i.test(
-                report,
-              )
-            ? _('Doctor repair') + ' \u2014 Safe Bypass'
-            : _('Doctor repair') + ' \u2014 ' + _('No issues found');
+      showDoctorModal(report, issues, fixed);
 
-      ui.showModal(
-        title,
-        renderModal(report, 'doctor_repair', {
-          initialAutoRefresh: false,
-        }),
-      );
+      if (fix) {
+        showToast(
+          fixed > 0
+            ? _('Doctor fixes applied') + `: ${fixed}`
+            : _('Doctor repair completed'),
+          'success',
+        );
+        await refreshDiagnosticServicesInfo({
+          force: true,
+          allowInactive: true,
+        });
+      }
     } else {
       const errorMsg =
         typeof doctorRes.error === 'string'
@@ -890,6 +945,9 @@ async function handleRunAiDoctor() {
         report,
         quickFixes,
         backendNodes,
+        isTachyonCore: Boolean(
+          store.get().diagnosticsSystemInfo?.sing_box_tachyon_core,
+        ),
         onRefreshServices: () =>
           refreshDiagnosticServicesInfo({
             force: true,
@@ -1019,8 +1077,13 @@ async function handleShowSingBoxConfig() {
         showSingBoxConfig.data,
       );
 
+      const isTachyonCore = Boolean(
+        store.get().diagnosticsSystemInfo?.sing_box_tachyon_core,
+      );
       ui.showModal(
-        _('Show sing-box config'),
+        isTachyonCore
+          ? _('Show Tachyon Core config')
+          : _('Show sing-box config'),
         renderModal(rawSingBoxConfigText, 'show_sing_box_config', {
           maskText: () => maskedSingBoxConfigText,
           initialAutoRefresh: false,
@@ -1079,6 +1142,9 @@ async function handleGenerateBugReport() {
       return filtered.join('\n');
     };
 
+    const isTachyonCore = Boolean(
+      store.get().diagnosticsSystemInfo?.sing_box_tachyon_core,
+    );
     const rawReport = [
       '--- TACHYON CONFIG ---',
       configResult || 'Failed to fetch config',
@@ -1088,10 +1154,10 @@ async function handleGenerateBugReport() {
         ? filterUdpErrors(logsResult.stdout)
         : 'Failed to fetch tachyon logs',
       '',
-      '--- SING-BOX LOGS ---',
+      isTachyonCore ? '--- TACHYON-CORE LOGS ---' : '--- SING-BOX LOGS ---',
       singboxLogsResult.code === 0
         ? filterUdpErrors(singboxLogsResult.stdout)
-        : 'Failed to fetch sing-box logs',
+        : `Failed to fetch ${isTachyonCore ? 'tachyon-core' : 'sing-box'} logs`,
     ].join('\n');
 
     const maskedReport = maskLogText(maskGlobalCheckText(rawReport));
@@ -1232,7 +1298,7 @@ function renderDiagnosticAvailableActionsWidget() {
     doctor: {
       loading: diagnosticsActions.doctor.loading,
       visible: true,
-      onClick: handleRunDoctor,
+      onClick: () => handleRunDoctor(false),
       disabled: utilityActionsDisabled,
     },
     aiDoctor: {
@@ -1271,6 +1337,12 @@ function renderDiagnosticAvailableActionsWidget() {
       disabled: false,
       onClick: handleOpenLeakCheck,
     },
+    routeExplain: {
+      visible: true,
+      loading: false,
+      disabled: false,
+      onClick: () => renderRouteExplainModal(),
+    },
     stabilityReport: {
       visible: true,
       loading: false,
@@ -1288,6 +1360,9 @@ function renderDiagnosticAvailableActionsWidget() {
     showSingBoxConfig: {
       loading: diagnosticsActions.showSingBoxConfig.loading,
       visible: true,
+      text: store.get().diagnosticsSystemInfo?.sing_box_tachyon_core
+        ? _('Show Tachyon Core config')
+        : _('Show sing-box config'),
       onClick: handleShowSingBoxConfig,
       disabled: utilityActionsDisabled,
     },
@@ -1342,6 +1417,9 @@ function renderDiagnosticSystemInfoWidget() {
     diagnosticsSystemInfo.sing_box_version,
   );
   const steerInstalled = Boolean(diagnosticsSystemInfo.steer_installed);
+  const singBoxRowLabel = diagnosticsSystemInfo.sing_box_tachyon_core
+    ? 'Tachyon Core'
+    : 'Sing-box';
 
   // Only one engine is installed at a time — engines are swapped, not co-installed.
   // Show only the active engine in system info.
@@ -1353,7 +1431,7 @@ function renderDiagnosticSystemInfoWidget() {
     });
   } else {
     items.push({
-      key: 'Sing-box',
+      key: singBoxRowLabel,
       value: formatSingBoxVersion(diagnosticsSystemInfo),
       tag: { label: _('active'), kind: 'success' as const },
     });
@@ -1363,7 +1441,7 @@ function renderDiagnosticSystemInfoWidget() {
   // show the inactive one without the active tag so the user knows to clean up.
   if (isSteer && singBoxInstalled) {
     items.push({
-      key: 'Sing-box',
+      key: singBoxRowLabel,
       value: formatSingBoxVersion(diagnosticsSystemInfo),
       tag: { label: _('installed'), kind: 'warning' as const },
     });

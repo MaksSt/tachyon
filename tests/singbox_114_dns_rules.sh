@@ -133,14 +133,14 @@ if (!cfg || !cfg.dns || !cfg.dns.rules) {
     exit(1);
 }
 
-let found_https_reject = false;
+let svcb_rule = null;
 let query_rule = null;
 let eval_rule = null;
 let resp_rule = null;
 
 for (let r in cfg.dns.rules) {
-    if (r.action == "reject" && r.query_type && r.query_type[0] == "HTTPS")
-        found_https_reject = true;
+    if (r.query_type && (r.query_type[0] == "HTTPS" || r.query_type[0] == "SVCB"))
+        svcb_rule = r;
     if (r.action == "route" && !r.match_response && r.rule_set) {
         let rs = type(r.rule_set) == "array" ? r.rule_set : [ r.rule_set ];
         for (let s in rs) {
@@ -159,9 +159,17 @@ for (let r in cfg.dns.rules) {
     }
 }
 
-if (!found_https_reject) {
-    warn("HTTPS reject rule missing\n");
+if (!svcb_rule) {
+    warn("HTTPS/SVCB DNS rule missing\n");
     exit(2);
+}
+// issue #118: the block must answer NOERROR with no records (NODATA). The
+// reject action replies REFUSED unconditionally and carries no rcode at all,
+// so a reject here is the bug, not the fix.
+if (svcb_rule.action != "predefined" || svcb_rule.rcode != "NOERROR") {
+    warn("HTTPS/SVCB rule must be predefined with rcode NOERROR, got action=" +
+         svcb_rule.action + " rcode=" + svcb_rule.rcode + "\n");
+    exit(7);
 }
 if (!query_rule) {
     warn("query rule for russia_inside missing\n");
@@ -428,7 +436,10 @@ cat >"$WORK_DIR/bypass_routed_dns_fixture.json" <<'EOF'
       "community_lists": [ "russia_outside" ],
       "routed_dns_enabled": "1",
       "routed_dns_type": "doh",
-      "routed_dns_server": [ "https://dns.comss.one/dns-query" ]
+      "routed_dns_server": [
+        "https://dns.comss.one/dns-query",
+        "https://dns2.comss.one/dns-query"
+      ]
     }
   ]
 }
@@ -464,6 +475,27 @@ for (let r in cfg.dns.rules || []) {
 }
 if (!found_dns_rule) {
     warn("DNS rule targeting ByPass-routed-dns-server not found\n");
+    exit(1);
+}
+
+// With several routed DNS servers the rule still points at the un-indexed tag,
+// so the first server has to carry it and the rest get -2, -3, …
+let found_second = false;
+for (let s in cfg.dns.servers || []) {
+    if (s.tag == "ByPass-routed-dns-server-2") {
+        found_second = true;
+        if (s.type != "https" || s.server != "dns2.comss.one" || s.detour) {
+            warn("ByPass-routed-dns-server-2 properties mismatch: " + json(s) + "\n");
+            exit(1);
+        }
+    }
+    if (s.tag == "ByPass-routed-dns-server-1") {
+        warn("the first server must carry the un-indexed tag, not -1\n");
+        exit(1);
+    }
+}
+if (!found_second) {
+    warn("second routed DNS server not found under the -2 tag\n");
     exit(1);
 }
 

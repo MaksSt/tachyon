@@ -17,6 +17,7 @@ interface ActionProps {
   visible: boolean;
   disabled: boolean;
   onClick: () => void;
+  text?: string;
 }
 
 interface IRenderAvailableActionsProps {
@@ -36,6 +37,7 @@ interface IRenderAvailableActionsProps {
   generateBugReport: ActionProps;
   checkServices: ActionProps;
   testLeaks?: ActionProps;
+  routeExplain?: ActionProps;
   stabilityReport?: ActionProps;
 }
 
@@ -56,6 +58,7 @@ export function renderAvailableActions({
   generateBugReport,
   checkServices,
   testLeaks,
+  routeExplain,
   stabilityReport,
 }: IRenderAvailableActionsProps) {
   return E('div', { class: 'tachyon_diagnostic-page__right-bar__actions' }, [
@@ -188,6 +191,16 @@ export function renderAvailableActions({
         disabled: testLeaks!.disabled,
       }),
     ]),
+    ...insertIf(!!routeExplain?.visible, [
+      renderButton({
+        classNames: ['cbi-button-action'],
+        onClick: routeExplain!.onClick,
+        icon: renderSquareChartGanttIcon24,
+        text: _('Route Decision Explainer'),
+        loading: routeExplain!.loading,
+        disabled: routeExplain!.disabled,
+      }),
+    ]),
     ...insertIf(!!stabilityReport?.visible, [
       renderButton({
         classNames: ['cbi-button-action'],
@@ -211,7 +224,7 @@ export function renderAvailableActions({
       renderButton({
         onClick: showSingBoxConfig.onClick,
         icon: renderCogIcon24,
-        text: _('Show sing-box config'),
+        text: showSingBoxConfig.text || _('Show sing-box config'),
         loading: showSingBoxConfig.loading,
         disabled: showSingBoxConfig.disabled,
       }),

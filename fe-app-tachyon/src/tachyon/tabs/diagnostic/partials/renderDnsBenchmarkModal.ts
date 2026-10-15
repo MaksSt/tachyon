@@ -276,7 +276,7 @@ export function renderDnsBenchmarkModal() {
   });
 
   const applyBtn = renderButton({
-    text: `🚀 ${_('Apply Recommended DNS')}`,
+    text: _('Apply Recommended DNS'),
     classNames: ['cbi-button-positive'],
     disabled: true,
     onClick: () => applyRecommended(),
@@ -350,33 +350,49 @@ export function renderDnsBenchmarkModal() {
   const applyRecommended = async () => {
     if (applyBtn) {
       (applyBtn as HTMLButtonElement).disabled = true;
-      applyBtn.textContent = `⏳ ${_('Applying...')}`;
+      applyBtn.textContent = _('Applying...');
     }
 
-    const res = await TachyonShellMethods.applyDnsBenchmark();
-    if (res.success) {
+    try {
+      const res = await TachyonShellMethods.applyDnsBenchmark();
+      if (res.success) {
+        ui.addNotification(
+          _('Tachyon'),
+          E(
+            'p',
+            {},
+            _(
+              'Recommended DNS settings applied successfully and service restarted!',
+            ),
+          ),
+          'info',
+        );
+        if (ui.hideModal) ui.hideModal();
+        window.setTimeout(() => window.location.reload(), 600);
+      } else {
+        ui.addNotification(
+          _('Tachyon'),
+          E('p', {}, res.error || _('Failed to apply DNS settings')),
+          'error',
+        );
+        if (applyBtn) {
+          (applyBtn as HTMLButtonElement).disabled = false;
+          applyBtn.textContent = _('Apply Recommended DNS');
+        }
+      }
+    } catch (err) {
       ui.addNotification(
         _('Tachyon'),
         E(
           'p',
           {},
-          _(
-            'Recommended DNS settings applied successfully and service restarted!',
-          ),
+          (err as Error)?.message || _('Failed to apply DNS settings'),
         ),
-        'info',
-      );
-      if (ui.hideModal) ui.hideModal();
-      window.location.reload();
-    } else {
-      ui.addNotification(
-        _('Tachyon'),
-        E('p', {}, res.error || _('Failed to apply DNS settings')),
         'error',
       );
       if (applyBtn) {
         (applyBtn as HTMLButtonElement).disabled = false;
-        applyBtn.textContent = `🚀 ${_('Apply Recommended DNS')}`;
+        applyBtn.textContent = _('Apply Recommended DNS');
       }
     }
   };

@@ -134,7 +134,8 @@ Usage: $0 [options]
       --engine NAME     Routing engine: sing-box (default), steer, steer-extended
       --steer           Install steer engine
       --steer-extended  Install steer-extended engine
-      --sing-box-variant VAR  sing-box build: stable, tiny, extended, extended-compressed, lx
+      --tachyon-core    Install tachyon-core engine build
+      --sing-box-variant VAR  sing-box build: stable, tiny, extended, extended-compressed, lx, tachyon-core
       --skip-sing-box   Do not install routing engine when none is present
       --skip-engine     Alias for --skip-sing-box
       --zram            Install zram-swap
@@ -160,11 +161,16 @@ parse_args() {
                 [ "$#" -gt 0 ] || { err "--engine requires name (sing-box, steer, steer-extended)"; return 2; }
                 case "$1" in
                     sing-box|sing_box) ENGINE_INSTALL_REQUESTED="sing-box" ;;
+                    tachyon-core|tachyon_core) ENGINE_INSTALL_REQUESTED="sing-box"; SING_BOX_VARIANT_REQUESTED="tachyon-core" ;;
                     steer) ENGINE_INSTALL_REQUESTED="steer" ;;
                     steer-extended|steer_extended) ENGINE_INSTALL_REQUESTED="steer-extended" ;;
                     none|skip) SKIP_SING_BOX=1 ;;
-                    *) err "Unsupported engine: $1 (allowed: sing-box, steer, steer-extended, none)"; return 2 ;;
+                    *) err "Unsupported engine: $1 (allowed: sing-box, tachyon-core, steer, steer-extended, none)"; return 2 ;;
                 esac
+                ;;
+            --tachyon-core)
+                ENGINE_INSTALL_REQUESTED="sing-box"
+                SING_BOX_VARIANT_REQUESTED="tachyon-core"
                 ;;
             --steer) ENGINE_INSTALL_REQUESTED="steer" ;;
             --steer-extended) ENGINE_INSTALL_REQUESTED="steer-extended" ;;
@@ -539,10 +545,34 @@ ensure_bootstrap_ucode_runtime() {
     ensure_package ucode-mod-uci || return 1
 }
 
+kmod_is_available() {
+    _kmod="$1"
+    pkg_is_installed "$_kmod" && return 0
+    case "$_kmod" in
+        kmod-nft-tproxy)
+            [ -d /sys/module/nft_tproxy ] && return 0
+            modprobe nft_tproxy >/dev/null 2>&1 && return 0
+            ;;
+        kmod-tun)
+            [ -e /dev/net/tun ] && return 0
+            [ -d /sys/module/tun ] && return 0
+            modprobe tun >/dev/null 2>&1 && return 0
+            ;;
+        kmod-inet-diag)
+            [ -d /sys/module/inet_diag ] && return 0
+            modprobe inet_diag >/dev/null 2>&1 && return 0
+            ;;
+    esac
+    return 1
+}
+
 ensure_runtime_dependencies() {
     _missing=""
     for _pkg in ca-bundle curl coreutils-base64 coreutils-timeout bind-dig nftables ip-full; do
         pkg_is_installed "$_pkg" || _missing="$_missing $_pkg"
+    done
+    for _kmod in kmod-nft-tproxy kmod-tun kmod-inet-diag; do
+        kmod_is_available "$_kmod" || _missing="$_missing $_kmod"
     done
     [ -z "$_missing" ] && return 0
     pkg_update_index || return 1
@@ -796,7 +826,8 @@ select_sing_box_installation() {
     printf '  5) sing-box lx\n'
     printf '  6) steer (lightweight Go engine, SmartDNS)\n'
     printf '  7) steer-extended (steer + xHTTP)\n'
-    printf '  8) skip\n'
+    printf '  8) tachyon-core (Rust core for sing-box configs)\n'
+    printf '  9) skip\n'
     printf 'Choice [1]: '
     read -r _answer || _answer=""
     case "${_answer:-1}" in
@@ -807,7 +838,8 @@ select_sing_box_installation() {
         5) SING_BOX_INSTALL_VARIANT="lx"; ENGINE_INSTALL_CHOICE="sing-box" ;;
         6) SING_BOX_INSTALL_VARIANT=""; ENGINE_INSTALL_CHOICE="steer" ;;
         7) SING_BOX_INSTALL_VARIANT=""; ENGINE_INSTALL_CHOICE="steer-extended" ;;
-        8) SING_BOX_INSTALL_VARIANT=""; ENGINE_INSTALL_CHOICE="" ;;
+        8) SING_BOX_INSTALL_VARIANT="tachyon-core"; ENGINE_INSTALL_CHOICE="sing-box" ;;
+        9) SING_BOX_INSTALL_VARIANT=""; ENGINE_INSTALL_CHOICE="" ;;
         *) warn "Unknown choice; using stable"; SING_BOX_INSTALL_VARIANT="stable"; ENGINE_INSTALL_CHOICE="sing-box" ;;
     esac
 }
@@ -999,7 +1031,15 @@ remove_legacy_packages() {
             # setup. Removing the package is enough to stop the service.
             apk_run apk-legacy-cleanup "$PACKAGE_TIMEOUT_SECONDS" del $_legacy_pkgs || warn "Could not remove legacy packages (will scrub world file)"
         fi
-        scrub_apk_world
+        # Legacy names only. The no-argument scrub uses WORLD_SCRUB_PACKAGES,
+        # which also lists tachyon and luci-app-tachyon - the packages this
+        # installer has just installed. Scrubbing them here drops them out of
+        # /etc/apk/world while they are installed, and apk's next transaction
+        # (a zapret2 component update, say) sees two orphans and purges them,
+        # taking the LuCI menu with them (issue #120). The full scrub still
+        # runs before the next install, where it belongs: it exists to release
+        # stale pinned entries before apk selects anything.
+        scrub_apk_world "$LEGACY_PACKAGES"
     else
         for _pkg in $LEGACY_PACKAGES; do
             if opkg status "$_pkg" 2>/dev/null | grep -q '^Status:'; then
@@ -1053,9 +1093,11 @@ scrub_apk_world() {
 # failed. Releasing the legacy entries *before* the install lets apk drop forkop
 # inside the same transaction, which is atomic, and it keeps the window in which
 # the legacy resolver is gone but Tachy's DNS is not up yet as short as it was
-# meant to be (issue #85). Only the legacy entries are dropped here; the full
-# scrub still runs at the end so `tachyon` is not missing from world if the
-# install fails and is rolled back.
+# meant to be (issue #85). Only the legacy entries are dropped here, and only
+# legacy entries at the end too: the full scrub belongs to the start of the next
+# run, where it releases stale pins before apk selects anything. Scrubbing the
+# freshly installed tachyon entries on the way out is what let the next apk
+# transaction purge Tachyon itself (issue #120).
 resolve_legacy_conflicts_before_install() {
     [ "$PKG_IS_APK" -eq 1 ] || return 0
     [ "$DRY_RUN" -eq 1 ] && return 0
@@ -1206,6 +1248,7 @@ install_selected_sing_box() {
                 extended) _action="install_extended" ;;
                 extended-compressed) _action="install_extended_compressed" ;;
                 lx) _action="install_lx" ;;
+                tachyon-core|tachyon_core) _action="install_tachyon_core" ;;
                 *) return 1 ;;
             esac
             msg "Installing sing-box ($SING_BOX_INSTALL_VARIANT)"

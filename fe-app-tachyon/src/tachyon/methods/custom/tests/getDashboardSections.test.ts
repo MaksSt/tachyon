@@ -1357,7 +1357,7 @@ describe('getDashboardSections', () => {
     expect(outbound?.displayName).toBe('🇫🇷 France');
   });
 
-  it('returns FPTN service section with running status on dashboard', async () => {
+  it('returns FPTN section as a connection with servers and urltest on dashboard', async () => {
     mocks.getConfigSections.mockResolvedValue([
       {
         '.name': 'fptn_sec',
@@ -1367,14 +1367,38 @@ describe('getDashboardSections', () => {
         access_token: 'test_token',
       },
     ]);
-    mocks.getFptnStatus.mockResolvedValue({
+    // The backend now expands the token itself: the section tag is a selector
+    // (the Clash API rejects a group switch against a urltest group with 400
+    // "Must be a Selector"), members sit under `<tag>/<name>` exactly like the
+    // core's own expansion, and the auto urltest group carries the section
+    // cache's `-urltest-out` tag.
+    mocks.getClashApiProxies.mockResolvedValue({
       success: true,
       data: {
-        installed: true,
-        configured: true,
-        service_running: true,
-        ready: true,
-        status_message: 'FPTN is running',
+        proxies: {
+          'fptn_sec-out': proxy('Selector', {
+            name: 'fptn_sec-out',
+            now: 'fptn_sec-urltest-out',
+            all: [
+              'fptn_sec-urltest-out',
+              'fptn_sec-out/Node-1',
+              'fptn_sec-out/Node-2',
+            ],
+          }),
+          'fptn_sec-urltest-out': proxy('URLTest', {
+            name: 'fptn_sec-urltest-out',
+            now: 'fptn_sec-out/Node-1',
+            all: ['fptn_sec-out/Node-1', 'fptn_sec-out/Node-2'],
+          }),
+          'fptn_sec-out/Node-1': proxy('FPTN', {
+            name: 'fptn_sec-out/Node-1',
+            history: [{ time: '2026-05-27T00:00:00Z', delay: 42 }],
+          }),
+          'fptn_sec-out/Node-2': proxy('FPTN', {
+            name: 'fptn_sec-out/Node-2',
+            history: [{ time: '2026-05-27T00:00:00Z', delay: 84 }],
+          }),
+        },
       },
     });
 
@@ -1384,9 +1408,19 @@ describe('getDashboardSections', () => {
     expect(result.data).toHaveLength(1);
     expect(result.data[0].sectionName).toBe('fptn_sec');
     expect(result.data[0].action).toBe('fptn');
-    expect(result.data[0].serviceStatus?.serviceType).toBe('fptn');
-    expect(result.data[0].serviceStatus?.ready).toBe(true);
-    expect(result.data[0].outbounds[0].displayName).toBe('Running');
+    expect(result.data[0].withTagSelect).toBe(true);
+    expect(result.data[0].proxyConfigType).toBe('selector');
+    expect(result.data[0].serviceStatus).toBeUndefined();
+    expect(result.data[0].outbounds.map((item) => item.code)).toEqual([
+      'fptn_sec-urltest-out',
+      'fptn_sec-out/Node-1',
+      'fptn_sec-out/Node-2',
+    ]);
+    const firstNode = result.data[0].outbounds.find(
+      (item) => item.code === 'fptn_sec-out/Node-1',
+    );
+    expect(firstNode?.displayName).toBe('Node-1');
+    expect(firstNode?.prefix).toBe('fptn_sec-out');
   });
 
   it('excludes hidden outbound tags from dashboard section cards even if present in selector', async () => {
@@ -1434,5 +1468,39 @@ describe('getDashboardSections', () => {
     expect(codes).toContain('main-urltest-out');
     expect(codes).toContain('proxy-visible-2');
     expect(codes).not.toContain('proxy-hidden-1');
+  });
+
+  it('marks a quarantined section with configError from the runtime errors file', async () => {
+    mocks.getConfigSections.mockResolvedValue([
+      proxySection(),
+      proxySection({ '.name': 'other' }),
+    ]);
+    // The runtime writes a flat { section: reason } map when sing-box rejects a
+    // section and init-config quarantines it; a missing file means every
+    // section loaded fine.
+    mocks.fsRead.mockImplementation((path: string) =>
+      path.includes('section-errors')
+        ? Promise.resolve(
+            JSON.stringify({ main: 'outbounds[1]: missing required field' }),
+          )
+        : Promise.reject(new Error('cache miss')),
+    );
+
+    const result = await getDashboardSections();
+
+    expect(result.success).toBe(true);
+    expect(result.data[0].configError).toBe(
+      'outbounds[1]: missing required field',
+    );
+    expect(result.data[1].configError).toBeUndefined();
+  });
+
+  it('leaves configError unset when the runtime errors file is absent', async () => {
+    mocks.getConfigSections.mockResolvedValue([proxySection()]);
+
+    const result = await getDashboardSections();
+
+    expect(result.success).toBe(true);
+    expect(result.data[0].configError).toBeUndefined();
   });
 });

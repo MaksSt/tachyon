@@ -3,6 +3,7 @@
 let fs = require("fs");
 let common = require("core.common");
 let crypt4 = require("subscription.crypt4");
+let wireguard = require("subscription.wireguard");
 let as_string = common.as_string;
 let object_or_empty = common.object_or_empty;
 let array_or_empty = common.array_or_empty;
@@ -23,7 +24,8 @@ function starts_with(value, prefix) {
 }
 
 function is_supported_share_link(line) {
-    return starts_with(line, "ss://") ||
+    return starts_with(line, "vpn://") ||
+        starts_with(line, "ss://") ||
         starts_with(line, "vmess://") ||
         starts_with(line, "vless://") ||
         starts_with(line, "trojan://") ||
@@ -36,6 +38,10 @@ function is_supported_share_link(line) {
         starts_with(line, "socks5://") ||
         starts_with(line, "http://") ||
         starts_with(line, "https://") ||
+        starts_with(line, "fptn:") ||
+        starts_with(line, "fptnb:") ||
+        starts_with(line, "fptn://") ||
+        starts_with(line, "fptnb://") ||
         crypt4.is_crypt4(line);
 }
 
@@ -714,10 +720,17 @@ function add_tls(url, security, default_tls) {
         fingerprint = "chrome";
 
     let tls_enabled = false;
+    let forced_tls_443 = false;
     if (security == "tls" || security == "xtls" || security == "reality")
         tls_enabled = true;
+    else if (security == "none") {
+        if (int(url.port) == 443) {
+            tls_enabled = true;
+            forced_tls_443 = true;
+        }
+    }
     else if (security == null || security == "")
-        tls_enabled = default_tls || sni != "" || length(alpn) > 0 || fingerprint != "" || public_key != "" || certificate_pin != "";
+        tls_enabled = default_tls || (int(url.port) == 443) || sni != "" || length(alpn) > 0 || fingerprint != "" || public_key != "" || certificate_pin != "";
 
     if (!tls_enabled)
         return [null, true];
@@ -725,18 +738,27 @@ function add_tls(url, security, default_tls) {
     let tls = { enabled: true };
     if (sni != "")
         tls.server_name = sni;
-    if (is_true(insecure))
+    else if (forced_tls_443 && url.host != "")
+        tls.server_name = url.host;
+    if (is_true(insecure) || forced_tls_443)
         tls.insecure = true;
     if (length(alpn) > 0)
         tls.alpn = alpn;
     if (fingerprint != "")
         tls.utls = { enabled: true, fingerprint: fingerprint };
+    else if (forced_tls_443)
+        tls.utls = { enabled: true, fingerprint: "chrome" };
     if (security == "reality" || public_key != "") {
         tls.reality = { enabled: true };
         if (public_key != "")
             tls.reality.public_key = public_key;
         if (short_id != "")
             tls.reality.short_id = short_id;
+        let mlkem_preference = query.support_x25519mlkem768;
+        if (mlkem_preference == null)
+            mlkem_preference = query.supportX25519MLKEM768;
+        if (mlkem_preference != null)
+            tls.reality.support_x25519mlkem768 = is_true(mlkem_preference);
     }
     if (certificate_pin != "")
         tls.certificate_sha256 = [ certificate_pin ];
@@ -1324,10 +1346,14 @@ function process_vmess(raw) {
 }
 
 function parse_share_link(line) {
+    if (starts_with(line, "vpn://"))
+        return wireguard.from_vpn(line);
     if (starts_with(line, "vmess://"))
         return process_vmess(line);
     if (starts_with(line, "ss://"))
         return process_shadowsocks(line);
+    if (starts_with(line, "fptn:") || starts_with(line, "fptnb:") || starts_with(line, "fptn://") || starts_with(line, "fptnb://"))
+        return { type: "fptn", token: line, share_link: line };
 
     let url = parse_url(line);
     if (!url)
@@ -3373,6 +3399,8 @@ function parse_subscription_source_entry_tsv(entry) {
 
 function module_exports() {
     return {
+        share_link_outbound,
+        parse_share_link,
         parse_subscription_source_entry,
         validate_subscription,
         normalize_content_validated,

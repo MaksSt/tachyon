@@ -131,6 +131,9 @@ type ChildType =
   | 'priority_level';
 
 const DASHBOARD_SECTION_CACHE_DIR = '/var/run/tachyon/section-cache';
+// Written by singbox/runtime.uc when it quarantines a section that sing-box
+// refused to load; absent (or stale-empty) when every section loaded fine.
+const SECTION_ERRORS_FILE = '/var/run/tachyon/section-errors.json';
 const CLASH_API_FETCH_TIMEOUT_MS = 2500;
 let directClashApiFailedAt = 0;
 const DIRECT_CLASH_API_COOLDOWN_MS = 10_000;
@@ -266,6 +269,10 @@ function hydrateConfigSections(configSections: Tachyon.ConfigSection[]) {
           return;
         }
         settings[item.url] = {
+          // Carried so the dashboard can tell a disabled source from an enabled
+          // one. `enabled` is absent on sections written before the flag existed,
+          // which means enabled - the same default the backend applies.
+          enabled: item.enabled,
           subscription_update_enabled: item.subscription_update_enabled,
           subscription_update_interval: item.subscription_update_interval,
           download_via_proxy_enabled: item.download_via_proxy_enabled,
@@ -284,6 +291,8 @@ function hydrateConfigSections(configSections: Tachyon.ConfigSection[]) {
           show_dashboard_metadata: item.show_dashboard_metadata,
           prefix_nodes: item.prefix_nodes,
           node_prefix: item.node_prefix,
+          node_prefix_bg: item.node_prefix_bg,
+          node_prefix_color: item.node_prefix_color,
           include_urltest_groups: item.include_urltest_groups,
           hide_urltest_group_outbounds: item.hide_urltest_group_outbounds,
           hide_detour_outbounds: item.hide_detour_outbounds,
@@ -393,6 +402,7 @@ const SINGLE_ENDPOINT_ACTIONS = new Set([
   'anytls',
   'snell',
   'mieru',
+  'naive',
   'sudoku',
   'masque',
   'openvpn',
@@ -404,6 +414,7 @@ const ACTION_DISPLAY_NAMES: Record<string, string> = {
   anytls: 'AnyTLS',
   snell: 'Snell',
   mieru: 'Mieru',
+  naive: 'NaiveProxy',
   sudoku: 'Sudoku',
   masque: 'MASQUE',
   openvpn: 'OpenVPN',
@@ -414,16 +425,14 @@ function isConnectionAction(action?: string) {
   return Boolean(
     action &&
       (SINGLE_ENDPOINT_ACTIONS.has(action) ||
-        ['connection', 'proxy', 'outbound'].includes(action)),
+        ['connection', 'proxy', 'outbound', 'fptn'].includes(action)),
   );
 }
 
 function isServiceAction(action?: string) {
   return Boolean(
     action &&
-      ['zapret', 'zapret2', 'byedpi', 'wdtt', 'olcrtc', 'fptn'].includes(
-        action,
-      ),
+      ['zapret', 'zapret2', 'byedpi', 'wdtt', 'olcrtc'].includes(action),
   );
 }
 
@@ -476,6 +485,8 @@ function isNaOutbound(outbound: Tachyon.Outbound) {
 
 function shouldUseProxyGroup(section: Tachyon.ConfigSection) {
   return (
+    section.action === 'fptn' ||
+    Boolean(section.access_token) ||
     getManualProxyLinks(section).length > 0 ||
     hasSubscriptionSources(section) ||
     getConnectionInterfaces(section).length > 0 ||
@@ -495,6 +506,10 @@ function getSectionProxyConfigType(section: Tachyon.ConfigSection) {
   }
 
   if (getManualProxyLinks(section).length > 0) {
+    return 'selector' as const;
+  }
+
+  if (section.action === 'fptn') {
     return 'selector' as const;
   }
 
@@ -531,6 +546,20 @@ function buildManualLinkByCode(section: Tachyon.ConfigSection) {
       link,
     ]),
   );
+}
+
+function findManualLink(
+  manualLinkByCode: Map<string, string>,
+  code: string,
+): string {
+  const direct = manualLinkByCode.get(code);
+  if (direct) return direct;
+  for (const [tag, link] of manualLinkByCode.entries()) {
+    if (code === tag || code.startsWith(`${tag}/`)) {
+      return link;
+    }
+  }
+  return '';
 }
 
 function getProxyEntryByCode(proxies: ClashProxyEntry[]) {
@@ -879,6 +908,22 @@ async function readDashboardSectionCache(
   }
 }
 
+// One flat map { section: reason } from the runtime's quarantine record.
+async function readSectionErrors(): Promise<Record<string, string>> {
+  try {
+    const raw = await fs.read(SECTION_ERRORS_FILE);
+    const parsed = JSON.parse(raw) as unknown;
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return objectMap(parsed);
+  } catch (_error) {
+    return {};
+  }
+}
+
 function getUrlTestGroups(dashboardCache?: DashboardSectionCache) {
   const groups = dashboardCache?.urltestGroups;
 
@@ -917,6 +962,54 @@ function getConfiguredSubscriptionPrefixes(
   return prefixes;
 }
 
+function getConfiguredSubscriptionPrefixStyles(section: Tachyon.ConfigSection) {
+  const settings = itemSettingsMap(section.subscription_url_settings);
+  const styles: Record<string, { bg?: string; color?: string }> = {};
+  for (const url of Object.keys(settings)) {
+    const item = settings[url];
+    if (item && item.prefix_nodes === '1') {
+      const p =
+        typeof item.node_prefix === 'string' ? item.node_prefix.trim() : '';
+      if (p) {
+        const bg =
+          typeof item.node_prefix_bg === 'string'
+            ? item.node_prefix_bg.trim()
+            : '';
+        const color =
+          typeof item.node_prefix_color === 'string'
+            ? item.node_prefix_color.trim()
+            : '';
+        if (bg || color) {
+          styles[p] = { bg: bg || undefined, color: color || undefined };
+        }
+      }
+    }
+  }
+  if (typeof window !== 'undefined' && Object.keys(styles).length > 0) {
+    const win = window as unknown as {
+      __tachyonUciPrefixStyles?: Record<
+        string,
+        { bg?: string; color?: string }
+      >;
+    };
+    win.__tachyonUciPrefixStyles = {
+      ...(win.__tachyonUciPrefixStyles || {}),
+      ...styles,
+    };
+  }
+  return styles;
+}
+
+function dashboardOutboundType(
+  code: string,
+  runtimeType: string | undefined,
+  outboundMetadata?: Tachyon.GetOutboundMetadata,
+) {
+  return outboundMetadata?.protocols?.[code] === 'amneziawg'
+    ? 'AmneziaWG'
+    : runtimeType || '';
+}
+
 function resolveOutboundNameAndPrefix({
   code,
   entry,
@@ -932,11 +1025,21 @@ function resolveOutboundNameAndPrefix({
   preferMetadata?: boolean;
   configuredPrefixes?: string[];
 }): { displayName: string; prefix?: string } {
+  const isFptn =
+    link.startsWith('fptn:') ||
+    link.startsWith('fptnb:') ||
+    link.startsWith('fptn://') ||
+    link.startsWith('fptnb://');
   const metadataName = outboundMetadata?.names?.[code];
+  const proxyUrlName = isFptn ? '' : getProxyUrlName(link);
+  const fallbackServerName = code.includes('/')
+    ? code.split('/').pop()
+    : undefined;
   const rawName =
-    (preferMetadata ? metadataName : getProxyUrlName(link)) ||
-    (preferMetadata ? getProxyUrlName(link) : metadataName) ||
+    (preferMetadata ? metadataName : proxyUrlName) ||
+    (preferMetadata ? proxyUrlName : metadataName) ||
     entry?.value?.name ||
+    fallbackServerName ||
     code;
 
   let prefix = outboundMetadata?.prefixes?.[code]?.trim() || '';
@@ -947,10 +1050,13 @@ function resolveOutboundNameAndPrefix({
       if (
         rawName.startsWith(p + ' ') ||
         rawName.startsWith(p + '-') ||
+        rawName.startsWith(p + '/') ||
         code.startsWith(p + ' ') ||
         code.startsWith(p + '-') ||
+        code.startsWith(p + '/') ||
         entry?.value?.name?.startsWith(p + ' ') ||
-        entry?.value?.name?.startsWith(p + '-')
+        entry?.value?.name?.startsWith(p + '-') ||
+        entry?.value?.name?.startsWith(p + '/')
       ) {
         prefix = p;
         break;
@@ -970,6 +1076,17 @@ function resolveOutboundNameAndPrefix({
       if (stripped) {
         displayName = stripped;
       }
+    } else if (displayName.startsWith(prefix + '/')) {
+      const stripped = displayName.slice(prefix.length + 1).trim();
+      if (stripped) {
+        displayName = stripped;
+      }
+    }
+  } else if (/^[A-Za-z0-9_-]+\//.test(displayName)) {
+    const parts = displayName.split('/');
+    if (parts.length > 1 && parts[parts.length - 1].trim()) {
+      prefix = parts.slice(0, -1).join('/');
+      displayName = parts[parts.length - 1].trim();
     }
   }
 
@@ -1026,7 +1143,7 @@ function buildUrlTestInfo({
     childCodes.flatMap((childCode) => {
       const childEntry = proxyByCode.get(childCode);
       const link =
-        manualLinkByCode.get(childCode) ||
+        findManualLink(manualLinkByCode, childCode) ||
         cachedProxyLinks.get(childCode) ||
         '';
       const canCopyLink = isCopyableProxyLink(link);
@@ -1045,10 +1162,15 @@ function buildUrlTestInfo({
           displayName: resolved.displayName,
           prefix: resolved.prefix,
           latency: childEntry?.value?.history?.[0]?.delay || 0,
-          type: childEntry?.value?.type || '',
+          type: dashboardOutboundType(
+            childCode,
+            childEntry?.value?.type,
+            outboundMetadata,
+          ),
           transport:
             outboundMetadata?.transports?.[childCode] ||
             getProxyUrlTransport(link),
+          details: outboundMetadata?.details?.[childCode],
           selected: selectedCode === childCode,
           link,
           canCopyLink,
@@ -1164,7 +1286,7 @@ function buildPriorityInfo({
     const members = uniqueCodes(level.outbounds || []).map((childCode) => {
       const childEntry = proxyByCode.get(childCode);
       const link =
-        manualLinkByCode.get(childCode) ||
+        findManualLink(manualLinkByCode, childCode) ||
         cachedProxyLinks.get(childCode) ||
         '';
       const canCopyLink = isCopyableProxyLink(link);
@@ -1182,10 +1304,15 @@ function buildPriorityInfo({
         displayName: resolved.displayName,
         prefix: resolved.prefix,
         latency: childEntry?.value?.history?.[0]?.delay || 0,
-        type: childEntry?.value?.type || '',
+        type: dashboardOutboundType(
+          childCode,
+          childEntry?.value?.type,
+          outboundMetadata,
+        ),
         transport:
           outboundMetadata?.transports?.[childCode] ||
           getProxyUrlTransport(link),
+        details: outboundMetadata?.details?.[childCode],
         selected: selectedCode === childCode,
         link,
         canCopyLink,
@@ -1253,6 +1380,7 @@ function buildProxyGroupOutbounds(
 ) {
   const sectionName = section['.name'];
   const configuredPrefixes = getConfiguredSubscriptionPrefixes(section);
+  getConfiguredSubscriptionPrefixStyles(section);
   const proxyByCode = getProxyEntryByCode(proxies);
   const selectorTag = getOutboundTagBySection(sectionName);
   const selector = proxyByCode.get(selectorTag);
@@ -1310,7 +1438,10 @@ function buildProxyGroupOutbounds(
     const item = proxyByCode.get(code);
     const urlTestConfig = urlTestConfigByCode.get(code);
     const priorityConfig = priorityConfigByCode.get(code);
-    const link = manualLinkByCode.get(code) || cachedProxyLinks.get(code) || '';
+    const link =
+      findManualLink(manualLinkByCode, code) ||
+      cachedProxyLinks.get(code) ||
+      '';
 
     if (!item && !urlTestConfig && !priorityConfig && !link) {
       return [];
@@ -1429,10 +1560,15 @@ function buildProxyGroupOutbounds(
         latency,
         type: priorityConfig
           ? 'Priority'
-          : effectiveItem?.value.type || 'URLTest',
+          : dashboardOutboundType(
+              code,
+              effectiveItem?.value.type || 'URLTest',
+              outboundMetadata,
+            ),
         transport: isGroupType
           ? undefined
           : outboundMetadata?.transports?.[code] || getProxyUrlTransport(link),
+        details: isGroupType ? undefined : outboundMetadata?.details?.[code],
         selected: isSelected,
         link,
         canCopyLink,
@@ -1619,6 +1755,9 @@ function getOutboundMetadata(dashboardCache?: DashboardSectionCache) {
     transports: objectMap(metadata.transports),
     protocols: objectMap(metadata.protocols),
     securities: objectMap(metadata.securities),
+    ports: objectMap(metadata.ports),
+    details: objectMap(metadata.details),
+    prefixes: objectMap(metadata.prefixes),
   };
 }
 
@@ -1781,6 +1920,7 @@ export async function getDashboardSections(
     return serviceStatusCache.get(serviceType)!;
   };
 
+  const sectionErrors = await readSectionErrors();
   const data = await Promise.all(
     configSections
       .filter(
@@ -1963,6 +2103,10 @@ export async function getDashboardSections(
 
   return {
     success: true,
-    data,
+    data: data.map((group) =>
+      sectionErrors[group.sectionName]
+        ? { ...group, configError: sectionErrors[group.sectionName] }
+        : group,
+    ),
   };
 }

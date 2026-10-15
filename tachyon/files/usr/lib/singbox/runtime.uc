@@ -5,6 +5,7 @@ let uci_core = require("core.uci");
 let common = require("core.common");
 let runtime_dns = require("singbox.dns");
 let verifier = require("components.verifier");
+let core_profile = require("singbox.core_profile");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
@@ -146,9 +147,45 @@ function sing_box_version_output() {
     return command_exists("sing-box") ? command_output_lenient(command_from_args([ "sing-box", "version" ]) + " 2>/dev/null") : "";
 }
 
+// The name the binary calls itself, read off the banner: "sing-box version
+// 1.14.2-lx.12" gives "sing-box", our own build gives "tachyon-core".
+//
+// This exists because our core does not carry a fork suffix in its version. The
+// released v0.0.1 prints "tachyon-core 0.0.1" - a bare number from its own
+// series - so sing_box_version() hands back "0.0.1", which looks like a stock
+// build of the same number. Every detection that used to look for "-tachyon."
+// in the version therefore misses the real binary, and the minimum-version gate
+// then compares 0.0.1 against 1.12 and refuses to start the router.
+let sing_box_banner_identity_cache = null;
+
+function sing_box_banner_identity() {
+    if (sing_box_banner_identity_cache != null)
+        return sing_box_banner_identity_cache;
+
+    sing_box_banner_identity_cache = "";
+    let output = sing_box_version_output();
+    if (output != "") {
+        let newline = index(output, "\n");
+        let line = trim(newline >= 0 ? substr(output, 0, newline) : output);
+        let parts = split(line, /[ \t\r\n]+/);
+        if (length(parts) > 0)
+            sing_box_banner_identity_cache = as_string(parts[0]);
+    }
+    return sing_box_banner_identity_cache;
+}
+
 function sing_box_marker_is(value) {
     return file_first_line(SB_VARIANT_STATE_FILE) == as_string(value);
 }
+
+function sing_box_marker_is_tachyon_core() {
+    return sing_box_marker_is("tachyon-core");
+}
+
+function sing_box_banner_is_tachyon_core() {
+    return sing_box_banner_identity() == "tachyon-core";
+}
+
 
 function sing_box_version_state() {
     return file_first_line(SB_VERSION_STATE_FILE);
@@ -191,7 +228,7 @@ function sing_box_restore_variant_marker(variant) {
 function sing_box_version() {
     if (!command_exists("sing-box"))
         return "";
-    if (sing_box_marker_is("extended-compressed") || sing_box_marker_is("lx"))
+    if (sing_box_marker_is("extended-compressed") || sing_box_marker_is("lx") || sing_box_marker_is("tachyon-core"))
         return sing_box_version_state();
     let v = parse_sing_box_version(sing_box_version_output());
     return match(v, /^[vV]?[0-9]+/) ? v : "";
@@ -204,6 +241,39 @@ function sing_box_version_is_extended(value) {
 function sing_box_version_is_lx(value) {
     let s = as_string(value);
     return s == "lx" || s == "sing-box-lx" || index(s, "-lx") >= 0;
+}
+
+// Tachyon's own core, a from-scratch implementation of the sing-box schema rather
+// than a fork of the Go binary. It identifies itself in the version string with a
+// "-tachyon.<n>" suffix, and that suffix is the only thing that distinguishes it:
+// it prints no build tags, so every capability that used to be probed from the
+// banner has to answer from this instead.
+//
+// Two consequences worth keeping straight, because they pull in opposite
+// directions:
+//
+//   - Its own version is NOT a sing-box version. `0.0.1-tachyon.0` is not older
+//     than sing-box 1.12, it is a different project that never had a release
+//     number in sing-box's series. Comparing the two numerically is meaningless
+//     and used to fail the minimum-version gate outright.
+//   - The suffix carries no schema level. Nothing in it says which sing-box
+//     release it tracks, so no field may be enabled on the strength of it.
+function sing_box_version_is_tachyon_core(value) {
+    let s = as_string(value);
+    if (index(s, "-tachyon.") >= 0 || s == "tachyon-core" || index(s, "tachyon-core") >= 0 || match(s, /^v?0\.0\./) != null)
+        return true;
+    // The marker is what the installer wrote when it put this binary in place,
+    // so it outranks any version string passed in. The banner is the ground
+    // truth about what is installed, and catches a binary that arrived without
+    // a marker - a manual copy, or a fresh install before the state is written.
+    return sing_box_marker_is_tachyon_core() || sing_box_banner_is_tachyon_core();
+}
+
+
+// True for any build that is neither upstream sing-box nor a named fork, so the
+// version gate can stop treating its number as comparable.
+function sing_box_version_is_foreign_core(version) {
+    return sing_box_version_is_tachyon_core(version);
 }
 
 // Answers "which variant is installed *right now*", and for that the marker file
@@ -224,21 +294,109 @@ function sing_box_version_looks_extended(value) {
 
 function sing_box_is_extended(value) {
     value = as_string(value);
-    if (sing_box_marker_is("extended-compressed") || sing_box_marker_is("extended") || sing_box_marker_is("lx"))
+    if (sing_box_marker_is("extended-compressed") || sing_box_marker_is("extended") || sing_box_marker_is("lx") || sing_box_marker_is("tachyon-core"))
         return true;
 
     value = value != "" ? value : sing_box_version();
-    return sing_box_version_is_extended(value) || sing_box_version_is_lx(value);
+    return sing_box_version_is_extended(value) || sing_box_version_is_lx(value) || sing_box_version_is_foreign_core(value);
 }
 
 function sing_box_is_lx(value) {
     value = as_string(value);
-    if (sing_box_version_is_lx(value))
+    if (sing_box_version_is_lx(value) || sing_box_version_is_foreign_core(value))
         return true;
-    if (sing_box_marker_is("lx"))
+    if (sing_box_marker_is("lx") || sing_box_marker_is("tachyon-core"))
         return true;
 
-    return sing_box_version_is_lx(value != "" ? value : sing_box_version());
+    return sing_box_version_is_lx(value != "" ? value : sing_box_version()) || sing_box_version_is_foreign_core(value != "" ? value : sing_box_version());
+}
+
+// ─── the capability model ────────────────────────────────────────────────────
+// The model itself lives in singbox/core_profile.uc: it is a pure lookup, and
+// requiring runtime.uc from a generator would run this file's command-line
+// dispatch on load and exit the process with a usage message. What is left here
+// is the part that knows about the machine - the marker file, the banner of the
+// installed binary - and it fills those in before delegating.
+// Which marker answers "what is installed".
+//
+// The marker file is the fallback, not the authority, and the order here is the
+// whole point of this function. A build that names itself - our core in either
+// its version suffix or its banner - outranks the file, because the file
+// describes what was installed *previously*: on a test router the binary had
+// been swapped for tachyon-core while /etc/tachyon/sing-box-variant still read
+// "lx", and taking the file first handed a foreign core to the lx profile - a
+// wrong pin field, a wrong schema level, and no error anywhere.
+function sing_box_core_identity_marker(build, given) {
+    let from_version = core_profile.profile_by_version(build);
+    if (from_version != "")
+        return from_version;
+
+    let identity = sing_box_banner_identity();
+    if (identity == "tachyon-core")
+        return "tachyon-core";
+
+    let marker = as_string(given);
+    return marker != "" ? marker : file_first_line(SB_VARIANT_STATE_FILE);
+}
+
+// The version of the installed binary, asked of the binary itself whenever it
+// answers.
+//
+// sing_box_version() reads the version state file whenever the marker claims lx
+// or extended-compressed. That is right for those forks, which do not always
+// name themselves, and wrong for a marker left behind by a package swap: on a
+// test router the marker still read "lx" after the binary had become tachyon-core,
+// so sing_box_version() answered "1.14.2-lx.12" and the stale file, not the binary
+// on disk, decided what was installed.
+function sing_box_core_installed_version() {
+    if (command_exists("sing-box")) {
+        let parsed = parse_sing_box_version(sing_box_version_output());
+        if (as_string(parsed) != "")
+            return as_string(parsed);
+    }
+    return sing_box_version();
+}
+
+function sing_box_core_resolve(version, marker) {
+    let build = as_string(version == null || version == "" ? sing_box_core_installed_version() : version);
+    return {
+        version: build,
+        marker: sing_box_core_identity_marker(build, marker)
+    };
+}
+
+function sing_box_core_profile(version, marker) {
+    let resolved = sing_box_core_resolve(version, marker);
+    return core_profile.profile(resolved.version, resolved.marker);
+}
+
+function sing_box_core_profile_data(profile) {
+    return core_profile.profile_data(profile);
+}
+
+function sing_box_core_pin_field(version, marker) {
+    let resolved = sing_box_core_resolve(version, marker);
+    return core_profile.pin_field(resolved.version, resolved.marker);
+}
+
+function sing_box_core_has_1_14(version, marker) {
+    let resolved = sing_box_core_resolve(version, marker);
+    return core_profile.has_1_14(resolved.version, resolved.marker);
+}
+
+function sing_box_core_has_1_15(version, marker) {
+    let resolved = sing_box_core_resolve(version, marker);
+    return core_profile.has_1_15(resolved.version, resolved.marker);
+}
+
+function sing_box_core_protocols(version, marker) {
+    let resolved = sing_box_core_resolve(version, marker);
+    return core_profile.protocols(resolved.version, resolved.marker);
+}
+
+function sing_box_core_supports_protocol(protocol, version, marker) {
+    let resolved = sing_box_core_resolve(version, marker);
+    return core_profile.supports_protocol(protocol, resolved.version, resolved.marker);
 }
 
 function output_has_build_tag(output, tag) {
@@ -252,46 +410,133 @@ function output_has_build_tag(output, tag) {
     return false;
 }
 
-function sing_box_supports_tailscale(version, version_output) {
-    version = as_string(version);
-    version_output = as_string(version_output);
+// xhttp and tailscale are build-tag probes on upstream, which prints them, and a
+// flat yes on the forks, which do not. Our own core implements xhttp but prints
+// no build tag, so the probe alone answers "no" and every xhttp node is dropped
+// from a subscription - which is why the answer is a profile field, not a probe.
+// The interpretation lives in core_profile.flag(); what is left here is the
+// machine part - a null answer means the question needs the installed binary's
+// banner, and only this module may run it.
+function sing_box_core_flag(version, marker, field, tag, version_output) {
+    let resolved = sing_box_core_resolve(version, marker);
+    let answer = core_profile.flag(resolved.version, resolved.marker, field, tag, version_output);
+    if (answer != null)
+        return answer;
+    return output_has_build_tag(sing_box_version_output(), tag);
+}
 
-    if (sing_box_marker_is("extended-compressed") || sing_box_marker_is("lx"))
-        return true;
-    if (sing_box_is_extended(version) || sing_box_is_lx(version))
-        return true;
-    if (version_output != "")
-        return output_has_build_tag(version_output, "with_tailscale");
-    return output_has_build_tag(sing_box_version_output(), "with_tailscale");
+// The whole answer for one core, in a shape the interface and the diagnostics can
+// read without re-deriving any of it. version_output is the caller's already-read
+// `sing-box version` banner: a string (empty or not) means the caller has asked
+// the binary already and nothing here may ask again - the compressed build is a
+// self-extracting stub and the lx build may have no runtime to run it with. Only
+// leaving the argument off lets this function probe the installed binary itself.
+function sing_box_core_capabilities(version, marker, version_output) {
+    let output = version_output == null ? null : as_string(version_output);
+    if (output != null && sing_box_banner_identity_cache == null) {
+        let first = trim(split(output, "\n")[0] || "");
+        let parts = split(first, /[ \t\r\n]+/);
+        sing_box_banner_identity_cache = length(parts) > 0 ? as_string(parts[0]) : "";
+    }
+
+    let resolved = sing_box_core_resolve(version, marker);
+    let build = resolved.version;
+    let field = core_profile.pin_field(build, resolved.marker);
+    let protocols = core_profile.protocols(build, resolved.marker);
+    let inbounds = core_profile.inbounds(build, resolved.marker);
+
+    let tailscale;
+    let xhttp;
+    if (output != null) {
+        let tail_flag = core_profile.flag(build, resolved.marker, "tailscale", "with_tailscale", output);
+        let xhttp_flag = core_profile.flag(build, resolved.marker, "xhttp", "with_xhttp", output);
+        tailscale = (tail_flag == null ? false : tail_flag) ? 1 : 0;
+        xhttp = (xhttp_flag == null ? false : xhttp_flag) ? 1 : 0;
+    }
+    else {
+        tailscale = sing_box_core_flag(build, marker, "tailscale", "with_tailscale", "") ? 1 : 0;
+        xhttp = sing_box_core_flag(build, marker, "xhttp", "with_xhttp", "") ? 1 : 0;
+    }
+
+    // The table answers "can this profile ever speak it", but upstream carries
+    // tailscale only when the binary was built with the tag - so the list is
+    // corrected against the actual build before the missing-list is derived.
+    if (!tailscale) {
+        let filtered = [];
+        for (let item in protocols)
+            if (item != "tailscale")
+                push(filtered, item);
+        protocols = filtered;
+    }
+    return {
+        profile: core_profile.profile(build, resolved.marker),
+        version: build,
+        marker: resolved.marker,
+        pin_field: field,
+        cert_pin: field != "",
+        schema_1_14: sing_box_core_has_1_14(build, marker) ? 1 : 0,
+        schema_1_15: sing_box_core_has_1_15(build, marker) ? 1 : 0,
+        xhttp,
+        tailscale,
+        foreign_series: sing_box_core_profile_data(sing_box_core_profile(build, marker)).foreign_series ? 1 : 0,
+        protocols,
+        inbounds,
+        // What this core cannot do out of the protocols and inbound kinds Tachyon
+        // knows, so the interface can name the gap instead of dropping a section
+        // silently.
+        missing_protocols: core_profile.missing_protocols(protocols),
+        missing_inbounds: core_profile.missing_inbounds(inbounds)
+    };
+}
+
+
+function sing_box_supports_tailscale(version, version_output) {
+    return sing_box_core_flag(as_string(version), "", "tailscale", "with_tailscale", as_string(version_output));
 }
 
 function sing_box_supports_xhttp(version, version_output) {
-    version = as_string(version);
-    version_output = as_string(version_output);
-
-    if (sing_box_marker_is("extended-compressed") || sing_box_marker_is("lx"))
-        return true;
-    if (sing_box_is_extended(version) || sing_box_is_lx(version))
-        return true;
-    if (version_output != "")
-        return output_has_build_tag(version_output, "with_xhttp");
-    return output_has_build_tag(sing_box_version_output(), "with_xhttp");
+    return sing_box_core_flag(as_string(version), "", "xhttp", "with_xhttp", as_string(version_output));
 }
 
 function sing_box_supports_cert_pin(version) {
     version = as_string(version);
-    // tls.certificate_sha256 was added upstream in 1.15.0 and is a question of
-    // version only, not of build. Verified on the real binaries: stock 1.14.2 and
-    // 1.14.2-lx.8 both reject it with "unknown field". sing-box-lx used to be
-    // excluded by name here, on the assumption that it would never gain the
-    // field - it tracks upstream, so that would have cost lx the feature for
-    // good once it passed 1.15 (issue #79).
+    // Pinning asks whether the build can carry a pin at all, and the field it
+    // wants is not the same everywhere. certificate_sha256 (whole DER, the value
+    // a proxy link's pcs carries) arrived upstream in 1.15.0 and is a question of
+    // version only. Verified on the real binaries: stock 1.14.2 and 1.14.2-lx.12
+    // both reject it with "unknown field".
+    //
+    // certificate_public_key_sha256 hashes the public key, so it is a different
+    // value and cannot stand in for a pcs - but it is what lx and our own core
+    // accept, and the generator writes the field the build understands. Both
+    // therefore support pinning, and the exclusion that used to sit here (issue
+    // #79, added because the core rejects certificate_sha256) is gone: it turned
+    // "which field" into "no feature".
     if (version == "" && command_exists("sing-box")) {
         if (sing_box_marker_is("extended-compressed"))
             version = sing_box_version_state();
         else
             version = sing_box_version();
     }
+
+    // lx carries no certificate_sha256 and accepts the public-key field instead,
+    // which is a field choice the generator makes. Verified on the real binary:
+    // 1.14.2-lx.12 rejects certificate_sha256 with "unknown field".
+    //
+    // Our own core has to be named here rather than left to the version rule:
+    // "0.0.1-tachyon.0" is below 1.15 by any numeric reading, and it does carry
+    // the field - it was added to its TLS allowlist together with the pinning
+    // itself. Reading the version here would switch the feature off for the one
+    // build that has it.
+    //
+    // Matched on the version suffix, not on the bare variant name: "sing-box-lx"
+    // alone carries no version to judge (and contains "-lx" itself, so a plain
+    // substring test would match it), and the marker file is the authority for
+    // what is actually installed.
+    if (sing_box_version_is_tachyon_core(version) || sing_box_marker_is_tachyon_core() ||
+        sing_box_marker_is("lx") || match(version, /^[0-9]+\.[0-9]+.*-lx/) != null)
+        return true;
+
     let m = match(version, /^v?([0-9]+)\.([0-9]+)/);
     if (m) {
         let major = int(m[1]);
@@ -335,6 +580,8 @@ function sing_box_is_tiny(version, version_output) {
 function sing_box_variant() {
     let version = "";
 
+    if (sing_box_marker_is("tachyon-core"))
+        return "tachyon-core";
     if (sing_box_marker_is("lx"))
         return "lx";
     if (sing_box_marker_is("extended-compressed"))
@@ -343,6 +590,10 @@ function sing_box_variant() {
         return "not-installed";
 
     version = sing_box_version();
+    // Before the upstream forks: this binary claims the schema, it is not a fork
+    // of the Go one, so it must not be reported as "stable".
+    if (sing_box_version_is_tachyon_core(version) || sing_box_marker_is_tachyon_core())
+        return "tachyon-core";
     if (sing_box_is_lx(version))
         return "lx";
     if (sing_box_is_extended(version))
@@ -380,12 +631,6 @@ function uci_get_option(config, section, key) {
     return trim(uci_core.get(uci_path(config, section, key)));
 }
 
-function ensure_sing_box_main_section() {
-    if (uci_core.exists("sing-box.main"))
-        return true;
-    return uci_core.set_section("sing-box.main", "sing-box");
-}
-
 function uci_set_option(config, section, key, value) {
     if (!uci_core.exists(as_string(config) + "." + as_string(section)))
         return false;
@@ -394,6 +639,26 @@ function uci_set_option(config, section, key, value) {
 
 function uci_commit(config) {
     return uci_core.commit(config);
+}
+
+function ensure_sing_box_main_section() {
+    let cfg_file = "/etc/config/sing-box";
+    if (!fs.stat(cfg_file)) {
+        let dir = fs.stat("/etc/config");
+        if (!dir || dir.type != "directory")
+            fs.mkdir("/etc/config", 0755);
+        write_file(cfg_file, "");
+    }
+    if (uci_core.exists("sing-box.main"))
+        return true;
+    if (!uci_core.set_section("sing-box.main", "sing-box"))
+        return false;
+    uci_set_option("sing-box", "main", "workdir", "/usr/share/sing-box");
+    uci_set_option("sing-box", "main", "conffile", "/etc/sing-box/config.json");
+    uci_set_option("sing-box", "main", "user", "root");
+    uci_set_option("sing-box", "main", "log_stderr", "1");
+    uci_commit("sing-box");
+    return true;
 }
 
 function owner_pid() {
@@ -424,6 +689,7 @@ function managed_service_text() {
         "    [ \"$enabled\" -eq \"1\" ] || return 0\n\n" +
         "    config_get config_file \"main\" \"conffile\" \"/etc/sing-box/config.json\"\n" +
         "    config_get working_directory \"main\" \"workdir\" \"/usr/share/sing-box\"\n" +
+        "    [ -d \"$working_directory\" ] || mkdir -p \"$working_directory\"\n" +
         "    config_get_bool log_stderr \"main\" \"log_stderr\" \"1\"\n\n" +
         "    procd_open_instance\n" +
         "    procd_set_param command \"$PROG\" run -c \"$config_file\" -D \"$working_directory\"\n" +
@@ -431,7 +697,7 @@ function managed_service_text() {
         "    procd_set_param stderr \"$log_stderr\"\n" +
         "    procd_set_param limits core=\"unlimited\"\n" +
         "    procd_set_param limits nofile=\"1000000 1000000\"\n" +
-        "    procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\"\n" +
+        "    procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\"\n" +
         "    procd_set_param term_timeout 15\n" +
         "    procd_set_param respawn\n" +
         "    procd_close_instance\n" +
@@ -490,6 +756,14 @@ function configure_service() {
 
     if (!ensure_sing_box_main_section())
         exit(1);
+
+    let workdir = uci_get_option("sing-box", "main", "workdir") || "/usr/share/sing-box";
+    if (!fs.stat(workdir)) {
+        let parent = "/usr/share";
+        if (!fs.stat(parent))
+            fs.mkdir(parent, 0755);
+        fs.mkdir(workdir, 0755);
+    }
 
     let changed = false;
     if (uci_get_option("sing-box", "main", "enabled") != "1") {
@@ -921,73 +1195,115 @@ function ensure_local_rulesets_exist(temp_config) {
 // ucode - the undefined call crashed init_config on the first rejected field and
 // took the whole start down with it.
 function repair_outbound_field(temp_config, reason) {
-    let m = match(as_string(reason), /outbounds\[(\d+)\]\.(\w+): json: unknown field/);
-    if (!m || !verifier.repair_unknown_outbound_field(temp_config, reason))
+    if (!verifier.repair_unknown_outbound_field(temp_config, reason))
         return false;
-    let bad_index = int(m[1]);
-    log_message("Installed sing-box does not support outbound field '" + m[2] +
-        "' on outbound " + (bad_index >= 0 ? sprintf("%d", bad_index) : "?") +
-        "; retrying without it there only", "warn");
+    let m = match(as_string(reason), /outbounds\[(\d+)\]\.(\w+): json: unknown field/);
+    if (m) {
+        let bad_index = int(m[1]);
+        log_message("Installed sing-box does not support outbound field '" + m[2] +
+            "' on outbound " + (bad_index >= 0 ? sprintf("%d", bad_index) : "?") +
+            "; retrying without it there only", "warn");
+    } else {
+        log_message("Installed sing-box does not support field reported in '" + reason + "'; retrying without it", "warn");
+    }
     return true;
 }
 
-function init_config(populate_nft, caches_prepared, no_refresh) {
-    let settings = uci_settings();
-    let config_path = option(settings, "config_path", "");
-    if (config_path == "") {
-        log_message("sing-box config path is empty. Aborted.", "fatal");
-        exit(1);
+// --- section quarantine ------------------------------------------------------
+//
+// A generated config that sing-box refuses to load must not take the whole
+// proxy down: the runtime isolates the offending section, regenerates without
+// it and starts with the rest, leaving the error visible to the UI in
+// /var/run/tachyon/section-errors.json. Only failures that sing-box itself
+// attributes to an outbound/endpoint/inbound/rule-set tag get quarantined -
+// tags carry the owning section name as their prefix, and section names are
+// [A-Za-z0-9_]+ (valid_section_name in the generator), so the substring before
+// the first "-" or "/" identifies the owner. A failure that cannot be
+// attributed keeps the old fatal behaviour: guessing here would drop random
+// sections and still leave the user without a proxy.
+
+const SECTION_ERRORS_FILE = getenv("TACHYON_SECTION_ERRORS_FILE") || "/var/run/tachyon/section-errors.json";
+
+function section_exists(name) {
+    name = as_string(name || "");
+    return name != "" && uci_core.exists(CONFIG_NAME + "." + name);
+}
+
+function section_from_tag(tag) {
+    let m = match(as_string(tag || ""), /^([A-Za-z0-9_]+)[-\/]/);
+    return m ? m[1] : "";
+}
+
+// The runtime keeps the quarantine map up to date for the UI. The file lives
+// in /var/run (tmpfs), never on flash; write_json_file's unchanged-content
+// guard keeps repeat writes silent.
+function write_section_errors(quarantined) {
+    let errors = {};
+    for (let name in quarantined)
+        errors[name] = as_string(quarantined[name] || "");
+    if (length(errors) == 0) {
+        remove_file(SECTION_ERRORS_FILE);
+        return;
+    }
+    common.write_json_file(SECTION_ERRORS_FILE, errors);
+}
+
+// When generation itself dies on a section (runtime_generate_unsupported), the
+// generator names the section in a tachyon-section-error:<name>:<reason> line
+// before exiting 2.
+function section_from_generator_log(log_path) {
+    let text = as_string(fs.readfile(log_path) || "");
+    let m = match(text, /tachyon-section-error:([A-Za-z0-9_]+):/);
+    return m ? m[1] : "";
+}
+
+function config_item_tag(config, list_name, index) {
+    let list = type(config) == "object" ? config[list_name] : null;
+    if (type(list) != "array")
+        return null;
+    let i = int(index);
+    if (i < 0 || i >= length(list) || type(list[i]) != "object")
+        return null;
+    return list[i].tag;
+}
+
+// Maps a sing-box check failure to the section that produced the blamed
+// element. Returns "" when the failure is not attributable to a section
+// (global settings, inbounds of the service itself, unparseable output).
+function section_from_check_reason(reason, config_path) {
+    reason = as_string(reason || "");
+    let tag = null;
+
+    let m = match(reason, /(outbounds|endpoints|inbounds)\[(\d+)\]/);
+    if (m)
+        tag = config_item_tag(common.read_json_file(config_path), m[1], m[2]);
+
+    if (tag == null) {
+        let rs = match(reason, /rule_set\[(\d+)\]/);
+        if (rs) {
+            let cfg = common.read_json_file(config_path);
+            let list = type(cfg) == "object" && type(cfg.route) == "object" ? cfg.route.rule_set : null;
+            let i = int(rs[1]);
+            if (type(list) == "array" && i >= 0 && i < length(list) && type(list[i]) == "object")
+                tag = list[i].tag;
+        }
     }
 
-    // Cleanup stale temp config files from previous failed runs
-    try {
-        let stale = trim(command_output_from_args([ "find", "/tmp", "-maxdepth", "1", "-name", "config.json.*.tmp.*", "-mmin", "+5", "-type", "f" ]));
-        for (let path in split(stale, "\n"))
-            if (trim(path) != "") remove_file(trim(path));
-    }
-    catch (e) {
-        // Housekeeping for temp files left by earlier failed runs. Failing here
-        // leaves a few stale files in /tmp and must not stop the start.
+    if (tag == null) {
+        let tm = match(reason, /(missing|unknown) outbound tag: *([-A-Za-z0-9_/]+)/);
+        if (tm)
+            tag = tm[2];
     }
 
-    let mwan3_active = module_success([ LIB_DIR + "/config/validator.uc", "mwan3-is-active" ]);
-    let output_interface = option(settings, "output_network_interface", "");
-    if (mwan3_active && output_interface != "")
-        log_message("mwan3 is active and Output Network Interface is set to '" + output_interface + "'; sing-box egress is pinned to this interface", "warn");
-    else if (mwan3_active)
-        log_message("mwan3 is active; disabling sing-box auto_detect_interface so mwan3 can control egress routing", "warn");
+    let name = section_from_tag(tag);
+    return section_exists(name) ? name : "";
+}
 
-    let deferred_sections = prepare_subscription_caches(caches_prepared, no_refresh);
-    if (deferred_sections == null)
-        exit(1);
-
-    let temp_config = temp_path();
-    let runtime_log = temp_path();
-    if (temp_config == "" || runtime_log == "") {
-        remove_files([ temp_config, runtime_log ]);
-        exit(1);
-    }
-
-    let generate_status = command_status(
-        module_command([
-            LIB_DIR + "/singbox/generator.uc",
-            "generate-config",
-            temp_config,
-            service_listen_address_value(settings),
-            mwan3_active ? "1" : "0",
-            sing_box_supports_xhttp(sing_box_version()) ? "1" : "0",
-            deferred_sections
-        ]) + " >" + shell_quote(runtime_log) + " 2>&1"
-    );
-    if (generate_status != 0) {
-        let reason = generator_failure_reason(runtime_log, generate_status);
-        log_message("Failed to generate sing-box configuration: " + reason, "fatal");
-        log_file_lines(runtime_log, "debug", "sing-box config generator output: ");
-        remove_files([ temp_config, runtime_log ]);
-        exit(1);
-    }
-    log_file_lines(runtime_log, "warn", "sing-box config generator: ");
-
+// Runs sing-box check and applies the known graceful-degradation repairs
+// (stripping fields older builds reject) until either the config passes or
+// nothing else can be stripped. Extracted from init_config so the quarantine
+// loop can call it once per attempt without re-running the repairs inline.
+function check_with_field_repairs(temp_config, runtime_log) {
     ensure_local_rulesets_exist(temp_config);
     let check_result = sing_box_check(temp_config, runtime_log);
     while (check_result.status != 0) {
@@ -1055,6 +1371,36 @@ function init_config(populate_nft, caches_prepared, no_refresh) {
             }
         }
         else {
+            // Nested TLS container fields, e.g. outbounds[N].tls.reality.support_x25519mlkem768.
+            // The other patterns above all match a single top-level key, so this
+            // class of error used to reach the bottom of the loop with nothing
+            // stripped: the check failed, the retry gave up, and one node with an
+            // unknown REALITY field took the whole proxy down instead of dropping
+            // that node. The dotted path is captured whole and deleted at each
+            // level, the same way the endpoints path below already does for
+            // `amnezia`.
+            let tls_field_m = match(check_result.reason, /(outbounds|inbounds)\[\d+\]\.tls\.(\w+)\.(\w+): json: unknown field/);
+            if (tls_field_m) {
+                let container = tls_field_m[2];
+                let unknown_field = tls_field_m[3];
+                log_message("Installed sing-box does not support tls." + container + "." + unknown_field + " (added in a later release); dropping it and retrying", "warn");
+                let cfg_text = as_string(fs.readfile(temp_config) || "");
+                let cfg = length(cfg_text) > 0 ? json(cfg_text) : null;
+                if (type(cfg) == "object") {
+                    for (let list in [ cfg.outbounds, cfg.inbounds ]) {
+                        if (type(list) != "array")
+                            continue;
+                        for (let item in list) {
+                            if (type(item) != "object" || type(item.tls) != "object")
+                                continue;
+                            if (type(item.tls[container]) == "object")
+                                delete item.tls[container][unknown_field];
+                        }
+                    }
+                    write_file(temp_config, sprintf("%J", cfg));
+                    stripped = true;
+                }
+            }
             let ep_field_m = match(check_result.reason, /endpoints\[\d+\]\.(\w+): json: unknown field/);
             let out_field_m = match(check_result.reason, /outbounds\[(\d+)\]\.(\w+): json: unknown field/);
             if (ep_field_m) {
@@ -1163,12 +1509,94 @@ function init_config(populate_nft, caches_prepared, no_refresh) {
                     stripped = true;
                 }
             }
+            else if (match(check_result.reason, /json: unknown field/)) {
+                if (repair_outbound_field(temp_config, check_result.reason))
+                    stripped = true;
+            }
         }
         if (!stripped)
             break;
         check_result = sing_box_check(temp_config, runtime_log);
     }
-    if (check_result.status != 0) {
+    return check_result;
+}
+
+function init_config(populate_nft, caches_prepared, no_refresh) {
+    let settings = uci_settings();
+    let config_path = option(settings, "config_path", "");
+    if (config_path == "") {
+        log_message("sing-box config path is empty. Aborted.", "fatal");
+        exit(1);
+    }
+
+    // Cleanup stale temp config files from previous failed runs
+    try {
+        let stale = trim(command_output_from_args([ "find", "/tmp", "-maxdepth", "1", "-name", "config.json.*.tmp.*", "-mmin", "+5", "-type", "f" ]));
+        for (let path in split(stale, "\n"))
+            if (trim(path) != "") remove_file(trim(path));
+    }
+    catch (e) {
+        // Housekeeping for temp files left by earlier failed runs. Failing here
+        // leaves a few stale files in /tmp and must not stop the start.
+    }
+
+    let mwan3_active = module_success([ LIB_DIR + "/config/validator.uc", "mwan3-is-active" ]);
+    let output_interface = option(settings, "output_network_interface", "");
+    if (mwan3_active && output_interface != "")
+        log_message("mwan3 is active and Output Network Interface is set to '" + output_interface + "'; sing-box egress is pinned to this interface", "warn");
+    else if (mwan3_active)
+        log_message("mwan3 is active; disabling sing-box auto_detect_interface so mwan3 can control egress routing", "warn");
+
+    let deferred_sections = prepare_subscription_caches(caches_prepared, no_refresh);
+    if (deferred_sections == null)
+        exit(1);
+
+    let temp_config = temp_path();
+    let runtime_log = temp_path();
+    if (temp_config == "" || runtime_log == "") {
+        remove_files([ temp_config, runtime_log ]);
+        exit(1);
+    }
+
+    // Quarantine loop: each iteration either yields a config sing-box accepts
+    // or isolates one more section that both the generator and sing-box check
+    // could attribute by name. 16 bounds the loop for pathological cases; in
+    // practice every pass quarantines at least one section or breaks out.
+    let quarantined = {};
+    let check_result = { status: 1, reason: "configuration was not generated" };
+    for (let attempt = 0; attempt < 16; attempt++) {
+        let generate_status = command_status(
+            module_command([
+                LIB_DIR + "/singbox/generator.uc",
+                "generate-config",
+                temp_config,
+                service_listen_address_value(settings),
+                mwan3_active ? "1" : "0",
+                sing_box_supports_xhttp(sing_box_version()) ? "1" : "0",
+                deferred_sections,
+                join(",", keys(quarantined))
+            ]) + " >" + shell_quote(runtime_log) + " 2>&1"
+        );
+        if (generate_status != 0) {
+            let reason = generator_failure_reason(runtime_log, generate_status);
+            let section = section_from_generator_log(runtime_log);
+            if (section != "" && quarantined[section] == null && section_exists(section)) {
+                log_message("Section '" + section + "' failed to generate: " + reason +
+                    ". Not loading it; the rest of the configuration starts normally", "warn");
+                quarantined[section] = reason;
+                continue;
+            }
+            log_message("Failed to generate sing-box configuration: " + reason, "fatal");
+            log_file_lines(runtime_log, "debug", "sing-box config generator output: ");
+            remove_files([ temp_config, runtime_log ]);
+            exit(1);
+        }
+        log_file_lines(runtime_log, "warn", "sing-box config generator: ");
+
+        check_result = check_with_field_repairs(temp_config, runtime_log);
+        if (check_result.status == 0)
+            break;
+
         // Say which of the two it was before blaming the configuration.
         let bin_problem = sing_box_binary_problem(sing_box_binary_path());
         if (bin_problem == "" && sing_box_check_blamed_the_binary(check_result.reason))
@@ -1177,11 +1605,23 @@ function init_config(populate_nft, caches_prepared, no_refresh) {
             log_message("Cannot verify the generated configuration: " + bin_problem +
                 ". This is not a configuration problem. The raw output was: " + check_result.reason, "fatal");
             remove_files([ temp_config, runtime_log ]);
+            exit(1);
         }
-        else {
+
+        let section = section_from_check_reason(check_result.reason, temp_config);
+        if (section == "" || quarantined[section] != null) {
             log_message("Generated sing-box configuration is invalid: " + check_result.reason + ". Aborted.", "fatal");
             remove_files([ temp_config, runtime_log ]);
+            exit(1);
         }
+        log_message("sing-box rejected the configuration at section '" + section + "' (" + check_result.reason +
+            "). Not loading it; the rest of the configuration starts normally", "warn");
+        quarantined[section] = check_result.reason;
+    }
+    write_section_errors(quarantined);
+    if (check_result.status != 0) {
+        log_message("Generated sing-box configuration is invalid: " + check_result.reason + ". Aborted.", "fatal");
+        remove_files([ temp_config, runtime_log ]);
         exit(1);
     }
 
@@ -1228,6 +1668,10 @@ else if (mode == "check-config-fixture") {
         print(result.reason, "\n");
     exit(result.status);
 }
+else if (mode == "quarantine-attribution-fixture")
+    print(section_from_check_reason(ARGV[1] || "", ARGV[2] || ""), "\n");
+else if (mode == "quarantine-marker-fixture")
+    print(section_from_generator_log(ARGV[1] || ""), "\n");
 else if (mode == "generator-failure-reason-fixture")
     print(generator_failure_reason(ARGV[1] || "", int(ARGV[2] || "1")), "\n");
 else if (mode == "outbound-repair-fixture") {
@@ -1289,12 +1733,37 @@ else if (mode == "version-looks-extended")
     exit(sing_box_version_looks_extended(ARGV[1]) ? 0 : 1);
 else if (mode == "is-lx")
     exit(sing_box_is_lx(ARGV[1]) ? 0 : 1);
+else if (mode == "is-foreign-core")
+    exit(sing_box_version_is_foreign_core(ARGV[1]) ? 0 : 1);
+else if (mode == "supports-xhttp")
+    exit(sing_box_supports_xhttp(ARGV[1], ARGV[2]) ? 0 : 1);
 else if (mode == "is-tiny")
     exit(sing_box_is_tiny(ARGV[1], ARGV[2]) ? 0 : 1);
 else if (mode == "supports-tailscale")
     exit(sing_box_supports_tailscale(ARGV[1], ARGV[2]) ? 0 : 1);
 else if (mode == "supports-cert-pin")
     exit(sing_box_supports_cert_pin(ARGV[1]) ? 0 : 1);
+else if (mode == "core-profile")
+    print(sing_box_core_profile(ARGV[1], ARGV[2]), "\n");
+else if (mode == "core-pin-field") {
+    let field = sing_box_core_pin_field(ARGV[1], ARGV[2]);
+    print(field, "\n");
+    exit(field != "" ? 0 : 1);
+}
+else if (mode == "core-has-1-14")
+    exit(sing_box_core_has_1_14(ARGV[1], ARGV[2]) ? 0 : 1);
+else if (mode == "core-has-1-15")
+    exit(sing_box_core_has_1_15(ARGV[1], ARGV[2]) ? 0 : 1);
+else if (mode == "core-protocols")
+    print(sprintf("%J\n", sing_box_core_protocols(ARGV[1], ARGV[2])));
+else if (mode == "core-supports-protocol")
+    exit(sing_box_core_supports_protocol(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
+else if (mode == "core-inbounds")
+    print(sprintf("%J\n", core_profile.inbounds(sing_box_core_resolve(ARGV[1], ARGV[2]).version, sing_box_core_resolve(ARGV[1], ARGV[2]).marker)));
+else if (mode == "core-supports-inbound")
+    exit(core_profile.supports_inbound(ARGV[1], sing_box_core_resolve(ARGV[2], ARGV[3]).version, sing_box_core_resolve(ARGV[2], ARGV[3]).marker) ? 0 : 1);
+else if (mode == "core-capabilities")
+    print(sprintf("%J\n", sing_box_core_capabilities(ARGV[1], ARGV[2], ARGV[3])));
 else if (mode == "variant")
     print(sing_box_variant(), "\n");
 else {

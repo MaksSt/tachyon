@@ -2,6 +2,7 @@
 
 let fs = require("fs");
 let common = require("core.common");
+let core_profile = require("singbox.core_profile");
 let core_ip = require("core.ip");
 let uci_core = require("core.uci");
 let runtime_constants = require("singbox.constants");
@@ -61,20 +62,22 @@ let url_query_params = runtime_url.query_params;
 
 const CONFIG_NAME = "tachyon";
 
+function parse_name_set(raw) {
+    let res = {};
+    for (let s in split(as_string(raw || ""), /[ \t\r\n,]+/)) {
+        s = trim(s);
+        if (s != "")
+            res[s] = true;
+    }
+    return res;
+}
+
 function parse_deferred_sections(deferred_sections) {
     let raw = trim(as_string(deferred_sections || getenv("TACHYON_SUBSCRIPTION_DEFERRED_SECTIONS") || ""));
     if (raw == "" && fs.stat(TACHYON_SUBSCRIPTION_DEFERRED_SECTIONS_FILE) != null) {
         raw = trim(as_string(fs.readfile(TACHYON_SUBSCRIPTION_DEFERRED_SECTIONS_FILE)) || "");
     }
-    let res = {};
-    if (raw != "") {
-        for (let s in split(raw, /[ \t\r\n]+/)) {
-            s = trim(s);
-            if (s != "")
-                res[s] = true;
-        }
-    }
-    return res;
+    return parse_name_set(raw);
 }
 
 // UCI stores values written as '<b 0x...>' strings as binary, which when
@@ -115,6 +118,7 @@ let enabled_sections = null;
 let enabled_servers = null;
 let reserve_section_outbound_tags = null;
 let add_outbound_for_section = null;
+let add_group_urltest_outbounds = null;
 let add_service_route_rules = null;
 let add_route_for_section = null;
 let add_server_routes = null;
@@ -214,7 +218,13 @@ function uci_cursor() {
     return uci;
 }
 
+// Section-scoped failures must be attributable: the runtime quarantines the
+// named section and regenerates without it instead of losing the whole start.
+// A failure raised outside any section loop (ctx.current_section == null) is a
+// whole-config problem and keeps the old exit(2) semantics with no marker.
 function runtime_generate_unsupported(reason) {
+    if (ctx.current_section != null)
+        warn("tachyon-section-error:", ctx.current_section, ":", reason, "\n");
     warn(reason, "\n");
     exit(2);
 }
@@ -223,9 +233,6 @@ function valid_section_name(name) {
     return match(name, /^[A-Za-z0-9_]+$/);
 }
 
-function section_enabled(section) {
-    return bool_option(section, "enabled", true);
-}
 
 function runtime_settings() {
     if (runtime_settings_cache == null)
@@ -485,6 +492,7 @@ function tproxy_inbound_matcher() {
 }
 
 let cached_sb_version = null;
+let cached_sb_version_banner = null;
 
 // The version state file is written by the component action alone. Treating it as
 // the source of truth meant a sing-box replaced by hand - install.sh, opkg, a
@@ -507,6 +515,12 @@ function detect_sing_box_version() {
     if (cached_sb_version != null)
         return cached_sb_version;
 
+    let override = getenv("SB_VERSION_OVERRIDE");
+    if (override != null && trim(override) != "") {
+        cached_sb_version = trim(override);
+        return cached_sb_version;
+    }
+
     let state_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
 
     if (sing_box_live_version_probe_disabled()) {
@@ -527,7 +541,11 @@ function detect_sing_box_version() {
 // router is not left waiting. Two prefixes are tried because an earlier one may be
 // absent from PATH.
 try {
-    for (let base in [ "sing-box", "/usr/bin/sing-box" ]) {
+    let bases = [ "sing-box", "/usr/bin/sing-box" ];
+    let preflight = getenv("SB_PREFLIGHT_BINARY");
+    if (preflight && preflight != "")
+        unshift(bases, preflight);
+    for (let base in bases) {
         let pipe = fs.popen(common.bounded_command(base + " version 2>/dev/null", "6"), "r");
         if (pipe) {
             let out = pipe.read("all");
@@ -540,6 +558,7 @@ try {
             let found = common.parse_sing_box_version(out);
             if (found != "") {
                 cached_sb_version = found;
+                cached_sb_version_banner = as_string(out);
                 try {
                     let cur_disk = trim(fs.readfile(state_file) || "");
                     if (cur_disk != cached_sb_version)
@@ -560,7 +579,180 @@ try {
     return cached_sb_version;
 }
 
+// Tachyon's own core is not in sing-box's version series: it reports
+// "0.0.1-tachyon.0", and no numeric comparison against 1.14/1.15 says anything
+// about it. What does say something is the schema it implements, checked field
+// by field against the core's own validator (crates/core-config/src/validate.rs):
+// http_clients, route.default_http_client, dns.optimistic, store_dns,
+// buffer_size, flush_interval and certificate_sha256 are all present, so every
+// gate below opens. That is the opposite mistake to the one this gate exists to
+// prevent - the failure is a config carrying a field the core rejects, and
+// `sing-box check` refuses the whole file over one of them.
+// Does the binary on disk name itself as our core?
+//
+// Installed as /usr/bin/sing-box the core answers in the legacy shape, "sing-box
+// version v0.0.1-tachyon.0", and the suffix alone settles it. Run under its own
+// name it answers "tachyon-core 0.0.1" instead - a bare number carrying no fork
+// suffix, indistinguishable from a stock build of the same version - and then the
+// name in the banner is the only thing left to go on.
+function sing_box_banner_names_tachyon_core() {
+    let preflight = getenv("SB_PREFLIGHT_BINARY");
+    if (preflight && preflight != "") {
+        let pipe = fs.popen(common.bounded_command(preflight + " version 2>/dev/null", "6"), "r");
+        if (pipe) {
+            let banner = as_string(pipe.read("all"));
+            pipe.close();
+            let newline = index(banner, "\n");
+            let line = trim(newline >= 0 ? substr(banner, 0, newline) : banner);
+            if (line != "") {
+                let token = split(line, /[ \t\r\n]+/)[0];
+                return token == "tachyon-core";
+            }
+        }
+        return false;
+    }
+    if (cached_sb_version_banner == null) {
+        let banner = "";
+        for (let base in [ "sing-box", "/usr/bin/sing-box" ]) {
+            let pipe = fs.popen(common.bounded_command(base + " version 2>/dev/null", "6"), "r");
+            if (pipe) {
+                banner = as_string(pipe.read("all"));
+                pipe.close();
+                if (banner != "")
+                    break;
+            }
+        }
+        cached_sb_version_banner = banner;
+    }
+    let newline = index(cached_sb_version_banner, "
+");
+    let line = trim(newline >= 0 ? substr(cached_sb_version_banner, 0, newline) : cached_sb_version_banner);
+    if (line == "")
+        return false;
+    let token = split(line, /[ 	
+]+/)[0];
+    return token == "tachyon-core";
+}
+
+// How client traffic reaches the proxy.
+//
+//   socks  - a client points at 1080 and is proxied. Nothing on the router is
+//            touched, so nothing can break underneath a client.
+//   tproxy - transparent interception through nft. The default, and what every
+//            Tachyon install has always used.
+//   tun    - the core owns the routes. Nothing is intercepted: the kernel's own
+//            policy routing sends traffic into tun0.
+//
+// Anything else falls back to tproxy rather than refusing to start: a config
+// that comes up degraded beats a router that comes up with no proxy at all.
+function proxy_mode(settings) {
+    let mode = lc(trim(as_string(option(settings, "proxy_mode", "tproxy"))));
+    if (mode == "socks" || mode == "tproxy" || mode == "tun")
+        return mode;
+    return "tproxy";
+}
+
+// The tun inbound, or null when it is off, unusable, or unsupported by the core.
+//
+// Written only when the capability table says the core has a tun inbound. The
+// field set below is deliberately the intersection of what all of them accept:
+// the smoltcp stack in our core and the gVisor stack in the forks take the same
+// keys, so a config generated here survives a binary swap. Anything specific -
+// the route table 2022, the fwmark - belongs to the core's own auto_route and is
+// never written into the file.
+function tun_inbound(settings) {
+    if (proxy_mode(settings) != "tun")
+        return null;
+
+    if (!core_profile.supports_inbound("tun", detect_sing_box_version(), null)) {
+        warn("proxy_mode is 'tun' but this core has no tun inbound; falling back to tproxy\n");
+        return null;
+    }
+
+    let interface_name = trim(option(settings, "tun_interface", runtime_constants.TUN_INTERFACE));
+    if (interface_name == "")
+        interface_name = runtime_constants.TUN_INTERFACE;
+
+    let inet4 = trim(option(settings, "tun_inet4", runtime_constants.TUN_INET4_ADDRESS));
+    if (inet4 == "")
+        inet4 = runtime_constants.TUN_INET4_ADDRESS;
+
+    let mtu = int_option(settings, "tun_mtu", runtime_constants.TUN_MTU);
+    if (mtu < 576 || mtu > 65535)
+        mtu = runtime_constants.TUN_MTU;
+
+    let inbound = {
+        type: "tun",
+        tag: runtime_constants.TUN_INBOUND_TAG,
+        interface_name,
+        inet4_address: inet4,
+        mtu,
+        // auto_route is the whole point on a router: it is what puts the default
+        // route into table 2022 and leaves main alone, instead of Tachyon writing
+        // routes that would collide with whatever else the box is running.
+        auto_route: bool_option(settings, "tun_auto_route", true),
+        strict_route: bool_option(settings, "tun_strict_route", false),
+        // Full-cone UDP: without it a client that has been handed a real address
+        // by the userspace NAT still fails on replies from a second source port.
+        endpoint_independent_nat: bool_option(settings, "tun_endpoint_independent_nat", true),
+        stack: trim(option(settings, "tun_stack", "mixed")) || "mixed",
+        gso: bool_option(settings, "tun_gso", true),
+        sniff: bool_option(settings, "tun_sniff", true),
+        sniff_override_destination: bool_option(settings, "tun_sniff_override_destination", false)
+    };
+
+    let inet6 = trim(option(settings, "tun_inet6", runtime_constants.TUN_INET6_ADDRESS));
+    if (inet6 != "")
+        inbound.inet6_address = inet6;
+
+    return inbound;
+}
+
+function section_enabled(section) {
+    return bool_option(section, "enabled", true);
+}
+
+function is_tachyon_core_version(sb_version_val) {
+    if (sb_version_val == null || sb_version_val == "")
+        sb_version_val = detect_sing_box_version();
+    // The suffix is decisive when it is there.
+    if (core_profile.profile_by_version(as_string(sb_version_val)) != "")
+        return true;
+
+    // A recorded variant in state file (including SB_VARIANT_STATE_FILE during pre-flight)
+    // is explicit evidence: if set to anything other than tachyon-core (e.g. lx, extended),
+    // this is not tachyon-core.
+    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant";
+    let recorded_variant = trim(as_string(fs.readfile(sb_variant_file) || ""));
+    if (recorded_variant != "")
+        return recorded_variant == "tachyon-core";
+
+    // Any version with a non-upstream, non-tachyon-core profile (e.g. -lx, extended)
+    // is definitely not tachyon-core.
+    let prof = core_profile.profile(as_string(sb_version_val), "");
+    if (prof != "upstream" && prof != "tachyon-core")
+        return false;
+
+    // Otherwise only believe the banner when the version names nothing else: with
+    // an explicit override in hand, that override is the build being generated for
+    // and the binary on disk is not evidence about it.
+    let override = trim(as_string(getenv("SB_VERSION_OVERRIDE") || ""));
+    if (override != "" && prof == "upstream") {
+        let preflight = getenv("SB_PREFLIGHT_BINARY");
+        if (preflight && preflight != "")
+            return sing_box_banner_names_tachyon_core();
+        return false;
+    }
+
+    if (sing_box_banner_names_tachyon_core())
+        return true;
+
+    return false;
+}
+
 function is_sb_1_14_plus_detected(sb_version_val) {
+    if (is_tachyon_core_version(sb_version_val))
+        return true;
     if (sb_version_val == null || sb_version_val == "")
         sb_version_val = detect_sing_box_version();
     if (sb_version_val != "") {
@@ -575,8 +767,14 @@ function is_sb_1_14_plus_detected(sb_version_val) {
 }
 
 function is_sb_1_15_plus_detected(sb_version_val) {
+    if (is_tachyon_core_version(sb_version_val))
+        return true;
     if (sb_version_val == null || sb_version_val == "")
         sb_version_val = detect_sing_box_version();
+    let prof = core_profile.profile(as_string(sb_version_val), "");
+    let pdata = core_profile.profile_data(prof);
+    if (pdata && pdata.schema_1_15 == "no")
+        return false;
     if (sb_version_val != "") {
         let m = match(sb_version_val, /^v?([0-9]+)\.([0-9]+)/);
         if (m) {
@@ -599,23 +797,77 @@ function is_sing_box_lx_detected(sb_version_val) {
     return sb_variant_val == "lx" || sb_variant_val == "sing-box-lx";
 }
 
-function is_certificate_sha256_supported(sb_version_val) {
+// Tachyon's own core reports a version from its own series and prints no build
+// tags, so the -tachyon. suffix and the variant marker file are the only signals.
+function is_tachyon_core_detected(sb_version_val) {
+    return is_tachyon_core_version(sb_version_val);
+}
+
+// Which TLS field carries the pin, and "" when this build cannot pin at all.
+//
+// The field is not one thing renamed twice - the two names hash different
+// things. certificate_sha256 is over the whole DER certificate, which is what a
+// pcs value from a proxy link is; certificate_public_key_sha256 is over the
+// public key. Putting a certificate hash under the public-key field pins
+// something the server never presents, so the field has to be chosen, not
+// swapped.
+//
+// Verified on the real binaries: stock 1.14.2 and 1.14.2-lx.12 both reject
+// certificate_sha256 with "unknown field" and both accept
+// certificate_public_key_sha256. lx tracks upstream but does not carry the 1.15
+// field, so its version number says nothing either way - the marker decides.
+// Tachyon's own core is the same case one step further: the string
+// certificate_sha256 does not occur in its config crate at all, while
+// certificate_public_key_sha256 is in its TLS allowlist
+// (crates/core-config/src/validate.rs).
+function certificate_pin_field(sb_version_val) {
     if (sb_version_val == null || sb_version_val == "")
         sb_version_val = detect_sing_box_version();
-    // Purely a question of sing-box version, and nothing else. certificate_sha256
-    // (SHA-256 over the whole DER certificate, which is what a pcs value is) was
-    // added upstream in 1.15.0; before that the only pin field was
-    // certificate_public_key_sha256, which hashes the certificate PUBLIC KEY and
-    // is therefore a different value - it cannot stand in for a pcs.
-    //
-    // Verified against the real binaries: stock 1.14.2 and 1.14.2-lx.8 both
-    // reject certificate_sha256 with "unknown field" and both accept
-    // certificate_public_key_sha256. sing-box-lx is not a special case here, it
-    // just tracks upstream: exclude it by build and lx loses the field for good
-    // once it reaches 1.15.
+
+    // Our own core takes certificate_sha256, which is the field a proxy link's
+    // pcs actually is - so it gets it. The public-key field is the older one and
+    // hashes something else.
+    if (is_tachyon_core_detected(sb_version_val))
+        return "certificate_sha256";
+
+    if (is_sing_box_lx_detected(sb_version_val))
+        return "certificate_public_key_sha256";
+
     if (is_sb_1_15_plus_detected(sb_version_val))
-        return true;
-    return false;
+        return "certificate_sha256";
+
+    return "";
+}
+
+// Whether this build can carry a pin at all, under whichever field it accepts.
+// lx and our own core pass this on the public-key field; see
+// certificate_pin_field for why that is not a rename.
+function is_certificate_sha256_supported(sb_version_val) {
+    return certificate_pin_field(sb_version_val) != "";
+}
+
+const VERBOSE_LOG_PATH = "/tmp/sing-box/sing-box.log";
+
+function singbox_log_section(log_level, sb_version_val) {
+    if (log_level == "panic" && is_tachyon_core_detected(sb_version_val))
+        log_level = "fatal";
+
+    let section = {
+        disabled: false,
+        level: log_level,
+        timestamp: false
+    };
+
+    // Everything below warn produces a line per connection. Routed through
+    // procd's stderr into syslog, that fills the 128 KiB ring within minutes
+    // and evicts hostapd, dnsmasq and the actual errors we go looking for - the
+    // measured case was 744 of 771 buffered lines being sing-box INFO. Send the
+    // verbose levels to a file on tmpfs instead: the full log stays available
+    // for debugging while syslog keeps room for what it is for.
+    if (log_level == "info" || log_level == "debug" || log_level == "trace")
+        section.output = VERBOSE_LOG_PATH;
+
+    return section;
 }
 
 function base_config(settings, service_address, runtime_context) {
@@ -698,7 +950,14 @@ function base_config(settings, service_address, runtime_context) {
     for (let rule in dns_config.rules)
         push(dns_rules, rule);
     for (let rule in [
-        { action: "reject", query_type: [ "HTTPS", "SVCB" ] },
+        // HTTPS/SVCB records are how a client discovers DoH servers, so they
+        // must not be answered - but with NODATA, not REFUSED. sing-box's
+        // `reject` answers REFUSED unconditionally (dns/router.go has no rcode
+        // option on the action at all), and resolvers read REFUSED as the
+        // server refusing to serve: they retry, switch servers or mark the
+        // resolver dead (issue #118). `predefined` with NOERROR and no records
+        // is the same block, answered as "this name has no such record".
+        { action: "predefined", query_type: [ "HTTPS", "SVCB" ], rcode: "NOERROR" },
         { action: "reject", domain_suffix: "use-application-dns.net" },
         {
             action: "route",
@@ -724,11 +983,25 @@ function base_config(settings, service_address, runtime_context) {
         fakeip_server.inet6_range = runtime_constants.FAKEIP_INET6_RANGE;
     push(dns_servers, fakeip_server);
 
-    let inbounds = [
-        { type: "tproxy", tag: runtime_constants.TPROXY_INBOUND_TAG, listen: runtime_constants.TPROXY_INBOUND_ADDRESS, listen_port: runtime_constants.TPROXY_INBOUND_PORT, tcp_fast_open: true, udp_fragment: true }
-    ];
-    if (core_ip.ipv6_supported()) {
-        push(inbounds, { type: "tproxy", tag: runtime_constants.TPROXY_INBOUND6_TAG, listen: runtime_constants.TPROXY_INBOUND6_ADDRESS, listen_port: runtime_constants.TPROXY_INBOUND_PORT, tcp_fast_open: true, udp_fragment: true });
+// The transparent inbound exists only in tproxy mode. In socks mode there is
+    // a client-facing listener instead, and in tun mode the core owns the routes
+    // and a tproxy socket would only sit there unused.
+    let mode = proxy_mode(settings);
+    let inbounds = [];
+    if (mode == "tproxy") {
+        push(inbounds, { type: "tproxy", tag: runtime_constants.TPROXY_INBOUND_TAG, listen: runtime_constants.TPROXY_INBOUND_ADDRESS, listen_port: runtime_constants.TPROXY_INBOUND_PORT, tcp_fast_open: true, udp_fragment: true });
+        if (core_ip.ipv6_supported())
+            push(inbounds, { type: "tproxy", tag: runtime_constants.TPROXY_INBOUND6_TAG, listen: runtime_constants.TPROXY_INBOUND6_ADDRESS, listen_port: runtime_constants.TPROXY_INBOUND_PORT, tcp_fast_open: true, udp_fragment: true });
+    }
+    if (mode == "socks") {
+        push(inbounds, {
+            type: "mixed",
+            tag: runtime_constants.CLIENT_MIXED_INBOUND_TAG,
+            listen: option(settings, "socks_listen", runtime_constants.CLIENT_MIXED_INBOUND_ADDRESS),
+            listen_port: int_option(settings, "socks_port", runtime_constants.CLIENT_MIXED_INBOUND_PORT),
+            tcp_fast_open: true,
+            udp_fragment: true
+        });
     }
     push(inbounds, { type: "direct", tag: runtime_constants.DNS_INBOUND_TAG, listen: runtime_constants.DNS_INBOUND_ADDRESS, listen_port: runtime_constants.DNS_INBOUND_PORT });
     if (runtime_context.source_aware_dns) {
@@ -739,8 +1012,15 @@ function base_config(settings, service_address, runtime_context) {
             listen_port: runtime_constants.SOURCE_DNS_INBOUND_PORT
         });
     }
-    for (let inbound in dns_config.inbounds)
+for (let inbound in dns_config.inbounds)
         push(inbounds, inbound);
+
+    // The tun inbound sits after the dns ones so the ordering of what is already
+    // here does not move: anything reading the generated file by position keeps
+    // reading what it read before.
+    let tun = tun_inbound(settings);
+    if (tun != null)
+        push(inbounds, tun);
 
     let default_outbounds = [
         { type: "direct", tag: runtime_constants.DIRECT_OUTBOUND_TAG },
@@ -792,11 +1072,7 @@ function base_config(settings, service_address, runtime_context) {
     }
 
     let base_cfg = {
-        log: {
-            disabled: false,
-            level: log_level,
-            timestamp: false
-        },
+        log: singbox_log_section(log_level, sb_version_val),
         dns: dns_section,
         ntp: {},
         certificate: {},
@@ -1001,8 +1277,13 @@ function add_service_mixed_proxy(config, settings, sections) {
     let has_any_proxy = false;
     let default_proxy_tag = "";
     for (let s in sections) {
+        // A deferred or quarantined section contributes no outbound; picking it
+        // as the default target would leave the service-mixed route rule
+        // pointing at a tag that does not exist.
+        if (ctx.deferred_sections && ctx.deferred_sections[s[".name"]])
+            continue;
         let action = s.action || "";
-        if (s.enabled != "0" && (action == "connection" || action == "subscription" || action == "provider")) {
+        if (s.enabled != "0" && (action == "connection" || action == "subscription" || action == "provider" || action == "fptn" || action == "awg")) {
             has_any_proxy = true;
             if (default_proxy_tag == "")
                 default_proxy_tag = outbound_tag(s[".name"]);
@@ -1543,26 +1824,77 @@ function add_excluded_clients_route_rule(config, settings) {
     });
 }
 
+// Remove pin fields this build would reject, keeping the one it understands.
+//
+// This is not "strip pins when the build cannot pin": a config can carry
+// certificate_sha256 while the installed build only accepts
+// certificate_public_key_sha256, and an unknown field anywhere is a hard
+// rejection that takes the whole config down, not just this node. So the
+// question is which field survives, and the other one goes.
 function strip_certificate_pins_if_unsupported(config) {
-    if (is_certificate_sha256_supported())
+    let keep = certificate_pin_field();
+    let drop = [];
+    if (keep == "")
+        drop = [ "certificate_sha256", "certificate_public_key_sha256" ];
+    else if (keep == "certificate_public_key_sha256")
+        drop = [ "certificate_sha256" ];
+
+    if (length(drop) == 0)
         return;
+
     let stripped = false;
     for (let list in [ config.outbounds, config.endpoints ]) {
         if (type(list) != "array")
             continue;
         for (let item in list) {
-            if (type(item) == "object" && type(item.tls) == "object" && item.tls.certificate_sha256 != null) {
-                delete item.tls.certificate_sha256;
-                stripped = true;
+            if (type(item) != "object" || type(item.tls) != "object")
+                continue;
+            for (let field in drop) {
+                if (item.tls[field] != null) {
+                    delete item.tls[field];
+                    stripped = true;
+                }
             }
         }
     }
     if (stripped)
-        warn("tls.certificate_sha256 requires sing-box 1.15.0+ (installed: ", detect_sing_box_version() || "unknown", "); certificate pin ignored - older sing-box only has certificate_public_key_sha256, which pins a different value (the public key, not the certificate)\n");
+        warn("installed sing-box (", detect_sing_box_version() || "unknown",
+            ") does not accept ", join(", ", drop),
+            "; those certificate pins were removed to keep the config loadable\n");
 }
 
-function generate_config(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections) {
+function normalize_wireguard_addresses(config) {
+    for (let list in [ config.outbounds, config.endpoints, config.inbounds ]) {
+        if (type(list) != "array")
+            continue;
+        for (let item in list) {
+            if (type(item) == "object" && (item.type == "wireguard" || item.type == "awg")) {
+                if (item.address != null)
+                    item.address = core_ip.normalize_to_cidrs(item.address);
+                if (item.local_address != null)
+                    item.local_address = core_ip.normalize_to_cidrs(item.local_address);
+                if (type(item.peers) == "array") {
+                    for (let peer in item.peers) {
+                        if (type(peer) == "object" && peer.allowed_ips != null)
+                            peer.allowed_ips = core_ip.normalize_to_cidrs(peer.allowed_ips);
+                    }
+                }
+            }
+        }
+    }
+}
+
+function generate_config(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections) {
     ctx.deferred_sections = parse_deferred_sections(deferred_sections);
+    // Quarantine reuses the same skip set the deferred sections use: every
+    // consumer (outbounds, routes, failover candidates, mixed proxies) already
+    // checks ctx.deferred_sections, so filtering there is the one place that
+    // makes a section disappear from the whole config. The runtime keeps the
+    // two lists apart on its side - quarantined sections must never be printed
+    // back as deferred, or the subscription bootstrap would retry them.
+    ctx.quarantined_sections = parse_name_set(quarantined_sections);
+    for (let name in ctx.quarantined_sections)
+        ctx.deferred_sections[name] = true;
     ctx.runtime_ruleset_folder = runtime_ruleset_folder;
     runtime_supports_xhttp = supports_xhttp == null || as_string(supports_xhttp) == ""
         ? true
@@ -1588,21 +1920,30 @@ function generate_config(output_path, service_address, mwan3_active, supports_xh
     reserve_section_outbound_tags(sections, taken);
     for (let server in servers)
         runtime_servers.add_server(config, server);
-    for (let section in sections)
+    for (let section in sections) {
+        ctx.current_section = section[".name"];
         add_outbound_for_section(config, section, taken, sections);
+    }
+    ctx.current_section = null;
+    add_group_urltest_outbounds(config, sections);
     add_service_route_rules(config, sections);
 
     // Add block and bypass sections before proxy sections so exceptions take precedence
     for (let section in sections) {
         let act = option(section, "action", "");
-        if (act == "block" || act == "bypass")
+        if (act == "block" || act == "bypass") {
+            ctx.current_section = section[".name"];
             add_route_for_section(config, section);
+        }
     }
     for (let section in sections) {
         let act = option(section, "action", "");
-        if (act != "block" && act != "bypass")
+        if (act != "block" && act != "bypass") {
+            ctx.current_section = section[".name"];
             add_route_for_section(config, section);
+        }
     }
+    ctx.current_section = null;
 
     add_server_routes(config, servers, sections);
     add_proxy_endpoint_dns_rule(config);
@@ -1622,8 +1963,11 @@ function generate_config(output_path, service_address, mwan3_active, supports_xh
 
     add_direct_bypass_proxy(config, settings, service_address);
     add_service_mixed_proxy(config, settings, sections);
-    for (let section in sections)
+    for (let section in sections) {
+        ctx.current_section = section[".name"];
         add_mixed_proxy_for_section(config, section, service_address);
+    }
+    ctx.current_section = null;
     add_router_traffic_redirect(config, settings);
 
     add_content_blocking(config);
@@ -1644,17 +1988,18 @@ function generate_config(output_path, service_address, mwan3_active, supports_xh
     assert_unique_outbound_tags(config);
     strip_internal_fields(config);
     strip_certificate_pins_if_unsupported(config);
+    normalize_wireguard_addresses(config);
     if (!atomic_write_json_file(output_path, config)) {
         warn("failed to write ", output_path, "\n");
         exit(1);
     }
 }
 
-function generate_config_fixture(fixture_path, output_path, service_address, mwan3_active, supports_xhttp, deferred_sections) {
+function generate_config_fixture(fixture_path, output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections) {
     use_fixture_cursor(fixture_path);
     runtime_subscription.set_section_cache_dir(output_path + ".section-cache");
     runtime_ruleset_folder = output_path + ".rulesets";
-    generate_config(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections);
+    generate_config(output_path, service_address, mwan3_active, supports_xhttp, deferred_sections, quarantined_sections);
 }
 
 function stdin_length() {
@@ -1774,6 +2119,7 @@ ctx.atomic_write_json_file = atomic_write_json_file;
 ctx.is_sb_1_14_plus = is_sb_1_14_plus_detected;
 ctx.is_sb_1_15_plus = is_sb_1_15_plus_detected;
 ctx.is_sing_box_lx = is_sing_box_lx_detected;
+ctx.is_tachyon_core = is_tachyon_core_detected;
 ctx.is_certificate_sha256_supported = is_certificate_sha256_supported;
 
 generator_outbounds.init(ctx);
@@ -1786,6 +2132,7 @@ enabled_sections = generator_routes.enabled_sections;
 enabled_servers = generator_routes.enabled_servers;
 reserve_section_outbound_tags = generator_routes.reserve_section_outbound_tags;
 add_outbound_for_section = generator_routes.add_outbound_for_section;
+add_group_urltest_outbounds = generator_routes.add_group_urltest_outbounds;
 add_service_route_rules = generator_routes.add_service_route_rules;
 add_route_for_section = generator_routes.add_route_for_section;
 add_server_routes = generator_routes.add_server_routes;
@@ -1794,9 +2141,9 @@ ensure_custom_ruleset = generator_routes.ensure_custom_ruleset;
 let mode = ARGV[0] || "";
 
 if (mode == "generate-config")
-    generate_config(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]);
+    generate_config(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6]);
 else if (mode == "generate-config-fixture")
-    generate_config_fixture(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6]);
+    generate_config_fixture(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]);
 else if (mode == "stdin-length")
     stdin_length();
 else if (mode == "stdin-contains")
@@ -1827,6 +2174,13 @@ else if (mode == "is-cert-pin-supported")
     exit(is_certificate_sha256_supported(ARGV[1]) ? 0 : 1);
 else if (mode == "is-sb-1-14-plus")
     exit(is_sb_1_14_plus_detected(ARGV[1]) ? 0 : 1);
+else if (mode == "is-sb-1-15-plus")
+    exit(is_sb_1_15_plus_detected(ARGV[1]) ? 0 : 1);
+else if (mode == "certificate-pin-field") {
+    let field = certificate_pin_field(ARGV[1]);
+    print(field + "\n");
+    exit(field != "" ? 0 : 1);
+}
 else if (mode == "version-detect") {
     // Exposed so the version source can be exercised directly: a state file that
     // disagrees with the binary has to lose, and that is only observable here.

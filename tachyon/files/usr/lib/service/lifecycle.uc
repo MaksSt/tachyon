@@ -787,8 +787,11 @@ function restore_rulesets_from_cache() {
             continue;
         if (!tmp_st || tmp_st.size == 0) {
             let content = fs.readfile(etc_path);
-            if (content)
-                fs.writefile(tmp_path, content);
+            if (content) {
+                write_file(tmp_path, content);
+                if (match(entry, /\.srs$/) && runtime_rulesets_mod.is_populated_srs_file(tmp_path))
+                    runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
+            }
         }
     }
     dir.close();
@@ -804,6 +807,10 @@ function prepare_community_rulesets() {
     command_success_from_args(["mkdir", "-p", tmp_dir]);
 
     let needed = {};
+    let exclusions = require("service.smart_detect_exclusions");
+    let exclusion_lists = exclusions.selected_lists(uci_core.get_all(CONFIG_NAME, "settings"));
+    for (let name in exclusion_lists)
+        if (exclusions.supported(name)) needed[name] = true;
     let sections = uci_core.get_all(CONFIG_NAME, "section") || {};
     for (let name, section in sections) {
         if (!section || !section.enabled || section.enabled == "0")
@@ -868,8 +875,11 @@ function prepare_community_rulesets() {
         // promoting it beats a pointless download attempt on a boot with no network.
         if (runtime_rulesets_mod.is_referenceable_srs_file(etc_path)) {
             let content = fs.readfile(etc_path);
-            if (content && fs.writefile(tmp_path, content) != null)
+            if (content && write_file(tmp_path, content)) {
+                if (runtime_rulesets_mod.is_populated_srs_file(tmp_path))
+                    runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
                 continue;
+            }
         }
 
         let url = runtime_rulesets_mod.community_url(service);
@@ -885,10 +895,13 @@ function prepare_community_rulesets() {
                     let st = fs.stat(dl_tmp);
                     if (st && st.size >= 100) {
                         command_success_from_args([ "mv", "-f", dl_tmp, tmp_path ]);
+                        runtime_rulesets_mod.remember_srs_file_verified(tmp_path);
                         command_success_from_args([ "mkdir", "-p", etc_dir ]);
                         let cdata = fs.readfile(tmp_path);
-                        if (cdata)
-                            fs.writefile(etc_path, cdata);
+                        if (cdata) {
+                            write_file(etc_path, cdata);
+                            runtime_rulesets_mod.remember_srs_file_verified(etc_path);
+                        }
                         log_message("Pre-downloaded community ruleset " + service + " from " + candidate, "info");
                         fetched = true;
                         break;
@@ -903,6 +916,9 @@ function prepare_community_rulesets() {
             log_message("Community ruleset '" + service + "' initialized with local fallback stub to allow sing-box clean start", "info");
         }
     }
+    for (let name in exclusion_lists)
+        if (!exclusions.prepare_list(name, tmp_dir + "/community-" + name + ".srs"))
+            log_message("Smart Detect: exclusion preset " + name + " is unavailable; keeping the previous cache", "warn");
 }
 
 // Whether the active routing engine is steer or steer-extended. Used to skip
@@ -1251,6 +1267,8 @@ function stop_main() {
         log_message("Tailscale stop failed (non-fatal)", "warn");
     module_success(PARENTAL_QUOTA_UC, [ "remove-cron" ]);
     module_success(TELEGRAM_UC, [ "stop-runtime" ]);
+    if (!module_success(WATCHDOG_UC, [ "stop-runtime" ]))
+        log_message("Watchdog stop failed (non-fatal)", "warn");
 
     module_success(NFT_UC, [ "nft-disable-router-output-intercept", NFT_TABLE_NAME ]);
 
@@ -1560,13 +1578,13 @@ function dns_failover_apply(candidate_state_path) {
         let sing_box_pid_before = sing_box_runtime_pid();
         status = module_status(STATE_UC, [ "hup-sing-box-runtime" ]);
         if (status == 0)
-            status = wait_dns_failover_state(candidate_state_path, 5);
+            status = wait_dns_failover_state(candidate_state_path, 10);
 
         if (status != 0) {
             log_message("sing-box SIGHUP DNS reload did not become ready; trying service reload", "warn");
             status = module_status(STATE_UC, [ "reload-sing-box-runtime", sing_box_pid_before, "dns-before", "dns-after" ]);
             if (status == 0)
-                status = wait_dns_failover_state(candidate_state_path, 8);
+                status = wait_dns_failover_state(candidate_state_path, 15);
         }
     }
 
@@ -1812,6 +1830,7 @@ function reload(reason) {
         let reload_sb_pid = trim(command_output_from_args([ "pidof", "sing-box" ]));
         if (match(reload_sb_pid, /^[0-9]+$/) != null)
             module_success(STATE_UC, [ "write-provenance", reload_sb_pid ]);
+        common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
 
         status = module_status(PRIORITY_UC, [ "start-runtime" ]);
         if (status != 0) {

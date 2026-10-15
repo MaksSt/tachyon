@@ -464,6 +464,8 @@ function user_agent_supported(user_agent, default_user_agent) {
         return false;
     if (user_agent == default_user_agent)
         return true;
+    if (index(user_agent, "sing-box") == 0 || index(user_agent, "tachyon") == 0)
+        return true;
 
     return auto_user_agents[user_agent] == true;
 }
@@ -797,31 +799,82 @@ function restore_persistent_subscription_cache(source_section, tmp_dir, persiste
         return false;
 
     let runtime_json = source_json_path(tmp_dir, source_section);
-    if (subscription_cache_is_usable(runtime_json))
+    let runtime_url = read_text(source_url_path(tmp_dir, source_section));
+    let runtime_user_agent = read_text(source_user_agent_path(tmp_dir, source_section));
+    let runtime_hwid = read_text(source_hwid_path(tmp_dir, source_section));
+    let runtime_device_headers = read_text(source_device_headers_path(tmp_dir, source_section));
+    if (subscription_cache_is_usable(runtime_json) &&
+        runtime_url == as_string(expected_url) &&
+        user_agent_matches_config(expected_user_agent, runtime_user_agent, default_user_agent) &&
+        hwid_matches_config(expected_hwid, runtime_hwid) &&
+        runtime_device_headers == as_string(expected_device_headers_signature))
         return true;
 
+    let candidate = null;
     let persistent_json = source_json_path(persistent_dir, source_section);
-    if (!subscription_cache_is_usable(persistent_json))
+    if (subscription_cache_is_usable(persistent_json)) {
+        let cached_url = read_text(source_url_path(persistent_dir, source_section));
+        let cached_user_agent = read_text(source_user_agent_path(persistent_dir, source_section));
+        let cached_hwid = read_text(source_hwid_path(persistent_dir, source_section));
+        let cached_device_headers = read_text(source_device_headers_path(persistent_dir, source_section));
+        if (cached_url == as_string(expected_url) &&
+            user_agent_matches_config(expected_user_agent, cached_user_agent, default_user_agent) &&
+            hwid_matches_config(expected_hwid, cached_hwid) &&
+            cached_device_headers == as_string(expected_device_headers_signature)) {
+            candidate = source_section;
+        }
+    }
+
+    if (candidate == null) {
+        let pattern = as_string(persistent_dir) + "/*.url";
+        for (let url_file in (fs.glob(pattern) || [])) {
+            let name = cache_name_from_file(url_file);
+            if (!cache_section_is_safe(name) || name == source_section)
+                continue;
+
+            let c_json = source_json_path(persistent_dir, name);
+            if (!subscription_cache_is_usable(c_json))
+                continue;
+            if (read_text(url_file) != as_string(expected_url))
+                continue;
+            if (!user_agent_matches_config(expected_user_agent, read_text(source_user_agent_path(persistent_dir, name)), default_user_agent))
+                continue;
+            if (!hwid_matches_config(expected_hwid, read_text(source_hwid_path(persistent_dir, name))))
+                continue;
+            if (read_text(source_device_headers_path(persistent_dir, name)) != as_string(expected_device_headers_signature))
+                continue;
+
+            candidate = name;
+            break;
+        }
+    }
+
+    if (candidate == null)
         return false;
 
-    let cached_url = read_text(source_url_path(persistent_dir, source_section));
-    let cached_user_agent = read_text(source_user_agent_path(persistent_dir, source_section));
-    let cached_hwid = read_text(source_hwid_path(persistent_dir, source_section));
-    let cached_device_headers = read_text(source_device_headers_path(persistent_dir, source_section));
-    if (cached_url != as_string(expected_url))
-        return false;
-    if (!user_agent_matches_config(expected_user_agent, cached_user_agent, default_user_agent))
-        return false;
-    if (!hwid_matches_config(expected_hwid, cached_hwid))
-        return false;
-    if (cached_device_headers != as_string(expected_device_headers_signature))
-        return false;
+    let candidate_json = source_json_path(persistent_dir, candidate);
+    let cached_url = read_text(source_url_path(persistent_dir, candidate));
+    let cached_user_agent = read_text(source_user_agent_path(persistent_dir, candidate));
+    let cached_hwid = read_text(source_hwid_path(persistent_dir, candidate));
+    let cached_device_headers = read_text(source_device_headers_path(persistent_dir, candidate));
 
-    return copy_file(persistent_json, runtime_json) &&
+    let ok = copy_file(candidate_json, runtime_json) &&
         write_text(source_url_path(tmp_dir, source_section), cached_url) &&
         write_text(source_user_agent_path(tmp_dir, source_section), cached_user_agent) &&
         write_text(source_hwid_path(tmp_dir, source_section), cached_hwid) &&
         write_text(source_device_headers_path(tmp_dir, source_section), cached_device_headers);
+
+    if (!ok)
+        return false;
+
+    let candidate_metadata = persistent_dir + "/" + as_string(candidate) + ".metadata.json";
+    let runtime_metadata = as_string(tmp_dir) + "/" + as_string(source_section) + ".metadata.json";
+    if (file_nonempty(candidate_metadata))
+        copy_file(candidate_metadata, runtime_metadata);
+    else
+        unlink_path(runtime_metadata);
+
+    return true;
 }
 
 function subscription_source_profile(section, entry) {
@@ -1431,6 +1484,10 @@ function persistent_metadata_path(source_section) {
     return TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR + "/" + as_string(source_section) + ".metadata.json";
 }
 
+function runtime_metadata_path(source_section) {
+    return TMP_SUBSCRIPTION_FOLDER + "/" + as_string(source_section) + ".metadata.json";
+}
+
 function remove_subscription_source_runtime_cache(source_section) {
     if (!cache_section_is_safe(source_section))
         return;
@@ -1440,6 +1497,7 @@ function remove_subscription_source_runtime_cache(source_section) {
     unlink_path(source_user_agent_path(TMP_SUBSCRIPTION_FOLDER, source_section));
     unlink_path(source_hwid_path(TMP_SUBSCRIPTION_FOLDER, source_section));
     unlink_path(source_device_headers_path(TMP_SUBSCRIPTION_FOLDER, source_section));
+    unlink_path(runtime_metadata_path(source_section));
 }
 
 function persist_subscription_cache(source_section, subscription_json_path, subscription_url, effective_user_agent, effective_hwid, metadata_path, effective_device_headers_signature) {
@@ -1485,7 +1543,9 @@ function persist_subscription_cache(source_section, subscription_json_path, subs
 }
 
 function append_persistent_source_metadata(array_path, source_index, source_section) {
-    let metadata_path = persistent_metadata_path(source_section);
+    let metadata_path = runtime_metadata_path(source_section);
+    if (!file_nonempty(metadata_path))
+        metadata_path = persistent_metadata_path(source_section);
     if (!file_nonempty(metadata_path))
         return false;
 
@@ -1702,7 +1762,9 @@ function copy_persistent_metadata_output(source_section, metadata_output_path) {
     if (metadata_output_path == null || metadata_output_path == "")
         return;
 
-    let metadata_path = persistent_metadata_path(source_section);
+    let metadata_path = runtime_metadata_path(source_section);
+    if (!file_nonempty(metadata_path))
+        metadata_path = persistent_metadata_path(source_section);
     if (file_nonempty(metadata_path) && object_has_extra_keys(metadata_path))
         copy_file(metadata_path, metadata_output_path) || unlink_path(metadata_output_path);
 }
@@ -2106,7 +2168,12 @@ function subscription_update_section(section, force) {
     let total = 0;
 
     for (let entry in connections.subscription_urls(section)) {
+        // total++ first, for the same positional reason as in
+        // prepare_subscription_cache_section: the slot of a skipped source must
+        // not be handed to the next one.
         total++;
+        if (!connections.subscription_url_enabled(section, entry))
+            continue;
         if (!force && !connections.subscription_update_enabled(section, entry))
             continue;
         let source_section = source_id(section_name_value, total);
@@ -2369,7 +2436,13 @@ function prepare_subscription_cache_section(state, section) {
     let ready = 0;
     let failed = 0;
     for (let entry in connections.subscription_urls(section)) {
+        // total++ stays before every continue. Sources are addressed positionally
+        // (source_id is "<section>-subscription-<n>"), so skipping a disabled URL
+        // has to leave its slot unclaimed - counting only the enabled ones would
+        // shift every later source by one and read one source's cache as another's.
         total++;
+        if (!connections.subscription_url_enabled(section, entry))
+            continue;
         if (ensure_subscription_source_for_prepare(state, section, total, entry, metadata_tmpfile))
             ready++;
         else {
@@ -2392,6 +2465,24 @@ function prepare_subscription_cache_section(state, section) {
     }
     else if (failed > 0) {
         log_message("Skipping unavailable subscription source(s) for rule '" + section_name_value + "'; using available outbounds", "warn");
+    }
+
+    for (let i = 1; i <= total; i++) {
+        let sid = source_id(section_name_value, i);
+        let runtime_json = source_json_path(TMP_SUBSCRIPTION_FOLDER, sid);
+        if (!subscription_cache_is_usable(runtime_json))
+            continue;
+        let r_url = read_text(source_url_path(TMP_SUBSCRIPTION_FOLDER, sid));
+        let p_url = read_text(source_url_path(TACHYON_PERSISTENT_SUBSCRIPTION_CACHE_DIR, sid));
+        if (p_url != r_url) {
+            let r_ua = read_text(source_user_agent_path(TMP_SUBSCRIPTION_FOLDER, sid));
+            let r_hwid = read_text(source_hwid_path(TMP_SUBSCRIPTION_FOLDER, sid));
+            let r_headers = read_text(source_device_headers_path(TMP_SUBSCRIPTION_FOLDER, sid));
+            let r_meta = runtime_metadata_path(sid);
+            if (!file_nonempty(r_meta))
+                r_meta = persistent_metadata_path(sid);
+            persist_subscription_cache(sid, runtime_json, r_url, r_ua, r_hwid, r_meta, r_headers);
+        }
     }
 
     let metadata_count = length(array_or_empty(read_json(metadata_tmpfile)));
@@ -2429,9 +2520,9 @@ function prepare_subscription_caches(phase, already_prepared, no_refresh) {
         no_refresh: as_string(no_refresh) == "1"
     };
 
-    prune_stale_subscription_caches_for_sections(sections);
     for (let section in sections)
         prepare_subscription_cache_section(state, section);
+    prune_stale_subscription_caches_for_sections(sections);
 
     if (state.startup_blocked)
         return 1;
@@ -2472,9 +2563,18 @@ function mark_pending_subscription_recovery_reload() {
     state_ucode_status([ "mark-pending-reload", TACHYON_PENDING_RELOAD_FILE, "subscription_deferred_recovery" ]);
 }
 
+// A recovered subscription cache only needs config.json regenerated and pushed
+// into the running sing-box, which `updates.uc subscription-deferred-recovery-
+// apply` does in place. Escalating to `/etc/init.d/tachyon reload` walked the
+// whole validate/capture/plan pipeline and restarted both helper workers, so a
+// background bootstrap retry could take the router's proxy down for minutes
+// (issue #119).
 function trigger_subscription_recovery_reload(worker) {
     if (worker)
-        command_status_from_args([ TACHYON_SERVICE_INIT, "reload", "subscription_deferred_recovery" ]);
+        command_status_from_args(command_args_with([
+            "ucode", "-L", LIB_DIR, LIB_DIR + "/components/updates.uc",
+            "subscription-deferred-recovery-apply"
+        ]));
     else
         mark_pending_subscription_recovery_reload();
 }
