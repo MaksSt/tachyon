@@ -21,64 +21,13 @@
 
 **Tachyon** — это высокопроизводительное, автономное и бескомпромиссное решение для оркестрации сетевого трафика, проксирования и обхода цензуры на роутерах под управлением **OpenWrt** (полная совместимость с **OpenWrt 23.05, 24.10, 25.x и SNAPSHOT**). Прямой форк проектов **[Forkop от @ushan0v](https://github.com/ushan0v/forkop)** (ранее **Podkop Plus**) и **[Steer от @xyzmean](https://github.com/xyzmean/steer)**.
 
-Tachyon объединяет мульти-движковую маршрутизацию: флагманское нативное Rust-ядро **[tachyon-core](https://github.com/Dushnilin/tachyon-core)** (~4.2 МБ RAM в простое, Zero-C-Crypto, встроенный L4/L7 Desync для обхода DPI), полнофункциональный **sing-box**, легковесный **Steer** и гибридный **Steer-Extended**. В систему встроены поддержка **OpenVPN (.ovpn)**, высокоскоростной туннель **FPTN** (Fast Packet Tunnel Network), локальный аппаратный обход DPI (**Zapret v1 / Zapret v2 / ByeDPI**), комбинаторный **DPI Strategy Fuzzer v2**, защищённый **Telegram-бот управления**, а также передовой **AI Stack** (автономный **AI Doctor v3.0**, **HTTP REST Agent API / OpenAPI 3.0** и **MCP Server** для подключения ИИ-агентов).
+Tachyon объединяет мульти-движковую маршрутизацию (**sing-box**, легковесный **Steer** и гибридный **Steer-Extended**), нативную поддержку **OpenVPN (.ovpn)**, высокоскоростной протокол **FPTN** (Fast Packet Tunnel Network), средства локального аппаратного обхода DPI (**Zapret v1 / Zapret v2 / ByeDPI**), интерактивный комбинаторный **DPI Strategy Fuzzer v2**, защищённый **Telegram-бот управления**, а также инновационный **AI Stack** (автономный **AI Doctor v3.0**, офлайн-диагностику, **HTTP REST Agent API / OpenAPI 3.0** и **MCP Server** для подключения ИИ-агентов).
 
 Вся внутренняя логика реализована на скриптовом движке **ucode** — нативном C-интерпретаторе OpenWrt, обеспечивающем ультранизкое потребление RAM (от 128 МБ ОЗУ) и мгновенный отклик.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>
-
-## 🚀 Быстрый старт и установка через Tachyon Installer
-
-<div align="center">
-
-![Installation Terminal](assets/readme/install_terminal.svg)
-
-</div>
-
-Установка Tachyon выполняется в 1 команду через универсальный транзакционный установщик **Tachyon Installer**:
-
-```bash
-wget -O /tmp/tachyon-setup.sh https://raw.githubusercontent.com/Dushnilin/tachyon/main/install.sh && sh /tmp/tachyon-setup.sh
-```
-
-> [!TIP]
-> **Зеркала установки (при замедлении или блокировках GitHub):**
-> ```bash
-> # Зеркало 1 (jsdelivr.net CDN):
-> wget -O /tmp/tachyon-setup.sh https://cdn.jsdelivr.net/gh/Dushnilin/tachyon@main/install.sh && sh /tmp/tachyon-setup.sh
-> 
-> # Зеркало 2 (gh-proxy.com):
-> wget -O /tmp/tachyon-setup.sh https://gh-proxy.com/raw.githubusercontent.com/Dushnilin/tachyon/main/install.sh && sh /tmp/tachyon-setup.sh
-> 
-> # Зеркало 3 (ghfast.top):
-> wget -O /tmp/tachyon-setup.sh https://ghfast.top/https://raw.githubusercontent.com/Dushnilin/tachyon/main/install.sh && sh /tmp/tachyon-setup.sh
-> ```
-
-### 🛠️ Преимущества и возможности Tachyon Installer
-
-* 🦀 **Нативное ядро tachyon-core из коробки**:
-  Вы можете сразу установить нативное Rust-ядро вместо тяжеловесного Go-бинарника ключом `--tachyon-core`:
-  ```bash
-  sh /tmp/tachyon-setup.sh -y --tachyon-core
-  ```
-* 🧭 **Интерактивный выбор движков и версий**:
-  При интерактивном запуске инсталлятор предложит выбрать желаемый движок (`tachyon-core`, `sing-box stable / extended / tiny / lx`, `steer`, `steer-extended`), а также нужную версию релиза.
-* 🛡️ **Транзакционная безопасность и Snapshots**:
-  Перед любыми изменениями установщик автоматически создаёт снимок конфигурации (`/etc/tachyon/installer-backups/`) и файл состояния `apk-world`. В случае ошибки или прерывания связи транзакция автоматически откатывается без потери связи с роутером.
-* 💾 **Автоматический ZRAM для роутеров с малым объемом ОЗУ**:
-  Инсталлятор анализирует доступную память роутера и на устройствах с ≤ 256 МБ RAM предлагает автоматически включить `zram-swap` для защиты от OOM.
-* 🔄 **Режимы обслуживания и ремонта**:
-  - `--repair` — переустановка Tachyon и полное восстановление интеграций с сетью и файрволом.
-  - `--reinstall` — принудительная переустановка поверх текущей системы.
-  - `--channel beta` — установка последних бета-версий.
-  - `--tag X.Y.Z` — установка конкретной опубликованной версии.
-* 📦 **Бесшовная миграция**:
-  Автоматический перенос настроек из устаревших пакетов **Forkop**, **Podkop Plus** и **Podkop** с очисткой устаревших зависимостей.
-
----
-
 
 ## 🌐 Архитектура и конвейер трафика
 
@@ -93,7 +42,7 @@ Tachyon перехватывает сетевой стек через ядро *
 2. **Zapret v1 (`nfqws`)**: Базовая десинхронизация TCP/UDP (`fake`, `disorder`, `split2`) прямо на роутере без VPS.
 3. **Zapret v2 (`nfqws2`)**: Адаптивный многовекторный обход ТСПУ (`multisplit`, `seqovl`, `wsize`, PAWS `tcp_ts`, аутентичные `blobs`) для YouTube 4K, Discord и стриминга.
 4. **ByeDPI (`ciadpi`)**: Локальный SOCKS5-десинхронизатор с фрагментацией полезной нагрузки HTTP/TLS SNI.
-5. **Мульти-движковое туннелирование и прокси (sing-box / Steer / tachyon-core / FPTN / OpenVPN)**: Заблокированные ресурсы и приватный трафик направляются через защищённые протоколы (VLESS Reality, Hysteria2, WireGuard, AmneziaWG, OpenVPN) или высокоскоростной туннель **FPTN** (`tun-fptn` поверх WebSocket/TLS с маскировкой под веб-трафик). На устройствах с малым объемом памяти активен **Steer** / **Steer-Extended**, а для максимальной производительности без накладных расходов Go — нативный Rust-рантайм **tachyon-core**.
+5. **Мульти-движковое туннелирование и прокси (sing-box / Steer / FPTN / OpenVPN)**: Заблокированные ресурсы и приватный трафик направляются через защищённые протоколы (VLESS Reality, Hysteria2, WireGuard, AmneziaWG, OpenVPN) или высокоскоростной туннель **FPTN** (`tun-fptn` поверх WebSocket/TLS с маскировкой под веб-трафик). На устройствах с малым объемом памяти активен **Steer** / **Steer-Extended**.
 6. **Smart DNS Pipeline**: Изолированная обработка DNS через FakeIP (`198.18.0.0/15`), DoH/DoT/DoQ с защитой от перехвата провайдером, интеграцией SmartDNS/`steer-dnsd` и автоматическим отказоустойчивым переключением (DNS Failover).
 
 <p align="center">
@@ -105,13 +54,6 @@ Tachyon перехватывает сетевой стек через ядро *
 ### 🧭 1. Мульти-движковая маршрутизация (Multi-Engine Architecture)
 * **Гибкий выбор движка маршрутизации**:
   * **sing-box Engine**: Полнофункциональный шлюз со всеми современными прокси-протоколами, селективной маршрутизацией по доменам/IP/устройствам и FakeIP.
-  * **tachyon-core Engine (Рекомендовано)**: Флагманское нативное прокси-ядро на чистом **Rust** (Zero-C-Crypto, без Go-рантайма и GC, рекордные **~4.2 МБ RAM в простое**):
-    * **100% совместимость**: Полный drop-in replacement для конфигураций и CLI sing-box (работает со всеми правилами, Clash API, DNS и инбаундами).
-    * **Нативный Outbound Desync**: Встроенный обход DPI (TCP-сплит, фрагментация TLS ClientHello, HTTP-сплит) прямо в сетевом стеке ядра без запуска сторонних демонов ByeDPI/Zapret.
-    * **Полноценный XHTTP транспорт**: Оптимизированные режимы `packet-up` и `auto` с асинхронным пайплайном отправки без блокировок и буферизацией TLS.
-    * **Поддержка любых роутеров**: Оптимизированные сборки под `aarch64`, `armv7`, `armv6`, `x86-64`, а также гарантированный **Soft-float для MIPS/MIPSEL** без аппаратного FPU (MediaTek MT7620/MT7621/MT7628) с защитой от `SIGILL`.
-    * **Отказоустойчивость**: Автоматический откат на резервный рабочий конфиг (`fallback.json`) при ошибках валидации и софт-старт rule-set при старте без сети.
-    * **Полный стек протоколов**: VLESS (Reality, XHTTP, gRPC, WS), VMess, Trojan, Shadowsocks, Hysteria2 с контроллером перегрузки **Brutal CC**, WireGuard / AmneziaWG (AWG 3.1) и встроенный L3-туннель **FPTN**.
   * **Steer Engine**: Ультралегковесный движок селективной маршрутизации на нативном `steer` и SmartDNS/DoH/DoT (`steer-dnsd`) для роутеров со скромным объёмом памяти.
   * **Steer-Extended Engine**: Гибридный режим — легковесный Steer в связке с аппаратным десинхронизатором Zapret (`nfqws`/`nfqws2`). Максимальная производительность и обход DPI без затрат ОЗУ на тяжелые Go-демоны.
 * **Переключение движка в 1 клик**:
@@ -126,7 +68,6 @@ Tachyon перехватывает сетевой стек через ядро *
 ### 🛡️ 2. Мультипротокольное проксирование и продвинутые подписки
 * **Ядро sing-box Engine (v1.11 - v1.14+)**:
   * Нативная поддержка: **VLESS (Reality / gRPC / WS)**, **VMess**, **Shadowsocks**, **Trojan**, **Hysteria2**, **WireGuard / AmneziaWG (AWG 3.1)**.
-  * **Импорт `.conf` AmneziaWG 2.0 / 3.0 / 3.1**: отдельный список «Amnezia конфиги» между URL и текстовыми ссылками в настройках подключения. Загрузка, имя, редактирование и удаление доступны с sing-box LX и tachyon-core. Исходный конфиг хранится в UCI `selector_amnezia_configs`; генератор использует общий WG/AWG-парсер и создаёт нативный endpoint. При смене на неподдерживаемое ядро поле скрывается, сохранённые записи не удаляются; применять их на таком ядре нельзя. Поддерживается один Interface и один Peer, до 64 КиБ вместе с именем. DNS и командные hooks из файла не применяются. Приватные ключи остаются в конфигурации роутера; не публикуйте её.
   * **Нативный OpenVPN Endpoint и загрузка `.ovpn`**: Полноценный встроенный OpenVPN-клиент в sing-box (>= 1.14.0) с возможностью прямой загрузки и валидации файлов `.ovpn` в LuCI.
 * **Высокоскоростной туннель FPTN Engine (`fptn-client-cli`)**:
   * L3-туннелирование IP-пакетов поверх WebSocket/TLS с маскировкой под стандартный HTTPS-трафик (`tun-fptn`, таблица маршрутизации `4249`).
@@ -137,7 +78,6 @@ Tachyon перехватывает сетевой стек через ядро *
   * **Anti-Collapse Shrink Guard**: Сохранение кэша рабочих нод при временных сбоях или пустых ответах серверов подписки.
 * **Генератор профилей Cloudflare WARP / AmneziaWG (`generate_warp`)**.
 * **Многомерная селективная маршрутизация**: по доменам, IP-сетям, MAC/IP клиентских устройств и странам (GeoIP).
-* **Исключения Smart Detect**: в «Настройки → Сервисы и доступ» можно объединить ручные домены с готовыми списками сервисов (`smart_detect_exclude_lists`). Исключения действуют на домены и поддомены в Default и Plus; ручные маршруты и ранее добавленные правила сохраняются. Если расширение до основного домена затронет исключённый поддомен, сохраняется только обнаруженный hostname. Списки обновляются штатным механизмом; декодированный кэш хранится в `/etc/tachyon/smart-detect-exclusions/`. При отсутствии выбранного кэша автоматическое обнаружение ждёт обновления списков; сбой обновления сохраняет прежний кэш. IP-only наборы недоступны, из смешанных наборов используются только доменные записи. Для подготовки кэша нужен `sing-box rule-set decompile` или совместимый `tachyon-core`; дополнительных пакетов не требуется.
 
 ---
 
@@ -322,7 +262,37 @@ curl http://192.168.1.1/cgi-bin/tachyon-api/openapi.json
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>
 
-## 🗑️ Удаление (Clean Uninstall & Backup)
+## 💻 Установка
+
+<div align="center">
+
+![Installation Terminal](assets/readme/install_terminal.svg)
+
+</div>
+
+Для установки Tachyon выполните следующую команду в SSH-консоли вашего роутера:
+
+```bash
+wget -O /tmp/tachyon-setup.sh https://raw.githubusercontent.com/Dushnilin/tachyon/main/install.sh && sh /tmp/tachyon-setup.sh
+```
+
+> [!TIP]
+> **Зеркала установки (при блокировке или замедлении GitHub):**
+> ```bash
+> # Зеркало 1 (jsdelivr.net CDN):
+> wget -O /tmp/tachyon-setup.sh https://cdn.jsdelivr.net/gh/Dushnilin/tachyon@main/install.sh && sh /tmp/tachyon-setup.sh
+> 
+> # Зеркало 2 (gh-proxy.com):
+> wget -O /tmp/tachyon-setup.sh https://gh-proxy.com/raw.githubusercontent.com/Dushnilin/tachyon/main/install.sh && sh /tmp/tachyon-setup.sh
+> 
+> # Зеркало 3 (ghfast.top):
+> wget -O /tmp/tachyon-setup.sh https://ghfast.top/https://raw.githubusercontent.com/Dushnilin/tachyon/main/install.sh && sh /tmp/tachyon-setup.sh
+> ```
+
+> [!NOTE]
+> **Автоматическая миграция:** Конфигурации от **Forkop**, **Podkop Plus** и оригинального **Podkop** полностью совместимы. Инсталлятор автоматически перенесет ваши правила в `/etc/config/tachyon` без потери данных.
+
+### 🗑️ Удаление (Clean Uninstall & Backup)
 
 Для полного и чистого удаления Tachyon с возвратом штатного DNS, очисткой правил nftables и сохранением вашей конфигурации в `/etc/config/tachyon.backup-<timestamp>`:
 
@@ -363,7 +333,6 @@ Tachyon опирается на фундаментальные разработ�
 * 🍴 **[Forkop (ushan0v)](https://github.com/ushan0v/forkop)** — прямой родительский проект (ранее Podkop Plus).
 * 🐕 **[Podkop (itdoginfo)](https://github.com/itdoginfo/podkop)** — оригинальный проект, заложивший основу архитектуры.
 * 🧭 **[steer (xyzmean)](https://github.com/xyzmean/steer)** — оригинальный проект легковесной policy-based маршрутизации и обхода блокировок для OpenWrt, интегрированный в Multi-Engine ядро Tachyon.
-* 🦀 **[tachyon-core](https://github.com/Dushnilin/tachyon-core)** — нативное высокопроизводительное прокси-ядро на чистом Rust (без рантайма Go, 4.2 МБ RAM в простое), разработанное специально для Tachyon и встраиваемых систем.
 * 📦 **[sing-box](https://github.com/SagerNet/sing-box)** — универсальная прокси-платформа.
 * 🚀 **[zapret (bol-van)](https://github.com/bol-van/zapret2)** — средства локального обхода DPI (`nfqws` / `nfqws2`).
 * 🌐 **[ByeDPI](https://github.com/hrbrmstr/byedpi)** — локальный SOCKS-прокси для десинка пакетов.
