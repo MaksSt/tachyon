@@ -2,7 +2,7 @@
 
 let common = require("core.common");
 let connections = require("config.connections");
-let runtime_constants = require("singbox.constants");
+let runtime_constants = require("tachyon_core.constants");
 
 let option = common.option;
 let bool_option = common.bool_option;
@@ -250,6 +250,12 @@ function resolve_rule_for_section(section, route_rule) {
     resolve_rule.server = (action == "zapret" || action == "zapret2")
         ? runtime_constants.BOOTSTRAP_DNS_SERVER_TAG
         : runtime_constants.DNS_SERVER_TAG;
+    if (action == "zapret" || action == "zapret2") {
+        let opt_key = action == "zapret2" ? "nfqws2_opt" : "nfqws_opt";
+        let raw_opt = trim(option(section, opt_key, ""));
+        if (raw_opt != "" && index(raw_opt, "--filter-l3=ipv4") >= 0 && match(raw_opt, /--filter-l3=[^[:space:]]*ipv6/) == null)
+            resolve_rule.strategy = "ipv4_only";
+    }
 
     return { rule: resolve_rule };
 }

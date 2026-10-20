@@ -2,13 +2,14 @@
 
 let fs = require("fs");
 let common = require("core.common");
-let runtime_constants = require("singbox.constants");
-let runtime_subscription = require("singbox.subscription");
-let runtime_country = require("singbox.country");
-let runtime_dns = require("singbox.dns");
-let core_profile = require("singbox.core_profile");
+let runtime_constants = require("tachyon_core.constants");
+let runtime_subscription = require("tachyon_core.subscription");
+let runtime_country = require("tachyon_core.country");
+let runtime_dns = require("tachyon_core.dns");
+let core_profile = require("tachyon_core.core_profile");
 let runtime_url = require("core.url");
 let subscription_share_link = require("subscription.share_link");
+let subscription_parser = require("subscription.parser");
 let connections = require("config.connections");
 let subscription_wireguard = require("subscription.wireguard");
 let subscription_amnezia = require("subscription.amnezia_config");
@@ -481,7 +482,7 @@ function tls_alpn_array(value, transport) {
 }
 
 // Which TLS field this build accepts for a pin. The answer comes from the
-// capability model in singbox/runtime.uc rather than from a second copy of the
+// capability model in tachyon_core/runtime.uc rather than from a second copy of the
 // rules: two copies of "which field does this core take" is exactly how the
 // generator and the validator ended up disagreeing about the same binary, and a
 // disagreement here is silent - the pin is simply dropped from the config.
@@ -492,8 +493,8 @@ function certificate_pin_field() {
     let override = trim(as_string(getenv("SB_VERSION_OVERRIDE") || ""));
     let version = override != ""
         ? override
-        : trim(as_string(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version") || ""));
-    let variant = trim(as_string(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant") || ""));
+        : trim(as_string(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version") || ""));
+    let variant = trim(as_string(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant") || ""));
 
     // With no state file to go on, let the model look at the installed binary
     // rather than guessing from an empty version.
@@ -610,16 +611,14 @@ function apply_link_transport(outbound, query) {
         optional_query_string(result, "host", query.host);
     }
     else if (transport == "xhttp") {
-        let mode = as_string(query.mode || "auto");
-        if (mode != "auto" && mode != "packet-up" && mode != "stream-up" && mode != "stream-one")
-            mode = "auto";
-        result.mode = mode;
-        result.path = as_string(query.path || "") != "" ? as_string(query.path) : "/";
-        result.x_padding_bytes = "100-1000";
-        result.no_grpc_header = false;
-        result.sc_max_each_post_bytes = "1000000";
-        result.sc_min_posts_interval_ms = "30";
-        optional_query_string(result, "host", as_string(query.host || "") != "" ? query.host : query.sni);
+        // xHTTP settings travel in `extra` (JSON) on real share links: xmux,
+        // padding, sc* limits. The subscription parser already knows all of
+        // that mapping — hand the query over to it instead of keeping a second,
+        // dumber copy that silently drops everything extra carries.
+        let built = subscription_parser.add_transport({ query: object_or_empty(query) });
+        if (type(built) != "object")
+            return;
+        result = built;
     }
     else {
         warn("unknown manual proxy link transport '", transport, "' ignored\n");
@@ -955,8 +954,8 @@ function manual_tuic_outbound(link, tag_name) {
 }
 
 function ensure_imported_vpn_lx() {
-    let variant = trim(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant") || "");
-    let version = trim(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version") || "");
+    let variant = trim(fs.readfile(getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant") || "");
+    let version = trim(fs.readfile(getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version") || "");
     if (variant != "lx" && variant != "tachyon-core" && index(version, "-lx") < 0 && index(version, "-tachyon.") < 0)
         ctx.runtime_generate_unsupported("vpn:// import is available only with sing-box-lx or tachyon-core");
 }
@@ -1047,7 +1046,7 @@ function fptn_token_payload(payload) {
 // (`tachyon-core fptn decode <token>`). Returns null when the binary is
 // missing or refuses, and the caller falls back to the raw-token form.
 function fptn_token_decode_via_core(token) {
-    let binary = getenv("SB_PREFLIGHT_BINARY") || getenv("TACHYON_SING_BOX_BIN") || "/usr/bin/sing-box";
+    let binary = getenv("SB_PREFLIGHT_BINARY") || getenv("TACHYON_SING_BOX_BIN") || "/usr/bin/tachyon-core";
     if (fs.stat(binary) == null)
         return null;
     let result = exec.run({ argv: [ binary, "fptn", "decode", token ], timeout: 15 });
@@ -1134,7 +1133,12 @@ function manual_link_outbound(link, tag_name, display_info) {
     if (scheme == "vmess")
         return manual_vmess_outbound(link, tag_name);
 
-    link = url_strip_fragment_value(url_decode(link));
+    // Strip the fragment, nothing else. Decoding the whole link up front used
+    // to run before the query was split, so a percent-encoded `&` (extra=...,
+    // plugin=..., any JSON blob) turned into a real one and cut the link in
+    // half. Every parser below decodes what it needs itself — userinfo()
+    // and query_params() decode per field.
+    link = url_strip_fragment_value(link);
     scheme = url_scheme(link);
     if (scheme == "http" || scheme == "https")
         return manual_http_outbound(link, tag_name);
@@ -1251,11 +1255,11 @@ function add_connection_manual_links(config, state, section, taken, selector_tag
 }
 
 function is_extended_variant_detected() {
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant";
+    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
     let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
     if (sb_variant_val == "extended" || sb_variant_val == "extended-compressed")
         return true;
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
+    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
     let sb_version_val = trim(fs.readfile(sb_version_file) || "");
     return index(sb_version_val, "extended") >= 0;
 }
@@ -1299,8 +1303,6 @@ function add_connection_text_urltest(config, state, section, taken, selector_tag
         tolerance,
         interrupt_exist_connections: interrupt
     };
-    if (is_extended_variant_detected() && length(text_tags) > 0)
-        outbound.default = text_tags[0];
     runtime_subscription.remember_outbound_metadata(state, urltest_tag, "Fastest", outbound);
     runtime_subscription.remember_urltest_group_config(state, urltest_tag, {
         displayName: "Fastest",
@@ -1898,8 +1900,8 @@ function add_awg_endpoint(config, section) {
     let mtu = int_option(section, "awg_mtu", "1280");
     endpoint.mtu = mtu > 0 ? mtu : 1280;
 
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant";
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
+    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
+    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
     let sb_version_val = trim(fs.readfile(sb_version_file) || "");
     let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
     let is_lx = sb_variant_val == "lx" || index(sb_version_val, "-lx") >= 0;
@@ -1983,7 +1985,7 @@ function add_awg_endpoint(config, section) {
         // j1-j3/itime were removed from the extended schema in 2.6.1 and
         // sing-box fatals on unknown fields, so emit them only for builds
         // whose schema still accepts them.
-        let sb_version_state_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
+        let sb_version_state_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
         let sb_version = trim(fs.readfile(sb_version_state_file) || "");
         if (common.extended_awg_schema_has_junk_signatures(sb_version)) {
             if (j1 != "") amnezia.j1 = j1;

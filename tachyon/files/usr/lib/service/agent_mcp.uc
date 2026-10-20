@@ -312,7 +312,7 @@ let KNOWLEDGE_BASE = {
             "Always start with 'tachyon snapshot' to get the full picture.",
             "Use 'tachyon diagnose' for structured problem list.",
             "For memory-constrained routers, enable GOMEMLIMIT scaling.",
-            "Community lists are downloaded to /tmp/sing-box/rulesets/."
+            "Community lists are downloaded to /tmp/tachyon-core/rulesets/."
         ]
     },
 
@@ -481,7 +481,7 @@ function error_result(text) {
 function execute_health() {
     let ai_raw = read_file("/tmp/tachyon_ai_status.json") || "{}";
     let ai = parse_json_safe(ai_raw) || {};
-    let sb_pid = trim(command_output("pidof sing-box"));
+    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
     let wd_pid = trim(read_file("/var/run/tachyon_watchdog.pid") || "");
     return json_result({
         status: ai.status || (sb_pid != "" ? "healthy" : "critical"),
@@ -496,7 +496,7 @@ function execute_snapshot() {
     let res = module_capture(["get-system-info"]);
     let sys_info = parse_json_safe(res.output);
 
-    let sb_pid = trim(command_output("pidof sing-box"));
+    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
     let wd_pid = trim(read_file("/var/run/tachyon_watchdog.pid") || "");
 
     let mem_info = read_file("/proc/meminfo") || "";
@@ -593,7 +593,7 @@ function execute_restart(args) {
         return error_result("Unknown service '" + svc + "'. Allowed: singbox, tachyon, dnsmasq, watchdog");
     }
     let cmd_map = {
-        singbox: "/etc/init.d/sing-box restart > /dev/null 2>&1",
+        singbox: "/etc/init.d/tachyon-core restart > /dev/null 2>&1",
         tachyon: "/etc/init.d/tachyon restart > /dev/null 2>&1",
         dnsmasq: "/etc/init.d/dnsmasq restart > /dev/null 2>&1",
         watchdog: "/usr/bin/tachyon watchdog start-runtime > /dev/null 2>&1"

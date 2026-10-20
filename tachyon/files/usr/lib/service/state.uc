@@ -13,6 +13,7 @@ const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
 const DEFAULT_PENDING_RELOAD_FILE = getenv("TACHYON_PENDING_RELOAD_FILE") || "/var/run/tachyon/reload.pending";
 const DEFAULT_SERVICE_INIT = getenv("TACHYON_SERVICE_INIT") || "/etc/init.d/tachyon";
+const CORE_LOG_PATH = "/tmp/tachyon-core/sing-box.log";
 const ZAPRET_DEFAULT_NFQWS_OPT = getenv("ZAPRET_DEFAULT_NFQWS_OPT") || "";
 const ZAPRET2_DEFAULT_NFQWS2_OPT = getenv("ZAPRET2_DEFAULT_NFQWS2_OPT") || "";
 const BYEDPI_DEFAULT_CMD_OPTS = getenv("BYEDPI_DEFAULT_CMD_OPTS") || "";
@@ -431,12 +432,17 @@ function stdin_first_field() {
 }
 
 function sing_box_service_pid_from_value(value) {
-    let service = type(value) == "object" ? value["sing-box"] : null;
-    let instances = service && type(service.instances) == "object" ? service.instances : {};
+    // The engine's procd service is `tachyon-core` now; an install that has
+    // not been through the service migration yet still registers as sing-box.
+    value = type(value) == "object" ? value : {};
+    for (let name in [ "tachyon-core", "sing-box" ]) {
+        let service = value[name];
+        let instances = service && type(service.instances) == "object" ? service.instances : {};
 
-    for (let _, instance in instances) {
-        if (type(instance) == "object" && instance.running === true && int(instance.pid || 0) > 0)
-            return int(instance.pid);
+        for (let _, instance in instances) {
+            if (type(instance) == "object" && instance.running === true && int(instance.pid || 0) > 0)
+                return int(instance.pid);
+        }
     }
 
     return 0;
@@ -453,24 +459,34 @@ function pid_is_sing_box(pid) {
 }
 
 function sing_box_service_pid_runtime() {
-    for (let path in [ "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
+    // new procd pid file first, the previous release's paths after it: an
+    // upgraded router can still be running under the old service name until
+    // the managed init script is rewritten
+    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid",
+        "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
         let pid = int(trim(fs.readfile(path) || "0"));
         if (pid > 0 && pid_is_sing_box(pid))
             return pid;
     }
 
-    let data = command_output_from_args([ "ubus", "call", "service", "list", "{\"name\":\"sing-box\"}" ]);
-    try {
-        let pid = sing_box_service_pid_from_value(json(data));
-        if (pid > 0 && pid_is_sing_box(pid))
-            return pid;
-    }
-    catch (e) {
-        // ubus is unavailable or answered with something that is not the
-        // service list; the fallback below handles this case.
+    // procd registers the service under its init script name; an install that
+    // has not been migrated yet still answers as sing-box
+    for (let name in [ "tachyon-core", "sing-box" ]) {
+        let data = command_output_from_args([ "ubus", "call", "service", "list", "{\"name\":\"" + name + "\"}" ]);
+        try {
+            let pid = sing_box_service_pid_from_value(json(data));
+            if (pid > 0 && pid_is_sing_box(pid))
+                return pid;
+        }
+        catch (e) {
+            // ubus is unavailable or answered with something that is not the
+            // service list; the fallbacks below handle this case.
+        }
     }
 
-    let pids = split(trim(command_trimmed_output_from_args([ "pidof", "sing-box" ])), /[ \t\r\n]+/);
+    let pids = split(trim(command_trimmed_output_from_args([ "pidof", "tachyon-core" ])), /[ \t\r\n]+/);
+    if (length(pids) == 0 || pids[0] == "")
+        pids = split(trim(command_trimmed_output_from_args([ "pidof", "sing-box" ])), /[ \t\r\n]+/);
     for (let p in pids) {
         let pid = int(p);
         if (pid > 0 && pid_is_sing_box(pid))
@@ -492,7 +508,7 @@ function has_int(values, needle) {
 // down when no section enables the mixed proxy at all.
 function sing_box_mixed_ports() {
     let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
-    let config_path = trim(as_string(settings.config_path || "")) || "/etc/sing-box/config.json";
+    let config_path = trim(as_string(settings.config_path || "")) || "/etc/tachyon-core/config.json";
     let data = fs.readfile(config_path);
     if (data == null)
         return [];
@@ -547,6 +563,26 @@ function sing_box_mixed_ports_listening(ports) {
     return true;
 }
 
+// Read the core log from a byte offset and report whether the core emitted a
+// reload-failure marker. A SIGHUP that trips on one inbound (e.g. a WireGuard
+// bind "Address in use") leaves the *old* config running: the process stays
+// alive and every port the old config declared is still listening, so a
+// liveness/port probe reads success while none of the new settings applied.
+// The core says so itself in its log ("keeping running configuration"); that
+// is the only reliable signal, so the tail written since the SIGHUP is scanned.
+function core_log_reload_failed(since_offset) {
+    let data = fs.readfile(CORE_LOG_PATH);
+    if (data == null)
+        return false;
+    data = as_string(data);
+    if (length(data) <= since_offset)
+        return false;
+    let tail = substr(data, since_offset);
+    return index(tail, "keeping running configuration") >= 0 ||
+        index(tail, "start error") >= 0 ||
+        index(tail, "reload failed") >= 0;
+}
+
 // Send SIGHUP to the running sing-box process and wait for it to stay alive
 // AND to still be listening.
 // sing-box 1.10+ reloads its configuration in-place on SIGHUP without tearing
@@ -568,6 +604,10 @@ function try_sighup_reload(pid) {
 
     // Send SIGHUP; ignore the kill exit code — the process may have just
     // finished a reload and the transient exit-code is unreliable.
+    let log_offset = 0;
+    let log_stat = fs.stat(CORE_LOG_PATH);
+    if (log_stat != null)
+        log_offset = int(log_stat.size || 0);
     command_success_from_args([ "kill", "-HUP", as_string(pid) ]);
 
     // Give sing-box up to 15 s to ingest the new config and bring its inbounds
@@ -586,6 +626,10 @@ function try_sighup_reload(pid) {
         // have to be back before this counts as a working reload.
         let process_ok = current_pid == pid || pid_is_sing_box(current_pid);
         if (process_ok && sing_box_mixed_ports_listening(ports)) {
+            // The old config also has these ports up, so a still-listening
+            // probe is not proof the new config loaded. The core's own log is.
+            if (core_log_reload_failed(log_offset))
+                return false;
             common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
             return true;
         }
@@ -596,6 +640,8 @@ function try_sighup_reload(pid) {
     let final_pid = sing_box_service_pid_runtime();
     if (final_pid <= 0 || !pid_is_sing_box(final_pid))
         return false;
+    if (core_log_reload_failed(log_offset))
+        return false;
     if (sing_box_mixed_ports_listening(ports)) {
         common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
         return true;
@@ -605,7 +651,7 @@ function try_sighup_reload(pid) {
 
 function hup_sing_box_runtime() {
     // The name said SIGHUP and the caller's log line said "SIGHUP DNS reload",
-    // but the body was a full /etc/init.d/sing-box restart, so every DNS
+    // but the body was a full /etc/init.d/tachyon-core restart, so every DNS
     // failover dropped live sessions and the graceful path in
     // reload_sing_box_runtime() was never the one being taken. Try SIGHUP first
     // and fall back to a restart only when the process does not survive it.
@@ -616,7 +662,7 @@ function hup_sing_box_runtime() {
     }
 
     command_success_from_args([ "logger", "-t", "tachyon", "[warn] sing-box SIGHUP did not take, falling back to a full restart" ]);
-    if (!command_success_from_args([ "/etc/init.d/sing-box", "restart" ]))
+    if (!command_success_from_args([ "/etc/init.d/tachyon-core", "restart" ]))
         exit(1);
 }
 
@@ -744,7 +790,7 @@ function arg_bool(value) {
 }
 
 function sing_box_runtime_reload_needed(config_hash_before, config_hash_after, force) {
-    return arg_bool(force) || as_string(config_hash_before) != as_string(config_hash_after);
+    return as_string(force) == "restart" || arg_bool(force) || as_string(config_hash_before) != as_string(config_hash_after);
 }
 
 function has_active_mtproxy_inbound() {
@@ -773,7 +819,7 @@ function reload_sing_box_runtime(previous_pid, config_hash_before, config_hash_a
             command_success_from_args([ "kill", "-9", as_string(active_pid) ]);
             command_success_from_args([ "sleep", "0.2" ]);
         }
-        if (!command_success_from_args([ "/etc/init.d/sing-box", "restart" ])) {
+        if (!command_success_from_args([ "/etc/init.d/tachyon-core", "restart" ])) {
             command_success_from_args([ "logger", "-t", "tachyon", "[fatal] Failed to restart sing-box. Aborted." ]);
             exit(1);
         }
@@ -783,7 +829,7 @@ function reload_sing_box_runtime(previous_pid, config_hash_before, config_hash_a
     // Try graceful SIGHUP reload first: sing-box 1.10+ reloads config in-place
     // without terminating the process, so active TCP sessions are preserved.
     let active_pid = sing_box_service_pid_runtime();
-    if (active_pid > 0) {
+    if (active_pid > 0 && as_string(force) != "restart") {
         command_success_from_args([ "logger", "-t", "tachyon", "[info] Reloading sing-box runtime via SIGHUP (graceful)" ]);
         if (try_sighup_reload(active_pid)) {
             command_success_from_args([ "logger", "-t", "tachyon", "[info] sing-box graceful reload succeeded" ]);
@@ -793,7 +839,7 @@ function reload_sing_box_runtime(previous_pid, config_hash_before, config_hash_a
     }
 
     command_success_from_args([ "logger", "-t", "tachyon", "[info] Restarting sing-box runtime" ]);
-    if (!command_success_from_args([ "/etc/init.d/sing-box", "restart" ])) {
+    if (!command_success_from_args([ "/etc/init.d/tachyon-core", "restart" ])) {
         command_success_from_args([ "logger", "-t", "tachyon", "[fatal] Failed to restart sing-box. Aborted." ]);
         exit(1);
     }
@@ -857,7 +903,7 @@ function wait_tachyon_stable_start(rt_table, nft_table, mark, min_age, timeout) 
     return tachyon_stably_running(rt_table, nft_table, mark, min_age);
 }
 
-function wait_sing_box_service_stable(min_age, timeout) {
+function wait_tachyon_core_service_stable(min_age, timeout) {
     timeout = int(timeout || 30);
     while (timeout > 0) {
         if (sing_box_service_stable(min_age))
@@ -1223,6 +1269,16 @@ function nft_runtime_signature_body(settings, sections, schedules, profiles, gue
     body = signature_add_value(body, "settings.source_network_interfaces", option(settings, "source_network_interfaces", "br-lan"));
     body = signature_add_value(body, "settings.exclude_ntp", bool_option(settings, "exclude_ntp", false) ? "1" : "0");
     body = signature_add_value(body, "settings.block_doh", bool_option(settings, "block_doh", false) ? "1" : "0");
+    let quic_mode = common.disable_quic_mode(option(settings, "disable_quic", "0"));
+    if (quic_mode != "off")
+        body = signature_add_value(body, "settings.disable_quic", quic_mode);
+    if (bool_option(settings, "webrtc_leak_protect", false))
+        body = signature_add_value(body, "settings.webrtc_leak_protect", "1");
+    if (option(settings, "qos_priority_engine", "1") == "0")
+        body = signature_add_value(body, "settings.qos_priority_engine", "0");
+    let proxy_mode = lc(trim(as_string(option(settings, "proxy_mode", "tproxy"))));
+    if (proxy_mode != "" && proxy_mode != "tproxy")
+        body = signature_add_value(body, "settings.proxy_mode", proxy_mode);
     if (bool_option(settings, "smart_detect", false) && option(settings, "smart_detect_mode", "default") == "plus")
         body = signature_add_value(body, "settings.smart_detect_plus", "1");
     body = signature_add_value(body, "settings.game_console_optimizer", option(settings, "game_console_optimizer", "0"));
@@ -1892,7 +1948,7 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
     body = signature_add_value(body, "settings.block_doh", bool_option_value(settings, "block_doh", false));
     if (sing_box_signature_has_remote_ruleset_sources(sections))
         body = signature_add_value(body, "settings.update_interval", settings_update_interval(settings));
-    body = signature_add_value(body, "settings.cache_path", option(settings, "cache_path", "/usr/share/sing-box/cache.db"));
+    body = signature_add_value(body, "settings.cache_path", option(settings, "cache_path", "/usr/share/tachyon-core/cache.db"));
     body = signature_add_value(body, "settings.config_path", option(settings, "config_path", ""));
     body = signature_add_value(body, "settings.log_level", option(settings, "log_level", "warn"));
     body = signature_add_value(body, "settings.service_listen_address", option(settings, "service_listen_address", ""));
@@ -2414,11 +2470,11 @@ else if (mode == "acquire-runtime-dir-lock-wait")
     exit(acquire_runtime_dir_lock_wait(ARGV[1], ARGV[2], ARGV[3]) ? 0 : 1);
 else if (mode == "release-runtime-dir-lock")
     release_runtime_dir_lock(ARGV[1]);
-else if (mode == "reload-sing-box-runtime")
+else if (mode == "reload-core-runtime")
     reload_sing_box_runtime(ARGV[1], ARGV[2], ARGV[3], ARGV[4]);
-else if (mode == "sighup-sing-box-runtime")
+else if (mode == "sighup-core-runtime")
     exit(try_sighup_reload(ARGV[1]) ? 0 : 1);
-else if (mode == "hup-sing-box-runtime")
+else if (mode == "hup-core-runtime")
     hup_sing_box_runtime();
 else if (mode == "clear-reload-state")
     clear_reload_state(ARGV[1], ARGV[2]);
@@ -2442,9 +2498,9 @@ else if (mode == "response-success")
     exit(response_success() ? 0 : 1);
 else if (mode == "stdin-first-field")
     stdin_first_field();
-else if (mode == "sing-box-service-pid")
+else if (mode == "tachyon-core-service-pid")
     sing_box_service_pid();
-else if (mode == "sing-box-service-runtime-pid" || mode == "sing-box-service-pid-runtime") {
+else if (mode == "tachyon-core-service-runtime-pid" || mode == "tachyon-core-service-pid-runtime") {
     let pid = sing_box_service_pid_runtime();
     if (pid <= 0)
         exit(1);
@@ -2452,7 +2508,7 @@ else if (mode == "sing-box-service-runtime-pid" || mode == "sing-box-service-pid
 }
 else if (mode == "sing-box-service-running")
     exit(sing_box_service_running() ? 0 : 1);
-else if (mode == "sing-box-service-stable")
+else if (mode == "tachyon-core-service-stable")
     exit(sing_box_service_stable(ARGV[1]) ? 0 : 1);
 else if (mode == "process-age-seconds-fixture") {
     let age = process_age_seconds_from_ticks(ARGV[1], ARGV[2]);
@@ -2472,9 +2528,9 @@ else if (mode == "tachyon-stably-running")
     exit(tachyon_stably_running(ARGV[1], ARGV[2], ARGV[3], ARGV[4]) ? 0 : 1);
 else if (mode == "wait-tachyon-stable-start")
     exit(wait_tachyon_stable_start(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]) ? 0 : 1);
-else if (mode == "wait-sing-box-service-stable")
-    exit(wait_sing_box_service_stable(ARGV[1], ARGV[2]) ? 0 : 1);
-else if (mode == "list-has-remote-references" || mode == "list-has-remote-sing-box-rulesets")
+else if (mode == "wait-tachyon-core-service-stable")
+    exit(wait_tachyon_core_service_stable(ARGV[1], ARGV[2]) ? 0 : 1);
+else if (mode == "list-has-remote-references" || mode == "list-has-remote-core-rulesets")
     exit(list_has_remote_references(ARGV[1]) ? 0 : 1);
 else if (mode == "community-service-has-subnet-list")
     exit(community_service_has_subnet_list(ARGV[1]) ? 0 : 1);
@@ -2660,7 +2716,7 @@ else if (mode == "write-provenance")
     exit(write_provenance_file(as_string(ARGV[1])) ? 0 : 1);
 else if (mode == "verify-provenance")
     exit(verify_provenance() ? 0 : 1);
-else if (mode == "sing-box-is-foreign")
+else if (mode == "core-is-foreign")
     exit(sing_box_is_foreign() ? 0 : 1);
 else if (mode == "cleanup-provenance") {
     cleanup_provenance_file();

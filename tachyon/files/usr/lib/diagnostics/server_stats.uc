@@ -32,6 +32,7 @@ function safe_json_parse(text) {
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const STATS_STORAGE_PATH = getenv("TACHYON_SERVER_STATS_PATH") || "/var/run/tachyon/server_stats.json";
 const TACHYON_BIN = getenv("TACHYON_BIN") || "/usr/bin/tachyon";
+const STALE_TAG_GRACE_SECONDS = int(getenv("TACHYON_SERVER_STATS_TAG_GRACE") || "3600");
 
 // --- Monotonic & Wall Time Helpers ---
 
@@ -224,6 +225,23 @@ function sync_runtime_proxies_to_db(db) {
             }
         }
     }
+
+    // A subscription that embeds load or a date in node names mints a new tag
+    // on every refresh, and the old ones stayed here forever. This file lives
+    // in /var/run (RAM), is re-read and re-serialised by every stats call, and
+    // dead tags were still being probed. Only prune against a non-empty
+    // runtime view: a failed fetch must not wipe the history. A tag gets an
+    // hour of grace after it last appeared.
+    if (length(keys(proxies)) > 0) {
+        let cutoff = get_now_ts() - STALE_TAG_GRACE_SECONDS;
+        for (let tag in keys(db.servers)) {
+            if (proxies[tag] != null)
+                continue;
+            let entry = db.servers[tag];
+            if ((int(entry.last_checked) || 0) < cutoff)
+                delete db.servers[tag];
+        }
+    }
     return count;
 }
 
@@ -412,6 +430,18 @@ function get_summary() {
     };
 }
 
+// Composite ranking: latency first, then stability. jitter_ms is collected by
+// record_measurement but was never scored — a node with the same average and
+// wild swings now loses to a steady one.
+function candidate_score(entry) {
+    if (type(entry) != "object")
+        entry = {};
+    return (entry.avg_latency || entry.last_latency || 9999)
+        + (entry.jitter_ms || 0)
+        + ((entry.consecutive_failures || 0) * 100)
+        - ((entry.success_rate || 0) * 2);
+}
+
 function get_best_candidates(target_section, limit) {
     let db = load_stats_db();
     sync_runtime_proxies_to_db(db);
@@ -429,11 +459,9 @@ function get_best_candidates(target_section, limit) {
         }
     }
 
-    // Sort by composite score: lowest latency with penalty for consecutive failures and low success rate
+    // Sort by composite score: lowest latency and jitter with penalty for consecutive failures and low success rate
     sort(pool, function(a, b) {
-        let score_a = (a.avg_latency || a.last_latency || 9999) + (a.consecutive_failures * 100) - (a.success_rate * 2);
-        let score_b = (b.avg_latency || b.last_latency || 9999) + (b.consecutive_failures * 100) - (b.success_rate * 2);
-        return score_a - score_b;
+        return candidate_score(a) - candidate_score(b);
     });
 
     let result = [];
@@ -488,6 +516,7 @@ function module_exports() {
         get_summary,
         probe_and_record,
         probe_all_servers,
+        candidate_score,
         get_best_candidates,
         query_servers,
         record_probe_result,

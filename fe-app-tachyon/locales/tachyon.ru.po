@@ -7,8 +7,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: TACHYON\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-14 23:47+0300\n"
-"PO-Revision-Date: 2026-10-14 23:47+0300\n"
+"POT-Creation-Date: 2026-10-19 22:58+0300\n"
+"PO-Revision-Date: 2026-10-19 22:58+0300\n"
 "Last-Translator: Dushnilin\n"
 "Language-Team: none\n"
 "Language: ru\n"
@@ -16,6 +16,12 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n"
+
+msgid "\"%s\" is not part of this section - add it to its conditions first"
+msgstr "\"%s\" в этой секции не используется - сначала добавьте его в условия"
+
+msgid "\"%s\" is the global rule of section \"%s\" and cannot be used here"
+msgstr "\"%s\" - это глобальное правило секции \"%s\", здесь его нельзя использовать"
 
 msgid "%s: select an Amnezia .conf file up to 64 KiB"
 msgstr "%s: выберите файл Amnezia .conf размером до 64 КиБ"
@@ -134,8 +140,8 @@ msgstr "Не удалось сгенерировать стратегии чер
 msgid "ALPN"
 msgstr "ALPN"
 
-msgid "API Key for OpenAI (sk-...) or DeepSeek (optional for Ollama / LM Studio)"
-msgstr "API-ключ для OpenAI (sk-...) или DeepSeek (опционально для Ollama / LM Studio)"
+msgid "API Key for OpenAI (sk-...), Anthropic, DeepSeek, OpenRouter, or Gemini (optional for Ollama / LM Studio)"
+msgstr ""
 
 msgid "Accept external proxy connections and route them with sing-box."
 msgstr "Принимать внешние прокси-подключения и маршрутизировать их через sing-box."
@@ -394,6 +400,9 @@ msgstr "Всегда блокировать эти домены для всех 
 
 msgid "Always visible"
 msgstr "Всегда включено"
+
+msgid "Amber"
+msgstr "Янтарный"
 
 msgid "Amnezia .conf"
 msgstr "Amnezia .conf"
@@ -758,6 +767,9 @@ msgstr "Блокирует доступ к приватным/локальным
 msgid "Blocks port 853 (DNS-over-TLS) and prevents bypass via encrypted DNS or Private Relay on smartphones for devices in this profile."
 msgstr "Блокирует порт 853 (DNS-over-TLS) и предотвращает обход через шифрованный DNS или Private Relay на смартфонах для устройств этого профиля."
 
+msgid "Blue"
+msgstr "Синий"
+
 msgid "Bootstrap DNS"
 msgstr "Bootstrap DNS"
 
@@ -1103,6 +1115,9 @@ msgstr "Компоненты"
 msgid "Concurrency"
 msgstr "Параллелизм"
 
+msgid "Condition value"
+msgstr "Значение условия"
+
 msgid "Conditions"
 msgstr "Условия"
 
@@ -1262,8 +1277,8 @@ msgstr "Пользовательский MTU, например 1500 (остав�
 msgid "Custom OpenAI-Compatible API"
 msgstr "Пользовательский OpenAI-совместимый API"
 
-msgid "Custom OpenAI-compatible API endpoint URL (e.g. http://192.168.1.100:11434/v1/chat/completions)"
-msgstr "Пользовательский URL эндпоинта OpenAI-совместимого API (напр. http://192.168.1.100:11434/v1/chat/completions)"
+msgid "Custom OpenAI-compatible API endpoint URL (e.g. http://192.168.1.100:11434/v1/chat/completions or https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)"
+msgstr ""
 
 msgid "Custom device headers"
 msgstr "Пользовательские заголовки устройства"
@@ -1300,6 +1315,9 @@ msgstr "Настройте порядок и видимость вкладок �
 
 msgid "Customize which component cards are displayed in the Components tab. Checkboxes show or hide components."
 msgstr "Настройте отображение карточек на вкладке «Компоненты». Галочки показывают или скрывают компоненты."
+
+msgid "Cyan"
+msgstr "Голубой"
 
 msgid "DHCP has DNS server"
 msgstr "DHCP содержит DNS сервер"
@@ -1486,6 +1504,9 @@ msgstr "Дневной лимит трафика (МБ)"
 
 msgid "Daily quota applies only when Target Scope is All Internet"
 msgstr "Суточная квота действует только при выборе области «Весь интернет»"
+
+msgid "Dark"
+msgstr "Тёмный"
 
 msgid "Dashboard"
 msgstr "Дашборд"
@@ -1780,6 +1801,9 @@ msgstr "Такой тег JSON outbound уже используется"
 
 msgid "Duplicate value"
 msgstr "Дублирующееся значение"
+
+msgid "Dynamic GOMEMLIMIT memory cap in MB for sing-box / tachyon-core. Set 0 for auto (50% RAM on low-memory devices or when OOM occurs)."
+msgstr ""
 
 msgid "EXCELLENT"
 msgstr "ОТЛИЧНО"
@@ -2402,6 +2426,9 @@ msgstr "Исправлено"
 msgid "Fleet Latency"
 msgstr "Средняя задержка серверов"
 
+msgid "Flow"
+msgstr "Поток (Flow)"
+
 msgid "Flush Conntrack Table"
 msgstr "Очистить таблицу соед. (conntrack)"
 
@@ -2530,6 +2557,21 @@ msgstr "Глобальная проверка"
 
 msgid "Global check failed"
 msgstr "Не удалось выполнить глобальную проверку"
+
+msgid "Global rule"
+msgstr "Глобальное правило"
+
+msgid "Global rule enabled"
+msgstr "Включено глобальное правило"
+
+msgid "Global rules"
+msgstr "Глобальные правила"
+
+msgid "Google Gemini API (gemini-2.5-flash / pro)"
+msgstr ""
+
+msgid "Green"
+msgstr "Зелёный"
 
 msgid "Group"
 msgstr "Группа"
@@ -2667,7 +2709,7 @@ msgid "History cleared"
 msgstr "История очищена"
 
 msgid "Home Router / Office / Dacha"
-msgstr ""
+msgstr "Домашний роутер / Офис / Дача"
 
 msgid "Host"
 msgstr "Хост"
@@ -2824,6 +2866,12 @@ msgstr "Включить серверы"
 
 msgid "Independent DoH/TLS probe"
 msgstr "Независимая проверка DoH/TLS"
+
+msgid "Indigo"
+msgstr "Индиго"
+
+msgid "Info"
+msgstr "Параметры"
 
 msgid "Information"
 msgstr "Информация"
@@ -3146,6 +3194,9 @@ msgstr "Недопустимый домен: пустое значение пр�
 msgid "Invalid format. Use an IP address or CIDR subnet"
 msgstr "Неверный формат. Используйте IP-адрес или подсеть CIDR"
 
+msgid "Invalid global rule \"%s\": expected \"option: value\" with a supported option"
+msgstr "Некорректное глобальное правило \"%s\": нужна запись вида \"опция: значение\" с поддерживаемой опцией"
+
 msgid "Invalid line: \"%s\". Use: domain ip or ip domain"
 msgstr "Неверная строка: \"%s\". Используйте: domain ip или ip domain"
 
@@ -3328,6 +3379,18 @@ msgstr "Обнаружены устаревшие пути zapret, требуе�
 
 msgid "Level name"
 msgstr "Имя уровня"
+
+msgid "Light Blue"
+msgstr "Светло-синий"
+
+msgid "Light Green"
+msgstr "Светло-зелёный"
+
+msgid "Light Pink"
+msgstr "Светло-розовый"
+
+msgid "Light Yellow"
+msgstr "Светло-жёлтый"
 
 msgid "List Update Frequency"
 msgstr "Частота обновления списков"
@@ -3533,6 +3596,9 @@ msgstr "Медиана"
 msgid "Median; successful queries: %s / %s. Click for details."
 msgstr "Медиана; успешные запросы: %s / %s. Нажмите для подробностей."
 
+msgid "Memory Limit (MB)"
+msgstr ""
+
 msgid "Memory Usage"
 msgstr "Использование памяти"
 
@@ -3572,8 +3638,8 @@ msgstr "Имя пользователя смешанного прокси"
 msgid "Mode"
 msgstr "Режим"
 
-msgid "Model name to use. Leave empty to use default (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / llama3.2)."
-msgstr "Имя используемой модели. Оставьте пустым, чтобы использовать модель по умолчанию (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / llama3.2)."
+msgid "Model name to use. Leave empty to use default (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / gemini-2.5-flash / llama3.2)."
+msgstr ""
 
 msgid "Modules"
 msgstr "Модули"
@@ -3598,6 +3664,9 @@ msgstr "Переместить ниже"
 
 msgid "Move Up"
 msgstr "Переместить выше"
+
+msgid "Multiplex"
+msgstr "Мультиплексирование"
 
 msgid "Must be a comma-separated list of numeric IDs"
 msgstr "Должен быть список числовых ID через запятую"
@@ -4026,7 +4095,7 @@ msgid "Optional context (e.g. \"Rostelecom, YouTube 4K buffering is slow\")..."
 msgstr "Дополнительный контекст (напр. \"Ростелеком, долго грузится YouTube 4K\")..."
 
 msgid "Optional name displayed at the top of all Telegram bot messages to identify this router when multiple routers share the same bot token."
-msgstr ""
+msgstr "Необязательное имя, отображаемое в верхней части всех сообщений Telegram-бота для идентификации этого роутера, когда один токен бота используется на нескольких роутерах."
 
 msgid "Optional tls-auth or tls-crypt key"
 msgstr "Опциональный ключ tls-auth или tls-crypt"
@@ -4054,6 +4123,9 @@ msgstr "При необходимости укажите отдельные ус
 
 msgid "Or paste hosts file content:"
 msgstr "Или вставьте содержимое файла hosts:"
+
+msgid "Orange"
+msgstr "Оранжевый"
 
 msgid "Other peers"
 msgstr "Другие пиры"
@@ -4210,6 +4282,9 @@ msgstr "Закрепить на дашборде"
 
 msgid "Ping"
 msgstr "Пинг"
+
+msgid "Pinning"
+msgstr "Привязка сертификата"
 
 msgid "Plain-UDP DNS servers used as a last resort when all primary DNS fail. These are always unencrypted (no DoH/DoT). Example: 1.1.1.1, 8.8.8.8. Unlike the ISP fallback toggle, these are your own chosen servers."
 msgstr "Обычные UDP DNS-серверы, используемые как резерв при недоступности всех основных DNS. Всегда работают без шифрования (без DoH/DoT). Пример: 1.1.1.1, 8.8.8.8. В отличие от аварийного DNS провайдера, это выбранные вами серверы."
@@ -4451,6 +4526,9 @@ msgstr "Публичный IP не требуется для этой конфи
 msgid "Public host"
 msgstr "Публичный хост"
 
+msgid "Purple"
+msgstr "Фиолетовый"
+
 msgid "QR code is too large"
 msgstr "QR-код слишком большой"
 
@@ -4628,6 +4706,9 @@ msgstr "Удалить серверы, чьи имена соответству�
 msgid "Remove the specified servers from this level."
 msgstr "Удалить указанные серверы с этого уровня."
 
+msgid "Removed from other sections as global: %s"
+msgstr "Удалено из других секций как глобальное: %s"
+
 msgid "Removed lines (-):"
 msgstr "Удалённые строки (-):"
 
@@ -4766,6 +4847,9 @@ msgstr "Многоразовый или эфемерный pre-auth ключ д�
 msgid "Rollback"
 msgstr "Откатить"
 
+msgid "Rose"
+msgstr "Розовый"
+
 msgid "Route"
 msgstr "Маршрут"
 
@@ -4827,7 +4911,7 @@ msgid "Router DNS queries were observed by the test service."
 msgstr "Тестовый сервис зафиксировал запросы через DNS роутера."
 
 msgid "Router Name"
-msgstr ""
+msgstr "Имя роутера"
 
 msgid "Router Traffic Target Section"
 msgstr "Секция для трафика роутера"
@@ -4933,6 +5017,9 @@ msgstr "Подменять LAN-адреса при выходе через tails
 
 msgid "SNI"
 msgstr "SNI"
+
+msgid "SNI / Host"
+msgstr "SNI / Хост"
 
 msgid "SSH"
 msgstr "SSH"
@@ -5108,14 +5195,14 @@ msgstr "Выберите один или несколько ISO-кодов ст�
 msgid "Select or enter a User-Agent"
 msgstr "Выберите или введите User-Agent"
 
-msgid "Select or enter path for sing-box cache file. Change this ONLY if you know what you are doing"
-msgstr "Выберите или введите путь к файлу кэша sing-box. Изменяйте ТОЛЬКО если точно знаете, что делаете"
+msgid "Select or enter path for tachyon-core cache file. Change this ONLY if you know what you are doing"
+msgstr ""
 
 msgid "Select or enter the IP addresses of your game consoles."
 msgstr "Выберите или введите IP-адреса ваших игровых консолей."
 
-msgid "Select path for sing-box config file. Change this ONLY if you know what you are doing"
-msgstr "Выберите путь к файлу конфигурации sing-box. Изменяйте ТОЛЬКО если точно знаете, что делаете"
+msgid "Select path for tachyon-core config file. Change this ONLY if you know what you are doing"
+msgstr ""
 
 msgid "Select sections to merge"
 msgstr "Выберите секции для объединения"
@@ -5936,6 +6023,9 @@ msgstr "Целевой сервис / Набор"
 msgid "Target accessible — no DPI blocking detected."
 msgstr "Цель доступна — блокировок DPI не обнаружено."
 
+msgid "Teal"
+msgstr "Бирюзовый"
+
 msgid "Teen (🧑)"
 msgstr "Подросток (🧑)"
 
@@ -6572,6 +6662,9 @@ msgstr "Значение должно быть положительным цел
 msgid "Value must not contain control characters"
 msgstr "Значение не должно содержать символы управления"
 
+msgid "Values listed here belong to this section alone: every other section stops offering them and loses them on save, and this section gets a \"Global rule enabled\" mark. Only values already used by this section can be claimed."
+msgstr "Перечисленные здесь значения принадлежат только этой секции: во всех остальных секциях они исчезают из списка выбора и удаляются при сохранении, а на самой секции появляется отметка «Включено глобальное правило». Заявить можно только те значения, которые эта секция уже использует."
+
 msgid "Verdict"
 msgstr "Статус"
 
@@ -6728,6 +6821,9 @@ msgstr "Если включено, блокировка поддомена (на
 msgid "When switching to another level, test every server and select the fastest instead of the first working one."
 msgstr "При переключении на другой уровень тестировать каждый сервер и выбирать самый быстрый вместо первого рабочего."
 
+msgid "White"
+msgstr "Белый"
+
 msgid "Why Discord fails?"
 msgstr "Почему не работает Discord?"
 
@@ -6748,6 +6844,9 @@ msgstr "Рабочих"
 
 msgid "XHTTP mode"
 msgstr "Режим XHTTP"
+
+msgid "XMUX"
+msgstr "XMUX"
 
 msgid "YACD Secret Key"
 msgstr "Секретный ключ YACD"
@@ -6944,6 +7043,9 @@ msgstr "стратегия настроена для секции с дейст�
 msgid "tiny"
 msgstr "tiny"
 
+msgid "uTLS Fingerprint"
+msgstr "Отпечаток uTLS"
+
 msgid "unique UCI identifier"
 msgstr "уникальный идентификатор UCI"
 
@@ -7093,6 +7195,21 @@ msgstr "🧠 Генерация..."
 
 msgid "🧬 Adaptive Smart Fuzzing (Genetic / Prior Seeds)"
 msgstr "🧬 Адаптивный умный фаззинг (генетический / по базовым шаблонам)"
+
+msgid "API Key for OpenAI (sk-...) or DeepSeek (optional for Ollama / LM Studio)"
+msgstr "API-ключ для OpenAI (sk-...) или DeepSeek (опционально для Ollama / LM Studio)"
+
+msgid "Custom OpenAI-compatible API endpoint URL (e.g. http://192.168.1.100:11434/v1/chat/completions)"
+msgstr "Пользовательский URL эндпоинта OpenAI-совместимого API (напр. http://192.168.1.100:11434/v1/chat/completions)"
+
+msgid "Model name to use. Leave empty to use default (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / llama3.2)."
+msgstr "Имя используемой модели. Оставьте пустым, чтобы использовать модель по умолчанию (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / llama3.2)."
+
+msgid "Select or enter path for sing-box cache file. Change this ONLY if you know what you are doing"
+msgstr "Выберите или введите путь к файлу кэша sing-box. Изменяйте ТОЛЬКО если точно знаете, что делаете"
+
+msgid "Select path for sing-box config file. Change this ONLY if you know what you are doing"
+msgstr "Выберите путь к файлу конфигурации sing-box. Изменяйте ТОЛЬКО если точно знаете, что делаете"
 
 msgid "Open"
 msgstr "Открыть"

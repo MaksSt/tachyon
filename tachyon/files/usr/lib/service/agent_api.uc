@@ -102,7 +102,7 @@ function check_write_auth(bearer) {
 function handle_health() {
     let ai_raw = fs.readfile("/tmp/tachyon_ai_status.json") || "{}";
     let ai = parse_json_safe(ai_raw) || {};
-    let sb_pid = trim(command_output("pidof sing-box"));
+    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
     let wd_pid = trim(fs.readfile("/var/run/tachyon_watchdog.pid") || "");
     ok({
         status:    ai.status || (sb_pid != "" ? "healthy" : "critical"),
@@ -169,7 +169,7 @@ function handle_snapshot() {
     if (tachyon_ver == "")
         tachyon_ver = trim(command_output("apk list tachyon 2>/dev/null | head -1"));
 
-    let sb_pid = trim(command_output("pidof sing-box"));
+    let sb_pid = trim(command_output("pidof tachyon-core sing-box"));
     let wd_pid = trim(fs.readfile("/var/run/tachyon_watchdog.pid") || "");
     let wd_ok = wd_pid != "" && fs.stat("/proc/" + wd_pid) != null;
 
@@ -523,7 +523,7 @@ function handle_restart(body) {
     }
 
     let cmd_map = {
-        singbox:  "/etc/init.d/sing-box restart > /dev/null 2>&1",
+        singbox:  "/etc/init.d/tachyon-core restart > /dev/null 2>&1",
         tachyon:  "/etc/init.d/tachyon restart > /dev/null 2>&1",
         dnsmasq:  "/etc/init.d/dnsmasq restart > /dev/null 2>&1",
         watchdog: "/usr/bin/tachyon watchdog start-runtime > /dev/null 2>&1"

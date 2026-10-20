@@ -5,13 +5,13 @@ let common = require("core.common");
 let helpers = require("core.helpers");
 let core_ip = require("core.ip");
 let core_url = require("core.url");
-let runtime_constants = require("singbox.constants");
-let runtime_dns = require("singbox.dns");
-let runtime_route = require("singbox.route");
-let runtime_rulesets = require("singbox.rulesets");
-let runtime_subscription = require("singbox.subscription");
-let runtime_servers = require("singbox.servers");
-let runtime_urltest = require("singbox.urltest");
+let runtime_constants = require("tachyon_core.constants");
+let runtime_dns = require("tachyon_core.dns");
+let runtime_route = require("tachyon_core.route");
+let runtime_rulesets = require("tachyon_core.rulesets");
+let runtime_subscription = require("tachyon_core.subscription");
+let runtime_servers = require("tachyon_core.servers");
+let runtime_urltest = require("tachyon_core.urltest");
 let connections = require("config.connections");
 let rule_config = require("config.rule");
 let source_rulesets = require("routing.rulesets");
@@ -759,11 +759,11 @@ function group_member_leaf_tags(members, config) {
 }
 
 function is_extended_variant_detected() {
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant";
+    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
     let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
     if (sb_variant_val == "extended" || sb_variant_val == "extended-compressed")
         return true;
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
+    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
     let sb_version_val = trim(fs.readfile(sb_version_file) || "");
     return index(sb_version_val, "extended") >= 0;
 }
@@ -782,8 +782,6 @@ function add_urltest_outbound(config, section, urltest_id, urltest_candidate_tag
         tolerance: int(connections.urltest_tolerance(section, urltest_id), 10),
         interrupt_exist_connections: connections.urltest_interrupt_exist_connections(section, urltest_id)
     };
-    if (is_extended_variant_detected() && length(urltest_outbounds) > 0)
-        urltest_outbound.default = urltest_outbounds[0];
     let idle_timeout = urltest_idle_timeout(section, urltest_id);
     if (idle_timeout != "")
         urltest_outbound.idle_timeout = idle_timeout;
@@ -1710,13 +1708,24 @@ function section_dns_server(section) {
     return runtime_constants.FAKEIP_DNS_SERVER_TAG;
 }
 
+function section_is_ipv4_only_dpi(section) {
+    let action = option(section, "action", "");
+    if (action != "zapret" && action != "zapret2")
+        return false;
+    let opt_key = action == "zapret2" ? "nfqws2_opt" : "nfqws_opt";
+    let raw = trim(option(section, opt_key, ""));
+    if (raw == "" || index(raw, "--filter-l3=ipv4") < 0)
+        return false;
+    return match(raw, /--filter-l3=[^[:space:]]*ipv6/) == null;
+}
+
 // The fakeip server synthesises addresses and answers A and AAAA only. Without
 // an explicit query_type every other type went there too and got nothing, so the
 // client waited out its own timeout: MX for mail, SRV for service discovery,
 // TXT for SPF/DKIM. Browsers never noticed, they only ask A and AAAA.
-function add_fakeip_query_type(rule, server_tag) {
+function add_fakeip_query_type(rule, server_tag, ipv4_only) {
     if (server_tag == runtime_constants.FAKEIP_DNS_SERVER_TAG)
-        rule.query_type = [ "A", "AAAA" ];
+        rule.query_type = ipv4_only ? [ "A" ] : [ "A", "AAAA" ];
     return rule;
 }
 
@@ -2293,9 +2302,9 @@ function add_protocol_matchers(rule, section) {
 function load_community_subnet_cidrs(community, filter_mode) {
     let service = as_string(community);
     let paths = [
-        "/tmp/sing-box/rulesets/community-subnets-" + service + ".lst",
+        "/tmp/tachyon-core/rulesets/community-subnets-" + service + ".lst",
         "/etc/tachyon/rulesets/community-subnets-" + service + ".lst",
-        (ctx.runtime_ruleset_folder || runtime_ruleset_folder || "/tmp/sing-box/rulesets") + "/community-subnets-" + service + ".lst"
+        (ctx.runtime_ruleset_folder || runtime_ruleset_folder || "/tmp/tachyon-core/rulesets") + "/community-subnets-" + service + ".lst"
     ];
     let cidrs = [];
     for (let path in paths) {
@@ -2541,32 +2550,60 @@ function add_combined_route_for_section(config, section) {
         push_section_geoip_remainder(config, create_section_route_rule(), target, excluded_cidrs, geo_tags, country_mode);
 
     let rewrite_ttl = int_option(ctx.runtime_settings(), "dns_rewrite_ttl", "60");
+    let dns_server_tag = section_dns_server(section);
+    let ipv4_only_dpi = section_is_ipv4_only_dpi(section) &&
+        dns_server_tag == runtime_constants.FAKEIP_DNS_SERVER_TAG;
     if (length(domain) > 0 || length(domain_suffix) > 0 || length(domain_keyword) > 0 || length(domain_regex) > 0) {
         let dns_rule = {
             action: "route",
-            server: section_dns_server(section),
+            server: dns_server_tag,
             rewrite_ttl
         };
-        add_fakeip_query_type(dns_rule, section_dns_server(section));
+        add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
         add_domain_array(dns_rule, "domain", domain);
         add_domain_array(dns_rule, "domain_suffix", domain_suffix);
         add_domain_array(dns_rule, "domain_keyword", domain_keyword);
         add_domain_array(dns_rule, "domain_regex", domain_regex);
         add_source_dns_matchers(dns_rule, source_ip_cidr);
         push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
+        if (ipv4_only_dpi) {
+            let aaaa_rule = {
+                action: "route",
+                server: runtime_constants.DNS_SERVER_TAG,
+                rewrite_ttl,
+                query_type: [ "AAAA" ]
+            };
+            add_domain_array(aaaa_rule, "domain", domain);
+            add_domain_array(aaaa_rule, "domain_suffix", domain_suffix);
+            add_domain_array(aaaa_rule, "domain_keyword", domain_keyword);
+            add_domain_array(aaaa_rule, "domain_regex", domain_regex);
+            add_source_dns_matchers(aaaa_rule, source_ip_cidr);
+            push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
+        }
     }
     let is_1_14 = ctx.is_sb_1_14_plus && ctx.is_sb_1_14_plus();
     if (is_1_14) {
         if (length(dns_query_rule_set_tags) > 0) {
             let dns_rule = {
                 action: "route",
-                server: section_dns_server(section),
+                server: dns_server_tag,
                 rewrite_ttl,
                 rule_set: single_or_array(dns_query_rule_set_tags)
             };
-            add_fakeip_query_type(dns_rule, section_dns_server(section));
+            add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
             add_source_dns_matchers(dns_rule, source_ip_cidr);
             push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
+            if (ipv4_only_dpi) {
+                let aaaa_rule = {
+                    action: "route",
+                    server: runtime_constants.DNS_SERVER_TAG,
+                    rewrite_ttl,
+                    query_type: [ "AAAA" ],
+                    rule_set: single_or_array(dns_query_rule_set_tags)
+                };
+                add_source_dns_matchers(aaaa_rule, source_ip_cidr);
+                push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
+            }
         }
         if (length(dns_response_rule_set_tags) > 0) {
             let eval_rule = {
@@ -2578,7 +2615,7 @@ function add_combined_route_for_section(config, section) {
 
             let dns_rule = {
                 action: "route",
-                server: section_dns_server(section),
+                server: dns_server_tag,
                 rewrite_ttl,
                 rule_set: single_or_array(dns_response_rule_set_tags),
                 match_response: true
@@ -2597,13 +2634,24 @@ function add_combined_route_for_section(config, section) {
         if (length(all_dns_tags) > 0) {
             let dns_rule = {
                 action: "route",
-                server: section_dns_server(section),
+                server: dns_server_tag,
                 rewrite_ttl,
                 rule_set: single_or_array(all_dns_tags)
             };
-            add_fakeip_query_type(dns_rule, section_dns_server(section));
+            add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
             add_source_dns_matchers(dns_rule, source_ip_cidr);
             push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
+            if (ipv4_only_dpi) {
+                let aaaa_rule = {
+                    action: "route",
+                    server: runtime_constants.DNS_SERVER_TAG,
+                    rewrite_ttl,
+                    query_type: [ "AAAA" ],
+                    rule_set: single_or_array(all_dns_tags)
+                };
+                add_source_dns_matchers(aaaa_rule, source_ip_cidr);
+                push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
+            }
         }
     }
 }

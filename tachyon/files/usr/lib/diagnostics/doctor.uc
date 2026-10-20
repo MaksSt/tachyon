@@ -20,7 +20,7 @@ const TACHYON_CONFIG = getenv("TACHYON_CONFIG") || constants.TACHYON_CONFIG || "
 const TACHYON_SERVICE_NAME = getenv("TACHYON_SERVICE_NAME") || constants.TACHYON_SERVICE_NAME || "tachyon";
 const RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
 const LOGREAD_LINE_LIMIT = "500";
-const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || constants.TMP_SING_BOX_FOLDER || "/tmp/sing-box";
+const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || constants.TMP_SING_BOX_FOLDER || "/tmp/tachyon-core";
 const TMP_RULESET_FOLDER = getenv("TMP_RULESET_FOLDER") || constants.TMP_RULESET_FOLDER || TMP_SING_BOX_FOLDER + "/rulesets";
 const CHECK_PROXY_IP_DOMAIN = getenv("CHECK_PROXY_IP_DOMAIN") || constants.CHECK_PROXY_IP_DOMAIN || "ip.podkop.fyi";
 const FAKEIP_TEST_DOMAIN = getenv("FAKEIP_TEST_DOMAIN") || constants.FAKEIP_TEST_DOMAIN || "fakeip.podkop.fyi";
@@ -38,7 +38,7 @@ const CLOUDFLARE_OCTETS = getenv("CLOUDFLARE_OCTETS") || constants.CLOUDFLARE_OC
 
 const HELPERS_UC = LIB_DIR + "/core/helpers.uc";
 const SERVICE_STATE_UC = LIB_DIR + "/service/state.uc";
-const SINGBOX_RUNTIME_UC = LIB_DIR + "/singbox/runtime.uc";
+const SINGBOX_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
 const ZAPRET_RUNTIME_UC = LIB_DIR + "/providers/zapret/runtime.uc";
 const ZAPRET2_RUNTIME_UC = LIB_DIR + "/providers/zapret2/runtime.uc";
 const BYEDPI_RUNTIME_UC = LIB_DIR + "/providers/byedpi/runtime.uc";
@@ -169,7 +169,10 @@ function build_system_info() { return sysinfo_mod.build_system_info(); }
 function show_config(visibility) { return sysinfo_mod.show_config(visibility); }
 function provider_installed(runtime_uc) { return sysinfo_mod.provider_installed(runtime_uc); }
 function sing_box_resolved_version() { return sysinfo_mod.sing_box_resolved_version(); }
-function sing_box_capability_flags(version) { return sysinfo_mod.sing_box_capability_flags(version); }
+// Caller at2219 passes (version, version_output); system_info reads the banner
+// from the second argument, so dropping it here silently forced the empty-banner
+// branch (and its component-action tailscale guess) on every doctor run.
+function sing_box_capability_flags(version, version_output) { return sysinfo_mod.sing_box_capability_flags(version, version_output); }
 function dns_check_router_resolver_available(router_ip) { return dns_mod.dns_check_router_resolver_available(router_ip); }
 function clash_api_url() { return routing_mod.clash_api_url(); }
 function singbox_config_path() { return common.singbox_config_path(); }
@@ -295,15 +298,13 @@ function network_show_data() {
 function helper_output(mode, args) {
     let full = [ mode ];
     for (let arg in args) push(full, as_string(arg));
-    return replace(module_output(HELPERS_UC, full), /[
-]+$/g, "");
+    return replace(module_output(HELPERS_UC, full), /[\n]+$/g, "");
 }
 
 function file_exists(path) { return fs.stat(as_string(path)) != null; }
 function command_exists(name) { return command_status("which " + shell_quote(name) + " >/dev/null 2>&1") == 0; }
 function stdout_is_tty() { return command_status("test -t 1") == 0; }
-function nolog(message) { if (stdout_is_tty()) print(as_string(message), "
-"); }
+function nolog(message) { if (stdout_is_tty()) print(as_string(message), "\n"); }
 
 function dns_check_resolve_host(host, resolver, timeout_seconds) {
     return dns_mod.dns_check_resolve_host(host, resolver, timeout_seconds);
@@ -331,6 +332,23 @@ function check_steer() {
 
 function check_dns_available() {
     return dns_mod.check_dns_available();
+}
+
+function is_valid_resolv_conf() {
+    let resolv_link = "";
+    try { resolv_link = fs.readlink("/etc/resolv.conf") || ""; } catch(e) {}
+    let content = trim(fs.readfile("/etc/resolv.conf") || "");
+    let has_nameserver = match(content, /nameserver\s+[0-9a-fA-F:.]+/);
+
+    if (resolv_link == "/tmp/resolv.conf" || resolv_link == "../tmp/resolv.conf" ||
+        resolv_link == "/tmp/resolv.conf.d/resolv.conf.auto" || resolv_link == "../tmp/resolv.conf.d/resolv.conf.auto" ||
+        resolv_link == "/tmp/resolv.conf.auto" || resolv_link == "../tmp/resolv.conf.auto") {
+        return { ok: true, is_link: true, target: resolv_link };
+    }
+    if (has_nameserver) {
+        return { ok: true, is_link: resolv_link != "", target: resolv_link != "" ? resolv_link : "regular file" };
+    }
+    return { ok: false, is_link: resolv_link != "", target: resolv_link };
 }
 
 function check_fakeip() {
@@ -500,6 +518,22 @@ function find_process_pid(name) {
     return length(pids) > 0 && pids[0] != "" ? pids[0] : "";
 }
 
+// The core binary may be named tachyon-core or sing-box depending on which
+// package is installed; every "is the core running" probe must accept both,
+// otherwise the doctor reports a running core as stopped and proposes
+// killing the very process that is serving traffic.
+function find_core_process_pid() {
+    let pid = find_process_pid("tachyon-core");
+    return pid != "" ? pid : find_process_pid("sing-box");
+}
+
+// ss and log lines name the core process however the binary is installed;
+// match both spellings or a tachyon-core instance is invisible here.
+function line_names_core(line) {
+    return index(line, "tachyon-core") >= 0 ||
+        index(line, "sing-box") >= 0 || index(line, "sing_box") >= 0;
+}
+
 function is_container_process(pid) {
     pid = as_string(pid);
     if (pid == "")
@@ -538,12 +572,12 @@ function is_adguardhome_primary_dns(cfg) {
 function tachyon_is_running() {
     let wd_pid = trim(fs.readfile("/var/run/tachyon_watchdog.pid") || "");
     if (wd_pid != "" && fs.stat("/proc/" + wd_pid) != null) return true;
-    let eng = "sing-box";
+    let eng = "tachyon-core";
     try { eng = require("core.engine").get_active(); } catch (e) {}
     if (eng == "steer" || eng == "steer-extended") {
         return find_process_pid("steer") != "" || command_success_from_args([ "/etc/init.d/steer", "status" ]);
     }
-    return find_process_pid("sing-box") != "";
+    return find_core_process_pid() != "";
 }
 
 function tachyon_is_enabled() {
@@ -555,14 +589,16 @@ function is_degraded() {
 }
 
 function kill_our_core_processes() {
-    let eng = "sing-box";
+    let eng = "tachyon-core";
     try { eng = require("core.engine").get_active(); } catch (e) {}
     if (eng == "steer" || eng == "steer-extended") {
         command_status("/etc/init.d/steer stop >/dev/null 2>&1");
         command_status("killall -9 steer >/dev/null 2>&1");
         return;
     }
-    command_status("/etc/init.d/sing-box stop >/dev/null 2>&1");
+    command_status("/etc/init.d/tachyon-core stop >/dev/null 2>&1");
+    // Both names: whichever package is installed must be stopped.
+    command_status("killall -9 tachyon-core >/dev/null 2>&1");
     command_status("killall -9 sing-box >/dev/null 2>&1");
 }
 
@@ -744,11 +780,10 @@ function run_recovery_checks() {
         doc_check("✅", "dnsmasq drop-ins", "absent", "");
     }
 
-    // resolv.conf must be the stock symlink and point at a working upstream.
+    // resolv.conf must be a valid symlink or a functional file with working nameservers.
+    let resolv_info = is_valid_resolv_conf();
     let resolv_fixed = false;
-    let resolv_link = "";
-    try { resolv_link = fs.readlink("/etc/resolv.conf") || ""; } catch(e) {}
-    if (resolv_link != "/tmp/resolv.conf" && resolv_link != "../tmp/resolv.conf") {
+    if (!resolv_info.ok) {
         doc_unlink("/etc/resolv.conf");
         if (doc_symlink("/tmp/resolv.conf", "/etc/resolv.conf"))
             resolv_fixed = true;
@@ -764,19 +799,20 @@ function run_recovery_checks() {
     if (resolv_fixed) {
         mark_fixed("resolv.conf", "broken", "восстановлена ссылка и nameserver");
     } else {
-        doc_check("✅", "resolv.conf", "OK (-> /tmp/resolv.conf)", "");
+        let desc = resolv_info.is_link ? ("OK (-> " + resolv_info.target + ")") : "OK (regular file)";
+        doc_check("✅", "resolv.conf", desc, "");
     }
 
-    // A stray sing-box (crashed service, half-removed install) must not sit
-    // between the LAN and the WAN.
-    if (find_process_pid("sing-box") != "") {
+    // A stray core (crashed service, half-removed install) must not sit
+    // between the LAN and the WAN, however the binary is named.
+    if (find_core_process_pid() != "") {
         if (DOCTOR_REPAIR_MODE)
             kill_our_core_processes();
         else
-            doc_plan("kill leftover sing-box processes");
-        mark_fixed("sing-box process", "leftover", "остановлен");
+            doc_plan("kill leftover core processes");
+        mark_fixed("core process", "leftover", "остановлен");
     } else {
-        doc_check("✅", "sing-box process", "absent", "");
+        doc_check("✅", "core process", "absent", "");
     }
 
     // Final verification: DNS through dnsmasq and straight upstream.
@@ -915,15 +951,15 @@ function run_doctor_checks_impl(repair) {
         return { report: join("\n", report) + "\n", issues, fixed, checks };
     }
 
-    let active_engine = "sing-box";
+    let active_engine = "tachyon-core";
     try {
         active_engine = require("core.engine").get_active();
     } catch (e) {}
     let is_steer = (active_engine == "steer" || active_engine == "steer-extended");
 
     let binary_name = is_steer ? "steer" : "sing-box";
-    let init_script = is_steer ? "/etc/init.d/steer" : "/etc/init.d/sing-box";
-    let config_file_path = is_steer ? "/etc/steer/spec.json" : "/etc/sing-box/config.json";
+    let init_script = is_steer ? "/etc/init.d/steer" : "/etc/init.d/tachyon-core";
+    let config_file_path = is_steer ? "/etc/steer/spec.json" : "/etc/tachyon-core/config.json";
 
     // 1. Process Check
     let has_sections = false;
@@ -937,7 +973,7 @@ function run_doctor_checks_impl(repair) {
         }
     }
 
-    let pid = find_process_pid(binary_name);
+    let pid = is_steer ? find_process_pid("steer") : find_core_process_pid();
     if (pid != "") {
         doc_check("✅", (is_steer ? active_engine : binary_name) + " process", "running (PID " + pid + ")", "");
     } else if (!has_sections && !is_steer) {
@@ -952,7 +988,7 @@ function run_doctor_checks_impl(repair) {
             command_status("sleep 1");
             command_status(init_script + " start >/dev/null 2>&1");
             command_status("sleep 3");
-            pid = find_process_pid(binary_name);
+            pid = is_steer ? find_process_pid("steer") : find_core_process_pid();
             if (pid != "") {
                 doc_check("❌", (is_steer ? active_engine : binary_name) + " process", "stopped", "→ FIXED: запущен");
                 fixed++;
@@ -1239,31 +1275,35 @@ function run_doctor_checks_impl(repair) {
             doc_check("✅", "dnsmasq params", "bypassed (DHCP-only mode, port 0)", "");
         } else {
             let noresolv = uci_core.get("dhcp.@dnsmasq[0].noresolv");
-            let localuse = uci_core.get("dhcp.@dnsmasq[0].localuse");
-            let rebind_protection = uci_core.get("dhcp.@dnsmasq[0].rebind_protection");
-            if (noresolv == "1" && localuse == "1" && rebind_protection == "0") {
-                doc_check("✅", "dnsmasq params", "OK (noresolv=1, localuse=1, rebind_protection=0)", "");
+            let raw_localuse = uci_core.get("dhcp.@dnsmasq[0].localuse");
+            // OpenWrt defaults localuse to 1 when omitted in UCI
+            let eff_localuse = (raw_localuse == null || raw_localuse == "") ? "1" : as_string(raw_localuse);
+            let raw_rebind = uci_core.get("dhcp.@dnsmasq[0].rebind_protection");
+            let eff_rebind = (raw_rebind == null || raw_rebind == "") ? "1" : as_string(raw_rebind);
+            if (noresolv == "1" && eff_localuse == "1") {
+                let detail = sprintf("OK (noresolv=1, localuse=%s, rebind_protection=%s)",
+                    (raw_localuse == null || raw_localuse == "") ? "1 (default)" : eff_localuse,
+                    eff_rebind);
+                doc_check("✅", "dnsmasq params", detail, "");
             } else {
                 issues++;
-                // noresolv/localuse are required for the sing-box DNS redirect to
-                // work; rebind_protection=0 is a deliberate compatibility downgrade
-                // for FakeIP answers — it must never be applied silently by a
-                // diagnostic pass.
                 if (!DOCTOR_REPAIR_MODE) {
-                    doc_plan("uci set dhcp noresolv=1 localuse=1 rebind_protection=0 + dnsmasq restart");
-                    doc_check("⚠️", "dnsmasq params", "incorrect", "→ WILL FIX (doctor --fix): noresolv=1, localuse=1, rebind_protection=0");
+                    doc_plan("uci set dhcp noresolv=1 localuse=1 + dnsmasq restart");
+                    doc_check("⚠️", "dnsmasq params",
+                        sprintf("incorrect (noresolv=%s, localuse=%s)", noresolv || "0", eff_localuse),
+                        "→ WILL FIX (doctor --fix): noresolv=1, localuse=1");
                 } else {
                     doc_set("dhcp.@dnsmasq[0].noresolv", "1");
-                    doc_set("dhcp.@dnsmasq[0].localuse", "1");
-                    doc_set("dhcp.@dnsmasq[0].rebind_protection", "0");
+                    if (eff_localuse != "1")
+                        doc_set("dhcp.@dnsmasq[0].localuse", "1");
                     doc_commit("dhcp");
                     command_status("/etc/init.d/dnsmasq restart >/dev/null 2>&1");
                     command_status("sleep 1");
                     let noresolv2 = uci_core.get("dhcp.@dnsmasq[0].noresolv");
-                    let localuse2 = uci_core.get("dhcp.@dnsmasq[0].localuse");
-                    let rebind_protection2 = uci_core.get("dhcp.@dnsmasq[0].rebind_protection");
-                    if (noresolv2 == "1" && localuse2 == "1" && rebind_protection2 == "0") {
-                        doc_check("❌", "dnsmasq params", "incorrect", "→ FIXED: noresolv=1, localuse=1, rebind_protection=0");
+                    let raw_lu2 = uci_core.get("dhcp.@dnsmasq[0].localuse");
+                    let eff_lu2 = (raw_lu2 == null || raw_lu2 == "") ? "1" : as_string(raw_lu2);
+                    if (noresolv2 == "1" && eff_lu2 == "1") {
+                        doc_check("❌", "dnsmasq params", "incorrect", "→ FIXED: noresolv=1, localuse=1");
                         fixed++;
                     } else {
                         doc_check("❌", "dnsmasq params", "incorrect", "→ не удалось исправить параметры");
@@ -1365,18 +1405,16 @@ function run_doctor_checks_impl(repair) {
         }
     }
 
-    // 4c. Resolv.conf symlink
-    let resolv_link = "";
-    // Throws when /etc/resolv.conf is a regular file rather than a symlink,
-    // which is precisely the broken state the branch below repairs.
-    try { resolv_link = fs.readlink("/etc/resolv.conf") || ""; } catch(e) {}
-    if (resolv_link == "/tmp/resolv.conf" || resolv_link == "../tmp/resolv.conf") {
-        doc_check("✅", "resolv.conf symlink", "OK (-> " + resolv_link + ")", "");
+    // 4c. Resolv.conf check
+    let resolv_info = is_valid_resolv_conf();
+    if (resolv_info.ok) {
+        let desc = resolv_info.is_link ? ("OK (-> " + resolv_info.target + ")") : "OK (regular file)";
+        doc_check("✅", "resolv.conf", desc, "");
     } else {
         issues++;
         if (!DOCTOR_REPAIR_MODE) {
             doc_plan("restore /etc/resolv.conf -> /tmp/resolv.conf symlink");
-            doc_check("⚠️", "resolv.conf symlink", "broken", "→ WILL FIX (doctor --fix): восстановление ссылки");
+            doc_check("⚠️", "resolv.conf", "broken", "→ WILL FIX (doctor --fix): восстановление ссылки");
         } else {
             fs.unlink("/etc/resolv.conf");
             let sym_ok = false;
@@ -1389,10 +1427,10 @@ function run_doctor_checks_impl(repair) {
                 // doc_check() below, which is this module's output channel.
             }
             if (sym_ok) {
-                doc_check("❌", "resolv.conf symlink", "broken", "→ FIXED: восстановлена ссылка на /tmp/resolv.conf");
+                doc_check("❌", "resolv.conf", "broken", "→ FIXED: восстановлена ссылка на /tmp/resolv.conf");
                 fixed++;
             } else {
-                doc_check("❌", "resolv.conf symlink", "broken", "→ не удалось восстановить ссылку");
+                doc_check("❌", "resolv.conf", "broken", "→ не удалось восстановить ссылку");
             }
         }
     }
@@ -1693,7 +1731,7 @@ function run_doctor_checks_impl(repair) {
             doc_plan("drop OS caches + sing-box restart");
             doc_check("⚠️", "Free RAM", sprintf("%dMB", free_mb), "→ WILL FIX (doctor --fix): сброс кэшей памяти и перезапуск sing-box");
         } else {
-            command_status("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; /etc/init.d/sing-box restart >/dev/null 2>&1");
+            command_status("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; /etc/init.d/tachyon-core restart >/dev/null 2>&1");
             doc_check("⚠️", "Free RAM", sprintf("%dMB", free_mb), "→ FIXED: кэши памяти сброшены, sing-box перезапущен");
             fixed++;
         }
@@ -1813,7 +1851,7 @@ function run_doctor_checks_impl(repair) {
     let ports_to_check = [mixed_port_str, "9090"];
     for (let port in ports_to_check) {
         if (index(netstat_out, ":" + port + " ") >= 0) {
-            let sb_pid = find_process_pid("sing-box");
+            let sb_pid = find_core_process_pid();
             if (sb_pid == "") {
                 let conflict_pids = [];
                 let conflict_names = [];
@@ -2081,7 +2119,7 @@ function run_doctor_checks_impl(repair) {
                 continue;
             let pid_info = as_string(fields[6]);
             let owner = index(pid_info, "/") >= 0 ? substr(pid_info, index(pid_info, "/") + 1) : pid_info;
-            if (owner == "" || owner == "dnsmasq" || owner == "sing-box" || owner == "AdGuardHome" || lc(owner) == "adguardhome")
+            if (owner == "" || owner == "dnsmasq" || owner == "sing-box" || owner == "tachyon-core" || owner == "AdGuardHome" || lc(owner) == "adguardhome")
                 continue;
             let already = false;
             for (let o in dns53_owners) {
@@ -2111,7 +2149,7 @@ function run_doctor_checks_impl(repair) {
         for (let line in split(ss_output, "\n")) {
             if (index(line, "UNCONN") < 0)
                 continue;
-            if (index(line, "sing-box") < 0 && index(line, "sing_box") < 0)
+            if (!line_names_core(line))
                 continue;
             let fields = split(trim(line), /[ \t]+/);
             if (length(fields) < 5)
@@ -2132,13 +2170,13 @@ function run_doctor_checks_impl(repair) {
                 doc_check("⚠️", "Port 53 socket collision", as_string(parasitic_count) + " sing-box sockets on :53 (" + collision_detail + ")",
                     "→ sing-box hijack-dns создаёт прозрачные write-only сокеты, перехватывающие UDP у dnsmasq; WILL FIX: restart sing-box");
             } else {
-                command_status("/etc/init.d/sing-box restart >/dev/null 2>&1");
+                command_status("/etc/init.d/tachyon-core restart >/dev/null 2>&1");
                 command_status("sleep 2");
                 let ss_check = command_capture("ss -u -a -e -n 'sport = :53' 2>/dev/null").output;
                 let still_parasitic = 0;
                 for (let line2 in split(ss_check, "\n")) {
                     if (index(line2, "UNCONN") < 0) continue;
-                    if (index(line2, "sing-box") < 0 && index(line2, "sing_box") < 0) continue;
+                    if (!line_names_core(line2)) continue;
                     let f2 = split(trim(line2), /[ \t]+/);
                     if (length(f2) >= 5 && int(f2[1]) > 0) still_parasitic++;
                 }
@@ -2245,9 +2283,35 @@ function doctor_history_record(result) {
     for (let c in (result.checks || [])) {
         if (c.status == "fail") { first_fail = as_string(c.name); break; }
     }
+    let now = time();
+    let issues = int(result.issues || 0);
+
+    // Debounce repeated diagnostic runs within 5 minutes (300s):
+    // If the last entry was recorded recently, update it in place so that
+    // multiple chat messages or rapid diagnostics runs do not artificially inflate the incident counter.
+    if (length(data.entries) > 0) {
+        let last = data.entries[length(data.entries) - 1];
+        if (now - int(last.ts || 0) < 300) {
+            last.ts = now;
+            last.issues = issues;
+            last.fixed = int(result.fixed || 0);
+            last.planned = length(result.planned_fixes || []);
+            if (first_fail != "")
+                last.first_fail = first_fail;
+            let tmp_path = DOCTOR_HISTORY_FILE + ".tmp." + int(clock()[0]);
+            let f = fs.open(tmp_path, "w");
+            if (f) {
+                f.write(sprintf("%J\n", data));
+                f.close();
+                fs.rename(tmp_path, DOCTOR_HISTORY_FILE);
+            }
+            return;
+        }
+    }
+
     push(data.entries, {
-        ts: time(),
-        issues: int(result.issues || 0),
+        ts: now,
+        issues: issues,
         fixed: int(result.fixed || 0),
         planned: length(result.planned_fixes || []),
         first_fail: first_fail
@@ -2269,13 +2333,20 @@ function doctor_history_trend(result) {
     let data = doctor_history_load();
     let day_ago = time() - 86400;
     let recent_failures = 0;
+    let last_ts = 0;
     for (let e in data.entries) {
-        if (int(e.ts || 0) >= day_ago && int(e.issues || 0) > 0)
-            recent_failures++;
+        let ts = int(e.ts || 0);
+        if (ts >= day_ago && int(e.issues || 0) > 0) {
+            // Count distinct incidents separated by at least 10 minutes (600s)
+            if (last_ts == 0 || (ts - last_ts) >= 600) {
+                recent_failures++;
+                last_ts = ts;
+            }
+        }
     }
     if (recent_failures < 2)
         return "";
-    return sprintf("⚠️ Это %d-й диагностики-запуск с проблемами за последние 24 часа — сбой повторяющийся, проверьте историю.", recent_failures);
+    return sprintf("⚠️ Зафиксировано %d инцидент(а/ов) с проблемами за последние 24 часа — сбой повторяющийся, проверьте историю.", recent_failures);
 }
 
 function run_doctor_checks(repair) {
@@ -2302,8 +2373,33 @@ function run_doctor_checks(repair) {
     return result;
 }
 
+let LAST_LLM_ERROR = "";
+
+function sanitize_llm_error(msg, api_key) {
+    msg = trim(as_string(msg || ""));
+    if (api_key && length(api_key) >= 4) {
+        msg = replace(msg, api_key, "[REDACTED]");
+    }
+    msg = replace(msg, /sk-[A-Za-z0-9_\-]{8,}/g, "sk-***");
+    msg = replace(msg, /Bearer[ \t]+[A-Za-z0-9._\-]+/g, "Bearer ***");
+    if (length(msg) > 280)
+        msg = substr(msg, 0, 280) + "...";
+    return msg;
+}
+
+function model_supports_temperature(provider, model) {
+    let m = lc(trim(as_string(model || "")));
+    if (m == "")
+        return true;
+    // OpenAI reasoning / GPT-5+ / o-series / search models reject custom temperature != 1
+    if (match(m, /^(o1|o3|o4|gpt-5|gpt-6)/) || index(m, "-search") >= 0 || index(m, "codex") >= 0 || index(m, "reasoner") >= 0)
+        return false;
+    return true;
+}
+
 function query_llm(provider, api_key, custom_url, prompt_text, model_override) {
     provider = lc(trim(as_string(provider)));
+    LAST_LLM_ERROR = "";
 
     if (provider == "anthropic" || provider == "claude") {
         let api_url = "https://api.anthropic.com/v1/messages";
@@ -2336,12 +2432,20 @@ function query_llm(provider, api_key, custom_url, prompt_text, model_override) {
         remove_file(payload_path);
 
         if (result.status != 0 || result.output == "") {
+            LAST_LLM_ERROR = sprintf("network/curl error (exit %d)", result.status);
             return null;
         }
 
         let response_data = parse_json_or_null(result.output);
         if (response_data && type(response_data.content) == "array" && length(response_data.content) > 0) {
             return response_data.content[0].text;
+        }
+        if (response_data && type(response_data.error) == "object") {
+            let err_type = as_string(response_data.error.type || "api_error");
+            let err_msg = sanitize_llm_error(response_data.error.message || "", api_key);
+            LAST_LLM_ERROR = err_type + (err_msg != "" ? (": " + err_msg) : "");
+        } else {
+            LAST_LLM_ERROR = "unexpected API response format";
         }
 
         return null;
@@ -2353,6 +2457,9 @@ function query_llm(provider, api_key, custom_url, prompt_text, model_override) {
     if (provider == "deepseek") {
         api_url = "https://api.deepseek.com/chat/completions";
         model = model_override || "deepseek-chat";
+    } else if (provider == "gemini") {
+        api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+        model = model_override || "gemini-2.5-flash";
     } else if (provider == "openrouter") {
         api_url = "https://openrouter.ai/api/v1/chat/completions";
         model = model_override || "deepseek/deepseek-chat";
@@ -2372,64 +2479,124 @@ function query_llm(provider, api_key, custom_url, prompt_text, model_override) {
             api_url = "http://192.168.1.100:1234/v1/chat/completions";
         }
         model = model_override || "local-model";
-    } else if (provider == "custom" && custom_url != "") {
+    } else if (provider == "custom") {
+        if (custom_url == "") {
+            LAST_LLM_ERROR = "Custom API URL is not configured";
+            warn("LLM API error: " + LAST_LLM_ERROR);
+            return null;
+        }
         custom_url = replace(trim(as_string(custom_url)), /\/+$/, "");
-        api_url = match(custom_url, /\/chat\/completions$/) ? custom_url : (custom_url + "/chat/completions");
-        model = model_override || "gpt-6-luna";
+        if (!match(custom_url, /^https?:\/\//)) {
+            LAST_LLM_ERROR = "Invalid custom API URL (must start with http:// or https://)";
+            warn("LLM API error: " + LAST_LLM_ERROR);
+            return null;
+        }
+        if (index(custom_url, "generativelanguage.googleapis.com") >= 0) {
+            if (!match(custom_url, /\/chat\/completions$/)) {
+                if (index(custom_url, "/openai") >= 0) {
+                    api_url = custom_url + "/chat/completions";
+                } else if (index(custom_url, "/v1beta") >= 0) {
+                    api_url = replace(custom_url, /\/v1beta.*$/, "") + "/v1beta/openai/chat/completions";
+                } else {
+                    api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+                }
+            } else {
+                api_url = custom_url;
+            }
+            model = model_override || "gemini-2.5-flash";
+        } else {
+            api_url = match(custom_url, /\/chat\/completions$/) ? custom_url : (custom_url + "/chat/completions");
+            model = model_override || "gpt-6-luna";
+        }
     } else {
         api_url = "https://api.openai.com/v1/chat/completions";
         model = model_override || "gpt-6-luna";
     }
 
-    let payload = {
-        model: model,
-        messages: [
-            {
-                role: "user",
-                content: prompt_text
-            }
-        ],
-        temperature: 0.3
+    let send_chat_request = function(include_temperature) {
+        let payload = {
+            model: model,
+            messages: [
+                {
+                    role: "user",
+                    content: prompt_text
+                }
+            ]
+        };
+        if (include_temperature)
+            payload.temperature = 0.3;
+
+        let payload_path = "/tmp/llm_payload.json";
+        common.write_json_file(payload_path, payload);
+
+        let curl_args = [
+            "curl", "-s", "-X", "POST",
+            "-H", "Content-Type: application/json",
+            "-H", "Authorization: Bearer " + api_key,
+            "--connect-timeout", "10",
+            "-m", "60",
+            "-d", "@" + payload_path,
+            api_url
+        ];
+
+        // OpenRouter recommends these headers for identification and rate-limit ranking
+        if (provider == "openrouter") {
+            push(curl_args, "-H");
+            push(curl_args, "HTTP-Referer: https://github.com/Dushnilin/tachyon");
+            push(curl_args, "-H");
+            push(curl_args, "X-Title: Tachyon AI Doctor");
+        }
+
+        let res = command_capture(command_from_args(curl_args));
+        remove_file(payload_path);
+        return res;
     };
 
-    let payload_path = "/tmp/llm_payload.json";
-    common.write_json_file(payload_path, payload);
-
-    let curl_args = [
-        "curl", "-s", "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "-H", "Authorization: Bearer " + api_key,
-        "--connect-timeout", "10",
-        "-m", "60",
-        "-d", "@" + payload_path,
-        api_url
-    ];
-
-    // OpenRouter recommends these headers for identification and rate-limit ranking
-    if (provider == "openrouter") {
-        push(curl_args, "-H");
-        push(curl_args, "HTTP-Referer: https://github.com/Dushnilin/tachyon");
-        push(curl_args, "-H");
-        push(curl_args, "X-Title: Tachyon AI Doctor");
-    }
-
-    let result = command_capture(command_from_args(curl_args));
-    remove_file(payload_path);
+    let use_temp = model_supports_temperature(provider, model);
+    let result = send_chat_request(use_temp);
 
     if (result.status != 0 || result.output == "") {
+        LAST_LLM_ERROR = sprintf("network/curl error (exit %d)", result.status);
         warn(sprintf("LLM query failed: provider=%s url=%s status=%d output_len=%d", provider, api_url, result.status, length(result.output || "")));
         return null;
     }
 
     let response_data = parse_json_or_null(result.output);
+    // Automatic retry without temperature if the model rejects temperature (e.g. invalid_request_error / unsupported_value / temperature)
+    if (use_temp && response_data && type(response_data.error) == "object") {
+        let err_param = lc(as_string(response_data.error.param || ""));
+        let err_code = lc(as_string(response_data.error.code || ""));
+        let err_msg_lc = lc(as_string(response_data.error.message || ""));
+        if (err_param == "temperature" || index(err_msg_lc, "temperature") >= 0 || err_code == "unsupported_value") {
+            result = send_chat_request(false);
+            if (result.status == 0 && result.output != "")
+                response_data = parse_json_or_null(result.output);
+        }
+    }
+
     if (response_data && type(response_data.choices) == "array" && length(response_data.choices) > 0) {
         return response_data.choices[0].message.content;
     }
 
+    if (response_data && type(response_data.error) == "object") {
+        let e_type = as_string(response_data.error.type || response_data.error.code || "api_error");
+        let e_code = as_string(response_data.error.code || "");
+        let e_param = as_string(response_data.error.param || "");
+        let e_msg = sanitize_llm_error(response_data.error.message || "", api_key);
+        let parts = [ e_type ];
+        if (e_code != "" && e_code != e_type) push(parts, e_code);
+        if (e_param != "") push(parts, "param=" + e_param);
+        LAST_LLM_ERROR = join(" / ", parts) + (e_msg != "" ? (": " + e_msg) : "");
+        warn(sprintf("LLM API error: provider=%s %s", provider, LAST_LLM_ERROR));
+        return null;
+    }
+
     // Log the raw response for debugging when parsing fails
     if (!response_data) {
+        LAST_LLM_ERROR = "invalid JSON response from LLM endpoint";
         warn(sprintf("LLM response parse failed: provider=%s raw_start=%s", provider, substr(trim(result.output), 0, 200)));
     } else if (!response_data.choices) {
+        LAST_LLM_ERROR = "LLM response missing choices";
         warn(sprintf("LLM response missing choices: provider=%s keys=%s", provider, join(",", keys(response_data))));
     }
     return null;
@@ -2660,7 +2827,7 @@ function verify_system() {
     // sb_pid from outside this if/else. An out-of-scope read yields null, and
     // null != "" is true, so the probe ran against a dead sing-box, scored a
     // false FAIL, and local_rule_doctor escalated that to restore_native_internet.
-    let sb_pid = is_steer_active ? "" : find_process_pid("sing-box");
+    let sb_pid = is_steer_active ? "" : find_core_process_pid();
     if (is_steer_active) {
         let steer_pid = find_process_pid("steer");
         add("steer process", steer_pid != "" ? "pass" : "fail",
@@ -2726,13 +2893,13 @@ function verify_system() {
             stability.wan_flaps++;
         if (index(l, "wan.down") >= 0 || index(l, "watchdog: wan check failed") >= 0)
             stability.wan_flaps++;
-        if (index(l, "sing-box") >= 0 &&
+        if (line_names_core(l) &&
             (index(l, "panic:") >= 0 || index(l, "fatal error:") >= 0 || index(l, "sigsegv") >= 0 || index(l, "died unexpectedly") >= 0))
             stability.singbox_restarts++;
         if (index(l, "dnsmasq") >= 0 &&
             (index(l, "failed to create listening socket") >= 0 || index(l, "address already in use") >= 0 || index(l, "failed to start") >= 0))
             stability.dnsmasq_restarts++;
-        if (index(l, "tachyon") >= 0 && index(l, "sing-box") < 0 && index(l, "watchdog: crashed") >= 0)
+        if (index(l, "tachyon") >= 0 && !line_names_core(l) && index(l, "watchdog: crashed") >= 0)
             stability.tachyon_restarts++;
     }
 
@@ -2767,6 +2934,7 @@ function ai_doctor_last() {
 
 const DOCTOR_FIX_PRIORITIES = {
     "fix_system_time": 5,
+    "fix_uci_config": 8,
     "fix_wan_interface": 10,
     "restart_network": 15,
     "fix_gateway": 20,
@@ -2775,13 +2943,18 @@ const DOCTOR_FIX_PRIORITIES = {
     "fix_bootstrap_dns": 38,
     "switch_to_doh": 40,
     "clear_dns_cache": 45,
+    "restart_singbox_dns": 48,
+    "restart_steer_dns": 48,
     "start_singbox": 50,
+    "start_steer": 50,
+    "start_watchdog": 52,
     "restart_zapret": 60,
     "restart_providers": 62,
     "optimize_mtu": 65,
     "rebuild_rules": 70,
-    "update_subscriptions": 80,
+    "reset_firewall": 72,
     "upgrade_to_singbox_extended": 75,
+    "update_subscriptions": 80,
     "flush_conntrack": 85,
     "optimize_memory": 90,
     "enable_safe_bypass": 95,
@@ -2948,7 +3121,7 @@ function diagnose_system_conflicts(cfg, lang, causes, fn_add_fix) {
         }
     }
 
-    let rs_files = fs.glob("/tmp/sing-box/rulesets/*.srs");
+    let rs_files = fs.glob("/tmp/tachyon-core/rulesets/*.srs");
     if (rs_files) {
         for (let rs_file in rs_files) {
             let st = fs.stat(rs_file);
@@ -3353,7 +3526,7 @@ function ai_doctor(user_query) {
     // even when sing-box was up. pidof matches the process name exactly and
     // works on busybox, and unlike pgrep -f it cannot pick up an unrelated
     // command line that merely mentions sing-box.
-    let singbox_running = trim(command_output("pidof sing-box 2>/dev/null")) != "";
+    let singbox_running = trim(command_output("pidof tachyon-core sing-box 2>/dev/null")) != "";
     let uptime_out = trim(command_output("cat /proc/uptime 2>/dev/null"));
     let uptime_min = uptime_out != "" ? int(split(uptime_out, ".")[0]) / 60 : 0;
 
@@ -3422,6 +3595,7 @@ function ai_doctor(user_query) {
             "You are \"Tachyon AI Doctor\", an AI assistant for anti-censorship and proxy services on OpenWrt.\n" +
             "Analyze the diagnostic report and system logs below.\n\n%s\n\n" +
             "Formulate a concise diagnosis (in English, max 3-4 bullet points).\n" +
+            "For each issue or recommendation, cite concrete evidence or symptoms from the diagnostic report (e.g., specific error message, failed check, or log entry).\n" +
             "If automatic quick fix is possible, include at the very end of your response:\n" +
             "FIX: code1, code2\n\n" +
             "IMPORTANT: do NOT report \"everything is fine\" when the Live Verification or Stability section shows any FAIL check, WAN flaps, or repeated service restarts — those are real problems even if the point-in-time checks passed.\n\n" +
@@ -3456,6 +3630,7 @@ function ai_doctor(user_query) {
             "Вы — ИИ-ассистент \"Tachyon AI Doctor\" для сервиса обхода блокировок на OpenWrt.\n" +
             "Проанализируйте диагностический отчет и логи ниже.\n\n%s\n\n" +
             "Сформулируйте краткий диагноз (на русском, максимум 3-4 пункта).\n" +
+            "Для каждого замечания или рекомендации обязательно приводите конкретные подтверждения и симптомы из отчёта (точную ошибку, упавшую проверку или строку логов).\n" +
             "Если авто-исправление возможно, укажите в самом конце ответа строчку:\n" +
             "FIX: код1, код2\n\n" +
             "ВАЖНО: не пишите «всё в порядке», если в секции Live Verification или Stability есть хоть один провал, флапы WAN или повторные перезапуски сервисов — это реальные проблемы, даже если мгновенные проверки прошли.\n\n" +
@@ -3498,6 +3673,18 @@ function ai_doctor(user_query) {
 
     let ai_res = query_llm(provider, api_key, custom_url, prompt, model_override);
     if (!ai_res) {
+        if (LAST_LLM_ERROR != "") {
+            let err_banner = lang == "en"
+                ? sprintf("⚠️ *LLM API Error (%s)*: %s\n_Switched to local heuristic diagnosis._\n\n", provider, LAST_LLM_ERROR)
+                : sprintf("⚠️ *Ошибка API ИИ-провайдера (%s)*: %s\n_Выполнен переход к локальному анализу._\n\n", provider, LAST_LLM_ERROR);
+            local_res.report = err_banner + as_string(local_res.report || "");
+            local_res.llm_error = LAST_LLM_ERROR;
+            let f_err = fs.open("/tmp/ai_doctor_last.json", "w");
+            if (f_err) {
+                f_err.write(sprintf("%J\n", local_res));
+                f_err.close();
+            }
+        }
         print(sprintf("%J\n", local_res));
         return 0;
     }
@@ -3508,13 +3695,19 @@ function ai_doctor(user_query) {
     if (fix_idx >= 0) {
         let fix_part = trim(substr(text, fix_idx + 4));
         let raw_codes = split(fix_part, /[,\r\n]+/);
+        let seen = {};
         for (let code in raw_codes) {
-            let clean_code = trim(replace(code, /[._`*]/g, ""));
-            let first_token = split(clean_code, /[ \t]+/)[0];
-            if (first_token != "") {
-                push(quick_fixes, first_token);
+            let clean_code = trim(replace(code, /[`*#]/g, ""));
+            clean_code = replace(clean_code, /^[ \t\-_.:]+|[ \t\-_.:]+$/g, "");
+            let first_token = lc(trim(split(clean_code, /[ \t,;:]+/)[0]));
+            if (first_token != "" && DOCTOR_FIX_PRIORITIES[first_token] != null) {
+                if (!seen[first_token]) {
+                    seen[first_token] = true;
+                    push(quick_fixes, first_token);
+                }
             }
         }
+        try { quick_fixes = prioritize_quick_fixes(quick_fixes); } catch(e) {}
         text = trim(substr(text, 0, fix_idx));
     }
     let quick_fix = length(quick_fixes) > 0 ? join(",", quick_fixes) : "";
@@ -3547,7 +3740,7 @@ function extract_ruleset(tag) {
         return 1;
     }
 
-    let db_path = "/etc/sing-box/cache.db";
+    let db_path = "/etc/tachyon-core/cache.db";
     let f = fs.open(db_path, "r");
     if (!f) {
         warn("failed to open " + db_path + "\n");
@@ -3633,7 +3826,7 @@ function extract_ruleset(tag) {
         return 1;
     }
 
-    let out_dir = "/tmp/sing-box/rulesets";
+    let out_dir = "/tmp/tachyon-core/rulesets";
     system("mkdir -p " + out_dir);
 
     let out_path = out_dir + "/community_" + tag + ".srs";

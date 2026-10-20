@@ -3,13 +3,13 @@
 let fs = require("fs");
 let uci_core = require("core.uci");
 let common = require("core.common");
-let runtime_dns = require("singbox.dns");
+let runtime_dns = require("tachyon_core.dns");
 let verifier = require("components.verifier");
-let core_profile = require("singbox.core_profile");
+let core_profile = require("tachyon_core.core_profile");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
-const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || "/tmp/sing-box";
+const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || "/tmp/tachyon-core";
 const TMP_RULESET_FOLDER = getenv("TMP_RULESET_FOLDER") || TMP_SING_BOX_FOLDER + "/rulesets";
 const TMP_SUBSCRIPTION_FOLDER = getenv("TMP_SUBSCRIPTION_FOLDER") || TMP_SING_BOX_FOLDER + "/subscriptions";
 const RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
@@ -37,8 +37,8 @@ const NFT_LOCALV6_SET_NAME = getenv("NFT_LOCALV6_SET_NAME") || "localv6";
 const NFT_FAKEIP_MARK = getenv("NFT_FAKEIP_MARK") || "0x04000000";
 const SB_SERVICE_MIXED_INBOUND_ADDRESS = getenv("SB_SERVICE_MIXED_INBOUND_ADDRESS") || "127.0.0.1";
 const SB_SERVICE_MIXED_INBOUND_PORT = getenv("SB_SERVICE_MIXED_INBOUND_PORT") || "4534";
-const SB_VARIANT_STATE_FILE = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant";
-const SB_VERSION_STATE_FILE = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
+const SB_VARIANT_STATE_FILE = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
+const SB_VERSION_STATE_FILE = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
 const SB_MANAGED_SERVICE_MARKER = getenv("SB_MANAGED_SERVICE_MARKER") || "Tachyon managed sing-box service for binary variants";
 
 let as_string = common.as_string;
@@ -139,12 +139,31 @@ function first_line_last_field(value) {
 
 let parse_sing_box_version = common.parse_sing_box_version;
 
+function find_core_binary() {
+    let path_env = as_string(getenv("PATH") || "/usr/sbin:/usr/bin:/sbin:/bin");
+    for (let dir in split(path_env, ":")) {
+        if (dir == "")
+            continue;
+        for (let name in [ "tachyon-core", "sing-box" ]) {
+            let candidate = dir + "/" + name;
+            if (fs.access(candidate, "x"))
+                return candidate;
+        }
+    }
+    if (command_exists("tachyon-core"))
+        return "tachyon-core";
+    if (command_exists("sing-box"))
+        return "sing-box";
+    return "";
+}
+
 // The version string is taken from stdout whatever the exit status: sing-box
 // prints "sing-box version X" first and may still exit non-zero (a warning about
 // a missing config, a signal from a concurrent service stop). Gating on the exit
 // code made the dashboard fall back to "unknown" for a perfectly working binary.
 function sing_box_version_output() {
-    return command_exists("sing-box") ? command_output_lenient(command_from_args([ "sing-box", "version" ]) + " 2>/dev/null") : "";
+    let bin = find_core_binary();
+    return bin != "" ? command_output_lenient(command_from_args([ bin, "version" ]) + " 2>/dev/null") : "";
 }
 
 // The name the binary calls itself, read off the banner: "sing-box version
@@ -226,7 +245,7 @@ function sing_box_restore_variant_marker(variant) {
 }
 
 function sing_box_version() {
-    if (!command_exists("sing-box"))
+    if (find_core_binary() == "")
         return "";
     if (sing_box_marker_is("extended-compressed") || sing_box_marker_is("lx") || sing_box_marker_is("tachyon-core"))
         return sing_box_version_state();
@@ -323,7 +342,7 @@ function sing_box_is_lx(value) {
 // whole point of this function. A build that names itself - our core in either
 // its version suffix or its banner - outranks the file, because the file
 // describes what was installed *previously*: on a test router the binary had
-// been swapped for tachyon-core while /etc/tachyon/sing-box-variant still read
+// been swapped for tachyon-core while /etc/tachyon/tachyon-core-variant still read
 // "lx", and taking the file first handed a foreign core to the lx profile - a
 // wrong pin field, a wrong schema level, and no error anywhere.
 function sing_box_core_identity_marker(build, given) {
@@ -349,7 +368,7 @@ function sing_box_core_identity_marker(build, given) {
 // so sing_box_version() answered "1.14.2-lx.12" and the stale file, not the binary
 // on disk, decided what was installed.
 function sing_box_core_installed_version() {
-    if (command_exists("sing-box")) {
+    if (find_core_binary() != "") {
         let parsed = parse_sing_box_version(sing_box_version_output());
         if (as_string(parsed) != "")
             return as_string(parsed);
@@ -512,7 +531,7 @@ function sing_box_supports_cert_pin(version) {
     // therefore support pinning, and the exclusion that used to sit here (issue
     // #79, added because the core rejects certificate_sha256) is gone: it turned
     // "which field" into "no feature".
-    if (version == "" && command_exists("sing-box")) {
+    if (version == "" && find_core_binary() != "") {
         if (sing_box_marker_is("extended-compressed"))
             version = sing_box_version_state();
         else
@@ -565,7 +584,7 @@ function sing_box_is_tiny(version, version_output) {
     version = as_string(version);
     version_output = as_string(version_output);
 
-    if (command_exists("sing-box") && (sing_box_marker_is("extended-compressed") || sing_box_marker_is("lx")))
+    if (find_core_binary() != "" && (sing_box_marker_is("extended-compressed") || sing_box_marker_is("lx")))
         return false;
     let computed_version = version != "" ? version : sing_box_version();
     if (sing_box_is_extended(computed_version) || sing_box_is_lx(computed_version))
@@ -586,7 +605,7 @@ function sing_box_variant() {
         return "lx";
     if (sing_box_marker_is("extended-compressed"))
         return "extended-compressed";
-    if (!command_exists("sing-box"))
+    if (find_core_binary() == "")
         return "not-installed";
 
     version = sing_box_version();
@@ -642,22 +661,29 @@ function uci_commit(config) {
 }
 
 function ensure_sing_box_main_section() {
-    let cfg_file = "/etc/config/sing-box";
+    // The engine config used to live in its own `sing-box` UCI package. The
+    // settings move to `tachyon-core`, and an install that still carries the
+    // old package has it renamed in place so nothing is lost on upgrade.
+    if (uci_core.exists("sing-box.main") && !uci_core.exists("tachyon-core.main")) {
+        uci_core.rename_package("sing-box", "tachyon-core");
+        uci_core.commit("tachyon-core");
+    }
+    let cfg_file = "/etc/config/tachyon-core";
     if (!fs.stat(cfg_file)) {
         let dir = fs.stat("/etc/config");
         if (!dir || dir.type != "directory")
             fs.mkdir("/etc/config", 0755);
         write_file(cfg_file, "");
     }
-    if (uci_core.exists("sing-box.main"))
+    if (uci_core.exists("tachyon-core.main"))
         return true;
-    if (!uci_core.set_section("sing-box.main", "sing-box"))
+    if (!uci_core.set_section("tachyon-core.main", "tachyon-core"))
         return false;
-    uci_set_option("sing-box", "main", "workdir", "/usr/share/sing-box");
-    uci_set_option("sing-box", "main", "conffile", "/etc/sing-box/config.json");
-    uci_set_option("sing-box", "main", "user", "root");
-    uci_set_option("sing-box", "main", "log_stderr", "1");
-    uci_commit("sing-box");
+    uci_set_option("tachyon-core", "main", "workdir", "/usr/share/tachyon-core");
+    uci_set_option("tachyon-core", "main", "conffile", "/etc/tachyon-core/config.json");
+    uci_set_option("tachyon-core", "main", "user", "root");
+    uci_set_option("tachyon-core", "main", "log_stderr", "1");
+    uci_commit("tachyon-core");
     return true;
 }
 
@@ -667,8 +693,25 @@ function owner_pid() {
 }
 
 function managed_service_installed() {
-    let data = fs.readfile("/etc/init.d/sing-box");
+    let data = fs.readfile("/etc/init.d/tachyon-core");
     return data != null && index(as_string(data), SB_MANAGED_SERVICE_MARKER) >= 0 && index(as_string(data), "GOGC=\"50\"") >= 0;
+}
+
+// Маркер и GOGC есть в каждом поколении скрипта, включая сломанный, который
+// читал переименованный UCI-пакет и молча выходил до procd_open_instance.
+// Рабочий скрипт от сломанного отличает только имя пакета - несовпадение
+// считается отсутствием, и скрипт перегенерируется.
+function managed_service_script_stale() {
+    let data = fs.readfile("/etc/init.d/tachyon-core");
+    if (data == null)
+        return false;
+    data = as_string(data);
+    // A script from before the limits were lowered (core dump unlimited, a
+    // million descriptors) or before GOMEMLIMIT was wired in is regenerated
+    // the same way as a broken one.
+    return index(data, "config_load \"tachyon-core\"") < 0 ||
+        index(data, "core=\"unlimited\"") >= 0 ||
+        index(data, "GOMEMLIMIT") < 0;
 }
 
 function managed_service_text() {
@@ -676,34 +719,65 @@ function managed_service_text() {
         "# " + SB_MANAGED_SERVICE_MARKER + "\n\n" +
         "USE_PROCD=1\n" +
         "START=99\n" +
-        "PROG=\"/usr/bin/sing-box\"\n\n" +
+        "PROG=\"/usr/bin/tachyon-core\"\n" +
+        "[ -x \"$PROG\" ] || PROG=\"/usr/bin/sing-box\"\n\n" +
         "start_service() {\n" +
         "    [ -d /dev/net ] || mkdir -p /dev/net\n" +
         "    [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null || true\n" +
         "    modprobe tun 2>/dev/null || true\n" +
         "    modprobe inet_diag 2>/dev/null || true\n\n" +
-        "    config_load \"sing-box\"\n" +
+        "    config_load \"tachyon-core\"\n" +
         "    local enabled config_file working_directory\n" +
         "    local log_stderr\n\n" +
         "    config_get_bool enabled \"main\" \"enabled\" \"0\"\n" +
         "    [ \"$enabled\" -eq \"1\" ] || return 0\n\n" +
-        "    config_get config_file \"main\" \"conffile\" \"/etc/sing-box/config.json\"\n" +
-        "    config_get working_directory \"main\" \"workdir\" \"/usr/share/sing-box\"\n" +
+        "    [ -x \"$PROG\" ] || PROG=\"$(command -v tachyon-core 2>/dev/null || command -v sing-box 2>/dev/null || echo /usr/bin/tachyon-core)\"\n" +
+        "    config_get config_file \"main\" \"conffile\" \"/etc/tachyon-core/config.json\"\n" +
+        "    config_get working_directory \"main\" \"workdir\" \"/usr/share/tachyon-core\"\n" +
         "    [ -d \"$working_directory\" ] || mkdir -p \"$working_directory\"\n" +
         "    config_get_bool log_stderr \"main\" \"log_stderr\" \"1\"\n\n" +
+        "    local mem_limit_mb=\"0\"\n" +
+        "    config_get mem_limit_mb \"main\" \"memory_limit_mb\" \"0\"\n" +
+        "    if [ \"$mem_limit_mb\" = \"0\" ] || [ -z \"$mem_limit_mb\" ]; then\n" +
+        "        mem_limit_mb=\"$(uci get tachyon.settings.memory_limit_mb 2>/dev/null || echo 0)\"\n" +
+        "    fi\n\n" +
+        "    local scale_pct=\"\"\n" +
+        "    if [ -s \"/etc/tachyon/mem_scale\" ]; then\n" +
+        "        scale_pct=\"$(awk -v s=\"$(cat /etc/tachyon/mem_scale 2>/dev/null)\" 'BEGIN { if (!s) exit; pct=int(s*100); if (pct < 20) pct=20; if (pct > 100) pct=100; print pct }')\"\n" +
+        "    fi\n\n" +
+        "    local gomemlimit=\"\"\n" +
+        "    local mem_total_kb=\"$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)\"\n" +
+        "    if [ \"$mem_limit_mb\" -gt 0 ] 2>/dev/null; then\n" +
+        "        gomemlimit=\"$mem_limit_mb\"\n" +
+        "    elif [ \"$mem_total_kb\" -gt 0 ]; then\n" +
+        "        if [ \"$mem_total_kb\" -le 524288 ] || { [ -n \"$scale_pct\" ] && [ \"$scale_pct\" -lt 100 ]; }; then\n" +
+        "            gomemlimit=$(( mem_total_kb / 1024 * 50 / 100 ))\n" +
+        "            [ \"$gomemlimit\" -lt 24 ] && gomemlimit=24\n" +
+        "        fi\n" +
+        "    fi\n\n" +
+        "    if [ -n \"$gomemlimit\" ] && [ \"$gomemlimit\" -gt 0 ] 2>/dev/null; then\n" +
+        "        if [ -n \"$scale_pct\" ] && [ \"$scale_pct\" -lt 100 ]; then\n" +
+        "            gomemlimit=$(( gomemlimit * scale_pct / 100 ))\n" +
+        "            [ \"$gomemlimit\" -lt 16 ] && gomemlimit=16\n" +
+        "        fi\n" +
+        "    fi\n\n" +
         "    procd_open_instance\n" +
         "    procd_set_param command \"$PROG\" run -c \"$config_file\" -D \"$working_directory\"\n" +
         "    procd_set_param file \"$config_file\"\n" +
         "    procd_set_param stderr \"$log_stderr\"\n" +
-        "    procd_set_param limits core=\"unlimited\"\n" +
-        "    procd_set_param limits nofile=\"1000000 1000000\"\n" +
-        "    procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\"\n" +
+        "    procd_set_param limits core=\"0\"\n" +
+        "    procd_set_param limits nofile=\"65535 65535\"\n" +
+        "    if [ -n \"$gomemlimit\" ] && [ \"$gomemlimit\" -gt 0 ] 2>/dev/null; then\n" +
+        "        procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\" GOMEMLIMIT=\"${gomemlimit}MiB\"\n" +
+        "    else\n" +
+        "        procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\"\n" +
+        "    fi\n" +
         "    procd_set_param term_timeout 15\n" +
         "    procd_set_param respawn\n" +
         "    procd_close_instance\n" +
         "}\n\n" +
         "service_triggers() {\n" +
-        "    procd_add_reload_trigger \"sing-box\"\n" +
+        "    procd_add_reload_trigger \"tachyon-core\"\n" +
         "}\n";
 }
 
@@ -712,34 +786,38 @@ function sing_box_compressed_marker_set() {
 }
 
 function install_managed_service_script() {
-    let tmp = "/etc/init.d/sing-box.tachyon." + owner_pid();
+    let tmp = "/etc/init.d/tachyon-core.tachyon." + owner_pid();
     if (!write_file(tmp, managed_service_text()))
         return false;
     if (!command_success_from_args([ "chmod", "0755", tmp ])) {
         remove_file(tmp);
         return false;
     }
-    return fs.rename(tmp, "/etc/init.d/sing-box");
+    return fs.rename(tmp, "/etc/init.d/tachyon-core");
 }
 
 function remove_managed_service_script() {
     if (!managed_service_installed())
         return;
 
-    command_success_from_args([ "/etc/init.d/sing-box", "stop" ]);
-    command_success_from_args([ "/etc/init.d/sing-box", "disable" ]);
-    remove_file("/etc/init.d/sing-box");
+    command_success_from_args([ "/etc/init.d/tachyon-core", "stop" ]);
+    command_success_from_args([ "/etc/init.d/tachyon-core", "disable" ]);
+    remove_file("/etc/init.d/tachyon-core");
 }
 
 function disable_service_config() {
     if (!ensure_sing_box_main_section())
         return;
-    uci_set_option("sing-box", "main", "enabled", "0");
-    uci_commit("sing-box");
+    uci_set_option("tachyon-core", "main", "enabled", "0");
+    uci_commit("tachyon-core");
 }
 
 function prepare_service_disabled() {
     disable_service_config();
+    if (file_exists("/etc/init.d/tachyon-core")) {
+        command_success_from_args([ "/etc/init.d/tachyon-core", "stop" ]);
+        command_success_from_args([ "/etc/init.d/tachyon-core", "disable" ]);
+    }
     if (file_exists("/etc/init.d/sing-box")) {
         command_success_from_args([ "/etc/init.d/sing-box", "stop" ]);
         command_success_from_args([ "/etc/init.d/sing-box", "disable" ]);
@@ -749,15 +827,29 @@ function prepare_service_disabled() {
 function configure_service() {
     let settings = uci_settings();
 
-    if (!managed_service_installed() && !install_managed_service_script()) {
-        log_message("Failed to install managed sing-box service. Aborted.", "fatal");
+    if (fs.stat("/usr/bin/sing-box") != null && fs.stat("/usr/bin/tachyon-core") == null) {
+        try {
+            fs.symlink("/usr/bin/sing-box", "/usr/bin/tachyon-core");
+        }
+        catch (e) {
+        }
+    }
+
+    if ((!managed_service_installed() || managed_service_script_stale()) && !install_managed_service_script()) {
+        log_message("Failed to install managed tachyon-core service. Aborted.", "fatal");
         exit(1);
     }
 
     if (!ensure_sing_box_main_section())
         exit(1);
 
-    let workdir = uci_get_option("sing-box", "main", "workdir") || "/usr/share/sing-box";
+    let changed = false;
+    let workdir = uci_get_option("tachyon-core", "main", "workdir") || "/usr/share/tachyon-core";
+    if (workdir == "/usr/share/sing-box") {
+        workdir = "/usr/share/tachyon-core";
+        if (uci_set_option("tachyon-core", "main", "workdir", workdir))
+            changed = true;
+    }
     if (!fs.stat(workdir)) {
         let parent = "/usr/share";
         if (!fs.stat(parent))
@@ -765,35 +857,49 @@ function configure_service() {
         fs.mkdir(workdir, 0755);
     }
 
-    let changed = false;
-    if (uci_get_option("sing-box", "main", "enabled") != "1") {
-        if (!uci_set_option("sing-box", "main", "enabled", "1"))
+    if (uci_get_option("tachyon-core", "main", "enabled") != "1") {
+        if (!uci_set_option("tachyon-core", "main", "enabled", "1"))
             exit(1);
         changed = true;
-        log_message("sing-box service has been enabled", "info");
+        log_message("tachyon-core service has been enabled", "info");
     }
 
-    if (uci_get_option("sing-box", "main", "user") != "root") {
-        if (!uci_set_option("sing-box", "main", "user", "root"))
+    if (uci_get_option("tachyon-core", "main", "user") != "root") {
+        if (!uci_set_option("tachyon-core", "main", "user", "root"))
             exit(1);
         changed = true;
-        log_message("sing-box service user has been changed to root", "info");
+        log_message("tachyon-core service user has been changed to root", "info");
     }
 
     let config_path = option(settings, "config_path", "");
-    let conffile = uci_get_option("sing-box", "main", "conffile");
+    let conffile = uci_get_option("tachyon-core", "main", "conffile");
     if (conffile != config_path) {
-        if (!uci_set_option("sing-box", "main", "conffile", config_path))
+        if (!uci_set_option("tachyon-core", "main", "conffile", config_path))
             exit(1);
         changed = true;
-        log_message("sing-box service config path set to " + config_path, "info");
+        log_message("tachyon-core service config path set to " + config_path, "info");
     }
 
-    if (changed && !uci_commit("sing-box"))
+    let mem_limit_mb = option(settings, "memory_limit_mb", "0");
+    let current_mem_limit_mb = uci_get_option("tachyon-core", "main", "memory_limit_mb") || "0";
+    if (current_mem_limit_mb != mem_limit_mb) {
+        if (!uci_set_option("tachyon-core", "main", "memory_limit_mb", mem_limit_mb))
+            exit(1);
+        changed = true;
+    }
+
+    if (changed && !uci_commit("tachyon-core"))
         exit(1);
 
-    if (file_exists("/etc/rc.d/S99sing-box")) {
-        log_message("Disabling standalone sing-box autostart", "info");
+    if (file_exists("/etc/rc.d/S99sing-box") || file_exists("/etc/rc.d/S99tachyon-core")) {
+        log_message("Disabling standalone tachyon-core autostart", "info");
+        command_success_from_args([ "/etc/init.d/tachyon-core", "disable" ]);
+    }
+
+    // Досервисный /etc/init.d/sing-box может всё ещё гонять то же ядро - два
+    // инстанса дерутся за lock cache.db, и второй падает с cache-file timeout.
+    if (file_exists("/etc/init.d/sing-box")) {
+        command_success_from_args([ "/etc/init.d/sing-box", "stop" ]);
         command_success_from_args([ "/etc/init.d/sing-box", "disable" ]);
     }
 
@@ -1025,22 +1131,25 @@ function log_file_lines(path, level, prefix) {
 function sing_box_binary_path() {
     // command_output_lenient returns the newline; stat'ing the raw value would
     // report an existing binary as missing.
-    return trim(command_output_lenient("command -v sing-box 2>/dev/null")) || "/usr/bin/sing-box";
+    return trim(command_output_lenient("command -v tachyon-core 2>/dev/null || command -v sing-box 2>/dev/null")) || "/usr/bin/tachyon-core";
 }
 
 
-let binary_diag = require("singbox.binary_diag");
+let binary_diag = require("tachyon_core.binary_diag");
 let sing_box_binary_problem = binary_diag.sing_box_binary_problem;
 let sing_box_check_blamed_the_binary = binary_diag.sing_box_check_blamed_the_binary;
 function sing_box_check(config_path, output_path) {
+    let bin = find_core_binary();
+    if (bin == "")
+        bin = "tachyon-core";
     let check_cmd = "GODEBUG=\"madvdontneed=1\" GOGC=\"30\" " +
-        command_from_args([ "sing-box", "-c", config_path, "check" ]) +
+        command_from_args([ bin, "-c", config_path, "check" ]) +
         " >" + shell_quote(output_path) + " 2>&1";
     let status = command_status(check_cmd);
     if ((status == 247 || status == 137) && fs.stat("/proc/sys/vm/drop_caches") != null) {
         system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null");
         check_cmd = "GODEBUG=\"madvdontneed=1\" GOGC=\"15\" " +
-            command_from_args([ "sing-box", "-c", config_path, "check" ]) +
+            command_from_args([ bin, "-c", config_path, "check" ]) +
             " >" + shell_quote(output_path) + " 2>&1";
         status = command_status(check_cmd);
     }
@@ -1567,7 +1676,7 @@ function init_config(populate_nft, caches_prepared, no_refresh) {
     for (let attempt = 0; attempt < 16; attempt++) {
         let generate_status = command_status(
             module_command([
-                LIB_DIR + "/singbox/generator.uc",
+                LIB_DIR + "/tachyon_core/generator.uc",
                 "generate-config",
                 temp_config,
                 service_listen_address_value(settings),
@@ -1610,7 +1719,7 @@ function init_config(populate_nft, caches_prepared, no_refresh) {
 
         let section = section_from_check_reason(check_result.reason, temp_config);
         if (section == "" || quarantined[section] != null) {
-            log_message("Generated sing-box configuration is invalid: " + check_result.reason + ". Aborted.", "fatal");
+            log_message("Generated tachyon-core configuration is invalid: " + check_result.reason + ". Aborted.", "fatal");
             remove_files([ temp_config, runtime_log ]);
             exit(1);
         }
@@ -1620,7 +1729,7 @@ function init_config(populate_nft, caches_prepared, no_refresh) {
     }
     write_section_errors(quarantined);
     if (check_result.status != 0) {
-        log_message("Generated sing-box configuration is invalid: " + check_result.reason + ". Aborted.", "fatal");
+        log_message("Generated tachyon-core configuration is invalid: " + check_result.reason + ". Aborted.", "fatal");
         remove_files([ temp_config, runtime_log ]);
         exit(1);
     }
@@ -1767,6 +1876,6 @@ else if (mode == "core-capabilities")
 else if (mode == "variant")
     print(sing_box_variant(), "\n");
 else {
-    warn("Usage: singbox/runtime.uc <operation> ...\n");
+    warn("Usage: tachyon_core/runtime.uc <operation> ...\n");
     exit(1);
 }

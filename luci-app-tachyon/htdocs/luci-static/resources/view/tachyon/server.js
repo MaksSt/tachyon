@@ -1163,6 +1163,43 @@ function restoreServerEditState(snapshot) {
   setUciSectionState("deletes", snapshot.sectionId, snapshot.deletes);
 }
 
+function sanitizeUciDeletes(targetSectionId) {
+  const state = uci.state;
+  if (!state || !state.deletes?.[UCI_PACKAGE]) {
+    return;
+  }
+
+  const creates = state.creates?.[UCI_PACKAGE] || {};
+  const values = state.values?.[UCI_PACKAGE] || {};
+  const deletes = state.deletes[UCI_PACKAGE];
+
+  for (const sid in deletes) {
+    if (creates[sid] || !values[sid]) {
+      delete deletes[sid];
+      continue;
+    }
+
+    if (deletes[sid] !== true && typeof deletes[sid] === "object") {
+      for (const opt in deletes[sid]) {
+        if (!values[sid].hasOwnProperty(opt)) {
+          delete deletes[sid][opt];
+        }
+      }
+      if (isEmptyObject(deletes[sid])) {
+        delete deletes[sid];
+      }
+    }
+  }
+
+  if (targetSectionId && (creates[targetSectionId] || !values[targetSectionId])) {
+    delete deletes[targetSectionId];
+  }
+
+  if (isEmptyObject(state.deletes[UCI_PACKAGE])) {
+    delete state.deletes[UCI_PACKAGE];
+  }
+}
+
 function ensureProtocolDefaults(sectionId, protocol, forceProtocolDefaults) {
   setValue(sectionId, "protocol", protocol);
   setDefault(sectionId, "enabled", "1");
@@ -1619,11 +1656,12 @@ function normalizeSha256(value) {
 }
 
 function shouldUseGeneratedTlsCertificatePin(sectionId) {
-  const certificatePath =
+  const certificatePath = `${
     uci.get(UCI_PACKAGE, sectionId, "tls_certificate_path") ||
-    defaultTlsCertificatePath(sectionId);
+    defaultTlsCertificatePath(sectionId)
+  }`.trim();
 
-  return `${certificatePath}` === defaultTlsCertificatePath(sectionId);
+  return !/^\/etc\/(acme|letsencrypt|ssl\/certs)\//.test(certificatePath);
 }
 
 function loadGeneratedTlsCertificatePin(sectionId) {
@@ -1669,6 +1707,8 @@ function buildHysteria2Link(sectionId, identity, options = {}) {
   if (certificatePin) {
     params.insecure = "1";
     params.pinSHA256 = certificatePin;
+  } else if (shouldUseGeneratedTlsCertificatePin(sectionId)) {
+    params.insecure = "1";
   }
 
   if (obfsType === "salamander") {
@@ -1716,7 +1756,10 @@ function buildTuicLink(sectionId, identity, options = {}) {
     sni: uci.get(UCI_PACKAGE, sectionId, "tls_server_name") || host,
   };
   if (certificatePin) {
+    params.insecure = "1";
     params.pcs = certificatePin;
+  } else if (shouldUseGeneratedTlsCertificatePin(sectionId)) {
+    params.insecure = "1";
   }
   const query = encodeQuery(params);
   return `tuic://${encodeURIComponent(identity.uuid)}:${encodeURIComponent(identity.password)}@${uriHost}:${port}${query ? `?${query}` : ""}#${encodeURIComponent(identity.name || sectionId)}`;
@@ -1733,7 +1776,10 @@ function buildAnytlsLink(sectionId, identity, options = {}) {
     sni: uci.get(UCI_PACKAGE, sectionId, "tls_server_name") || host,
   };
   if (certificatePin) {
+    params.insecure = "1";
     params.pcs = certificatePin;
+  } else if (shouldUseGeneratedTlsCertificatePin(sectionId)) {
+    params.insecure = "1";
   }
   const query = encodeQuery(params);
   return `anytls://${encodeURIComponent(identity.password)}@${uriHost}:${port}${query ? `?${query}` : ""}#${encodeURIComponent(identity.name || sectionId)}`;
@@ -3681,6 +3727,7 @@ function configureServerSection(sectionRef, options = {}) {
   };
 
   sectionRef.renderMoreOptionsModal = function (sectionId, ev) {
+    sanitizeUciDeletes(sectionId);
     this.serverEditSnapshots ??= {};
     this.serverEditSnapshots[sectionId] = captureServerEditState(sectionId);
 
@@ -3707,6 +3754,7 @@ function configureServerSection(sectionRef, options = {}) {
     const prevMap = mapNode ? dom.findClassInstance(mapNode) : this.map;
 
     prevMap.addedSection = sectionId;
+    sanitizeUciDeletes(sectionId);
 
     const capabilitiesTask =
       typeof options.loadCapabilities === "function"
@@ -3744,6 +3792,8 @@ function configureServerSection(sectionRef, options = {}) {
       restoreServerEditState(snapshot);
     }
 
+    sanitizeUciDeletes(sectionId);
+
     return form.GridSection.prototype.handleModalCancel.call(
       this,
       modalMap,
@@ -3765,7 +3815,56 @@ function configureServerSection(sectionRef, options = {}) {
       return Promise.resolve();
     }
 
-    let saveTasks = targetMap.save(null, true);
+    const targetSectionId =
+      targetMap.section || targetMap.children?.[0]?.section;
+
+    sanitizeUciDeletes(targetSectionId);
+
+    const origCallDelete = uci.callDelete;
+    if (typeof origCallDelete === "function") {
+      uci.callDelete = function (config, section, options) {
+        if (config === UCI_PACKAGE) {
+          const creates = uci.state?.creates?.[UCI_PACKAGE];
+          const values = uci.state?.values?.[UCI_PACKAGE];
+          if (creates?.[section] || !values?.[section]) {
+            return Promise.resolve(0);
+          }
+        }
+        return origCallDelete.apply(this, arguments).catch((err) => {
+          const msg = typeof err?.message === "string" ? err.message : "";
+          // ubus code 4 is UBUS_STATUS_NOT_FOUND. The numeric code survives
+          // translation; the text after the colon does not, so it only counts
+          // when the message carries no code at all (older transports). A code
+          // that is present but different is authoritative, and the trailing
+          // \b keeps "ubus code 40"/"41" from matching this guard.
+          const coded = /\bubus code \d+\b/.test(msg);
+          if (
+            config === UCI_PACKAGE &&
+            (/\bubus code 4\b/.test(msg) ||
+              (!coded &&
+                (msg.includes("Ресурс не найден") || msg.includes("Not found"))))
+          ) {
+            return 0;
+          }
+          return Promise.reject(err);
+        });
+      };
+    }
+
+    const beforeUciSave = () => {
+      sanitizeUciDeletes(targetSectionId);
+    };
+
+    let saveTasks;
+    try {
+      saveTasks = targetMap.save(beforeUciSave, true);
+    } catch (e) {
+      if (origCallDelete) {
+        uci.callDelete = origCallDelete;
+      }
+      return Promise.reject(e);
+    }
+
     let curr = targetMap;
     while (curr.parent) {
       curr = curr.parent;
@@ -3776,7 +3875,12 @@ function configureServerSection(sectionRef, options = {}) {
 
     return saveTasks
       .then(() => this.handleModalCancel(targetMap, ev, true))
-      .catch((error) => showServerValidationMessage(error));
+      .catch((error) => showServerValidationMessage(error))
+      .finally(() => {
+        if (origCallDelete) {
+          uci.callDelete = origCallDelete;
+        }
+      });
   };
 
   sectionRef.renderRowActions = function (sectionId) {

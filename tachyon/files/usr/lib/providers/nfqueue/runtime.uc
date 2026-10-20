@@ -4,7 +4,7 @@ let fs = require("fs");
 let common = require("core.common");
 let constants = require("core.constants");
 let uci_core = require("core.uci");
-let runtime_constants = require("singbox.constants");
+let runtime_constants = require("tachyon_core.constants");
 let connections = require("config.connections");
 
 let as_string = common.as_string;
@@ -550,7 +550,7 @@ function runtime_config_status(cfg, sections) {
     let is_steer = index(engine_name, "steer") == 0;
     try {
         let engine = require("core.engine");
-        if (engine && engine.get_active() != "sing-box")
+        if (engine && engine.get_active() != "tachyon-core")
             is_steer = true;
     } catch (e) {}
 
@@ -660,6 +660,22 @@ function steer_manages_provider(cfg) {
     return trim(as_string(output)) != "" && steer_process_count(cfg.provider_bin) > 0;
 }
 
+// Status is polled by the UI and these logs are appended to without rotation,
+// so reading the whole file just for its last line scales with uptime.
+function read_log_tail(path) {
+    let st = fs.stat(path);
+    if (st == null || st.size == 0)
+        return null;
+    let f = fs.open(path, "r");
+    if (!f)
+        return null;
+    if (st.size > 8192)
+        f.seek(-8192, 2);
+    let data = f.read(8192);
+    f.close();
+    return data;
+}
+
 function status_json(cfg) {
     let sections = enabled_sections(cfg);
     let configured = length(sections) > 0;
@@ -718,7 +734,7 @@ function status_json(cfg) {
         if (running < expected) {
             for (let section in sections) {
                 let name = section_name(section);
-                let log_data = fs.readfile(cfg.log_dir + "/" + name + ".log");
+                let log_data = read_log_tail(cfg.log_dir + "/" + name + ".log");
                 if (log_data != null && log_data != "") {
                     let log_lines = split(trim(log_data), "\n");
                     if (length(log_lines) > 0) {

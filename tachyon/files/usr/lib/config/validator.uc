@@ -700,7 +700,7 @@ function zapret_validator() {
 // top-level require put that contract back in reach of any future edit.
 function core_profile() {
     if (core_profile_module == null)
-        core_profile_module = require("singbox.core_profile");
+        core_profile_module = require("tachyon_core.core_profile");
     return core_profile_module;
 }
 
@@ -1540,7 +1540,7 @@ function dns_action_has_domain_matchers(section) {
 }
 
 // The generator emits every block/bypass rule before all others
-// (singbox/generator.uc), and sing-box DNS rules are first-match-wins, so an
+// (tachyon_core/generator.uc), and sing-box DNS rules are first-match-wins, so an
 // action=dns section can never override one. A domain written inline here and
 // also claimed by a block/bypass list is dropped with no other trace.
 function warn_dns_action_precedence(section, sections) {
@@ -2176,6 +2176,58 @@ function validate_guest_mode(guest_mode) {
     validate_time_format(end_time, "guest_mode." + name + ".end_time");
 }
 
+// A section may claim one of its own condition values as global: the value is
+// then reserved for it alone and must not appear in any other section. The
+// claim lives on the owner as list global_rules '<kind>:<value>' and only counts
+// while the owner still uses the value - see connections.active_global_rules.
+// This is cross-section by nature, so it runs once over all sections instead of
+// per validate_rule(), and it deliberately covers disabled sections too: the
+// invariant has to hold for a section someone re-enables tomorrow.
+function validate_global_rules(sections) {
+    let owners = {};
+    let claim_count = 0;
+
+    for (let section in sections) {
+        let name = section_name(section);
+
+        for (let entry in connections.global_rules(section)) {
+            claim_count++;
+            let claim = connections.global_rule_claim(entry);
+            if (claim == null)
+                fail_validation("Rule '" + name + "' has a malformed global rule '" + entry +
+                    "'. Expected '<option>:<value>' with a supported option. Aborted.");
+
+            // A claim that no longer matches the owner's own conditions is inert
+            // and reserves nothing, so it neither blocks others nor collides here.
+            let values = connections.condition_values(section, claim.kind);
+            if (values != null && values[claim.value] == true)
+                owners[claim.kind + ":" + claim.value] = name;
+        }
+    }
+
+    if (!claim_count)
+        return;
+
+    for (let section in sections) {
+        let name = section_name(section);
+
+        for (let kind in connections.GLOBAL_RULE_OPTIONS) {
+            let values = connections.condition_values(section, kind);
+            if (values == null)
+                continue;
+
+            for (let value in keys(values)) {
+                let owner = owners[kind + ":" + value];
+                if (owner == null || owner == name)
+                    continue;
+                fail_validation("Rule '" + name + "' uses '" + value + "' (" + kind +
+                    "), which rule '" + owner + "' has claimed as a global rule. Remove it from '" +
+                    name + "' or drop the global claim in '" + owner + "'. Aborted.");
+            }
+        }
+    }
+}
+
 function validate_runtime_config(context) {
     let settings = settings_section();
     let sections = sections_by_type("section");
@@ -2236,6 +2288,8 @@ function validate_runtime_config(context) {
     for (let section in sections)
         validate_rule(section, sections, context);
 
+    validate_global_rules(sections);
+
     for (let profile in profiles)
         validate_profile(profile, profiles);
 
@@ -2294,10 +2348,22 @@ function context_from_runtime() {
     };
 }
 
+function find_core_binary() {
+    if (command_exists("tachyon-core"))
+        return "tachyon-core";
+    if (command_exists("sing-box"))
+        return "sing-box";
+    return "";
+}
+
+function core_exists() {
+    return command_exists("tachyon-core") || command_exists("sing-box");
+}
+
 function sing_box_variant_marker(ctx, value) {
     let path = as_string(ctx.sing_box_variant_state_file);
     if (path == "")
-        path = "/etc/tachyon/sing-box-variant";
+        path = fs.stat("/etc/tachyon/tachyon-core-variant") != null ? "/etc/tachyon/tachyon-core-variant" : "/etc/tachyon/sing-box-variant";
 
     let data = fs.readfile(path);
     return trim(as_string(data)) == as_string(value);
@@ -2322,7 +2388,7 @@ function sing_box_tachyon_core_marker_set(ctx) {
 function sing_box_version_state(ctx) {
     let path = as_string(ctx.sing_box_version_state_file);
     if (path == "")
-        path = "/etc/tachyon/sing-box-version";
+        path = fs.stat("/etc/tachyon/tachyon-core-version") != null ? "/etc/tachyon/tachyon-core-version" : "/etc/tachyon/sing-box-version";
 
     let data = fs.readfile(path);
     if (data == null)
@@ -2333,13 +2399,14 @@ function sing_box_version_state(ctx) {
 }
 
 function get_sing_box_version(ctx) {
-    if (!command_exists("sing-box"))
+    let bin = find_core_binary();
+    if (bin == "")
         return "";
 
     if (sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx))
         return sing_box_version_state(ctx);
 
-    return common.parse_sing_box_version(command_output_from_args([ "sing-box", "version" ]));
+    return common.parse_sing_box_version(command_output_from_args([ bin, "version" ]));
 }
 
 function sing_box_version_is_extended(version) {
@@ -2351,7 +2418,7 @@ function sing_box_version_is_lx(version) {
     return s == "lx" || s == "sing-box-lx" || index(s, "-lx") >= 0;
 }
 
-// Kept identical to the copy in singbox/runtime.uc, like version_compare above -
+// Kept identical to the copy in tachyon_core/runtime.uc, like version_compare above -
 // this module runs before runtime is loaded. Its "-tachyon.<n>" suffix marks a
 // build that implements the schema from scratch rather than being a fork of the
 // Go binary, and whose version number is therefore not comparable with sing-box's.
@@ -2361,7 +2428,7 @@ function sing_box_version_is_foreign_core(version) {
 }
 
 function sing_box_is_extended(ctx, version) {
-    if (as_string(version) == "" && command_exists("sing-box") &&
+    if (as_string(version) == "" && core_exists() &&
         (sing_box_compressed_marker_set(ctx) || sing_box_extended_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
         return true;
 
@@ -2372,7 +2439,7 @@ function sing_box_is_extended(ctx, version) {
 function sing_box_is_lx(ctx, version) {
     if (sing_box_version_is_lx(version) || sing_box_version_is_foreign_core(version))
         return true;
-    if (as_string(version) == "" && command_exists("sing-box") && (sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
+    if (as_string(version) == "" && core_exists() && (sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
         return true;
 
     return sing_box_version_is_lx(version != null ? version : get_sing_box_version(ctx)) || sing_box_version_is_foreign_core(version != null ? version : get_sing_box_version(ctx));
@@ -2381,7 +2448,7 @@ function sing_box_is_lx(ctx, version) {
 function sing_box_is_tachyon_core(ctx, version) {
     if (sing_box_version_is_foreign_core(version))
         return true;
-    if (as_string(version) == "" && command_exists("sing-box") && sing_box_tachyon_core_marker_set(ctx))
+    if (as_string(version) == "" && core_exists() && sing_box_tachyon_core_marker_set(ctx))
         return true;
 
     return sing_box_version_is_foreign_core(version != null ? version : get_sing_box_version(ctx)) || sing_box_tachyon_core_marker_set(ctx);
@@ -2395,7 +2462,7 @@ function sing_box_is_tachyon_core(ctx, version) {
 function sing_box_capability_marker(ctx, version) {
     let path = as_string(ctx.sing_box_variant_state_file);
     if (path == "")
-        path = "/etc/tachyon/sing-box-variant";
+        path = fs.stat("/etc/tachyon/tachyon-core-variant") != null ? "/etc/tachyon/tachyon-core-variant" : "/etc/tachyon/sing-box-variant";
 
     let data = fs.readfile(path);
     let marker = data == null ? "" : trim(as_string(data));
@@ -2410,16 +2477,20 @@ function sing_box_capability_marker(ctx, version) {
 function sing_box_supports_tailscale(ctx, version, version_output) {
     let answer = core_profile().supports_tailscale(as_string(version),
         sing_box_capability_marker(ctx, version), as_string(version_output));
-    if (answer == null)
-        answer = core_profile().output_has_build_tag(command_output_from_args([ "sing-box", "version" ]), "with_tailscale");
+    if (answer == null) {
+        let bin = find_core_binary();
+        answer = bin != "" ? core_profile().output_has_build_tag(command_output_from_args([ bin, "version" ]), "with_tailscale") : false;
+    }
     return answer;
 }
 
 function sing_box_supports_xhttp(ctx, version, version_output) {
     let answer = core_profile().supports_xhttp(as_string(version),
         sing_box_capability_marker(ctx, version), as_string(version_output));
-    if (answer == null)
-        answer = core_profile().output_has_build_tag(command_output_from_args([ "sing-box", "version" ]), "with_xhttp");
+    if (answer == null) {
+        let bin = find_core_binary();
+        answer = bin != "" ? core_profile().output_has_build_tag(command_output_from_args([ bin, "version" ]), "with_xhttp") : false;
+    }
     return answer;
 }
 
@@ -2433,7 +2504,8 @@ function managed_sing_box_service_script(marker) {
         "\n" +
         "USE_PROCD=1\n" +
         "START=99\n" +
-        "PROG=\"/usr/bin/sing-box\"\n" +
+        "PROG=\"/usr/bin/tachyon-core\"\n" +
+        "[ -x \"$PROG\" ] || PROG=\"/usr/bin/sing-box\"\n" +
         "\n" +
         "start_service() {\n" +
         "    [ -d /dev/net ] || mkdir -p /dev/net\n" +
@@ -2441,45 +2513,76 @@ function managed_sing_box_service_script(marker) {
         "    modprobe tun 2>/dev/null || true\n" +
         "    modprobe inet_diag 2>/dev/null || true\n" +
         "\n" +
-        "    config_load \"sing-box\"\n" +
+        "    config_load \"tachyon-core\"\n" +
         "    local enabled config_file working_directory\n" +
         "    local log_stderr\n" +
         "\n" +
         "    config_get_bool enabled \"main\" \"enabled\" \"0\"\n" +
         "    [ \"$enabled\" -eq \"1\" ] || return 0\n" +
         "\n" +
-        "    config_get config_file \"main\" \"conffile\" \"/etc/sing-box/config.json\"\n" +
-        "    config_get working_directory \"main\" \"workdir\" \"/usr/share/sing-box\"\n" +
+        "    [ -x \"$PROG\" ] || PROG=\"$(command -v tachyon-core 2>/dev/null || command -v sing-box 2>/dev/null || echo /usr/bin/tachyon-core)\"\n" +
+        "    config_get config_file \"main\" \"conffile\" \"/etc/tachyon-core/config.json\"\n" +
+        "    config_get working_directory \"main\" \"workdir\" \"/usr/share/tachyon-core\"\n" +
+        "    [ -d \"$working_directory\" ] || mkdir -p \"$working_directory\"\n" +
         "    config_get_bool log_stderr \"main\" \"log_stderr\" \"1\"\n" +
         "\n" +
-        "    mkdir -p /tmp/sing-box 2>/dev/null\n" +
-        "    : > /tmp/sing-box/sing-box.log 2>/dev/null\n" +
+        "    local mem_limit_mb=\"0\"\n" +
+        "    config_get mem_limit_mb \"main\" \"memory_limit_mb\" \"0\"\n" +
+        "    if [ \"$mem_limit_mb\" = \"0\" ] || [ -z \"$mem_limit_mb\" ]; then\n" +
+        "        mem_limit_mb=\"$(uci get tachyon.settings.memory_limit_mb 2>/dev/null || echo 0)\"\n" +
+        "    fi\n\n" +
+        "    local scale_pct=\"\"\n" +
+        "    if [ -s \"/etc/tachyon/mem_scale\" ]; then\n" +
+        "        scale_pct=\"$(awk -v s=\"$(cat /etc/tachyon/mem_scale 2>/dev/null)\" 'BEGIN { if (!s) exit; pct=int(s*100); if (pct < 20) pct=20; if (pct > 100) pct=100; print pct }')\"\n" +
+        "    fi\n\n" +
+        "    local gomemlimit=\"\"\n" +
+        "    local mem_total_kb=\"$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)\"\n" +
+        "    if [ \"$mem_limit_mb\" -gt 0 ] 2>/dev/null; then\n" +
+        "        gomemlimit=\"$mem_limit_mb\"\n" +
+        "    elif [ \"$mem_total_kb\" -gt 0 ]; then\n" +
+        "        if [ \"$mem_total_kb\" -le 524288 ] || { [ -n \"$scale_pct\" ] && [ \"$scale_pct\" -lt 100 ]; }; then\n" +
+        "            gomemlimit=$(( mem_total_kb / 1024 * 50 / 100 ))\n" +
+        "            [ \"$gomemlimit\" -lt 24 ] && gomemlimit=24\n" +
+        "        fi\n" +
+        "    fi\n\n" +
+        "    if [ -n \"$gomemlimit\" ] && [ \"$gomemlimit\" -gt 0 ] 2>/dev/null; then\n" +
+        "        if [ -n \"$scale_pct\" ] && [ \"$scale_pct\" -lt 100 ]; then\n" +
+        "            gomemlimit=$(( gomemlimit * scale_pct / 100 ))\n" +
+        "            [ \"$gomemlimit\" -lt 16 ] && gomemlimit=16\n" +
+        "        fi\n" +
+        "    fi\n\n" +
+        "    mkdir -p /tmp/tachyon-core 2>/dev/null\n" +
+        "    : > /tmp/tachyon-core/sing-box.log 2>/dev/null\n" +
         "\n" +
         "    procd_open_instance\n" +
         "    procd_set_param command \"$PROG\" run -c \"$config_file\" -D \"$working_directory\"\n" +
         "    procd_set_param file \"$config_file\"\n" +
         "    procd_set_param stderr \"$log_stderr\"\n" +
-        "    procd_set_param limits core=\"unlimited\"\n" +
-        "    procd_set_param limits nofile=\"1000000 1000000\"\n" +
-        "    procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\"\n" +
+        "    procd_set_param limits core=\"0\"\n" +
+        "    procd_set_param limits nofile=\"65535 65535\"\n" +
+        "    if [ -n \"$gomemlimit\" ] && [ \"$gomemlimit\" -gt 0 ] 2>/dev/null; then\n" +
+        "        procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\" GOMEMLIMIT=\"${gomemlimit}MiB\"\n" +
+        "    else\n" +
+        "        procd_set_param env GODEBUG=\"madvdontneed=1\" GOGC=\"50\" TACHYON_RULESET_SOFT_START=\"1\"\n" +
+        "    fi\n" +
         "    procd_set_param term_timeout 15\n" +
         "    procd_set_param respawn\n" +
         "    procd_close_instance\n" +
         "}\n" +
         "\n" +
         "service_triggers() {\n" +
-        "    procd_add_reload_trigger \"sing-box\"\n" +
+        "    procd_add_reload_trigger \"tachyon-core\"\n" +
         "}\n";
 }
 
 function install_managed_sing_box_service_script(ctx) {
     let stamp = clock();
-    let tmp_file = sprintf("/etc/init.d/sing-box.tachyon.%d.%d", stamp[0], stamp[1]);
+    let tmp_file = sprintf("/etc/init.d/tachyon-core.tachyon.%d.%d", stamp[0], stamp[1]);
 
     if (!fs.writefile(tmp_file, managed_sing_box_service_script(ctx.sing_box_managed_service_marker)))
         return false;
 
-    if (!run_args([ "chmod", "0755", tmp_file ]) || !run_args([ "mv", "-f", tmp_file, "/etc/init.d/sing-box" ])) {
+    if (!run_args([ "chmod", "0755", tmp_file ]) || !run_args([ "mv", "-f", tmp_file, "/etc/init.d/tachyon-core" ])) {
         fs.unlink(tmp_file);
         return false;
     }
@@ -2748,12 +2851,13 @@ function check_runtime_requirements() {
     log_message("Checking required packages and runtime settings", "info");
 
     let ctx = context_from_runtime();
-    let sing_box_version_output = command_exists("sing-box") ? command_output_from_args([ "sing-box", "version" ]) : "";
+    let bin = find_core_binary();
+    let sing_box_version_output = bin != "" ? command_output_from_args([ bin, "version" ]) : "";
     let sing_box_version = (sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)) ? sing_box_version_state(ctx) : common.parse_sing_box_version(sing_box_version_output);
     let coreutils_base64_version = first_line_field_from_text(command_output("base64 --version 2>/dev/null"), 4);
 
     if (sing_box_version == "") {
-        if (!command_exists("sing-box") || !(sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
+        if (!core_exists() || !(sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
             fail_requirement("Package 'sing-box' is not installed. Aborted.", "error");
     }
     else if (!sing_box_version_is_foreign_core(sing_box_version) &&
@@ -2768,11 +2872,11 @@ function check_runtime_requirements() {
         fail_requirement("Package 'sing-box' version (" + sing_box_version + ") is lower than the required minimum (" + ctx.sing_box_required_version + "). Update sing-box: opkg update && opkg remove sing-box && opkg install sing-box. Aborted.", "error");
     }
 
-    if (!service_exists("sing-box") && (sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx)))
+    if (!service_exists("tachyon-core") && !service_exists("sing-box") && (sing_box_compressed_marker_set(ctx) || sing_box_lx_marker_set(ctx) || sing_box_tachyon_core_marker_set(ctx) || core_exists()))
         install_managed_sing_box_service_script(ctx);
 
-    if (!service_exists("sing-box"))
-        fail_requirement("Service 'sing-box' is missing. Install a sing-box package or reinstall sing-box-lx / sing-box-extended binary variant. Aborted.", "error");
+    if (!service_exists("tachyon-core") && !service_exists("sing-box"))
+        fail_requirement("Service 'tachyon-core' is missing. Install a sing-box package or reinstall sing-box-lx / sing-box-extended binary variant. Aborted.", "error");
 
     validate_extended_server_features(ctx, sing_box_version, sing_box_version_output);
     validate_section_action_variant_support(ctx, sing_box_version);

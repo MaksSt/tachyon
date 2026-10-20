@@ -469,9 +469,11 @@ function isUrlTestEnabled(section: Tachyon.ConfigSection) {
   return getUrlTestIds(section).length > 0;
 }
 
-function shouldHideNaServers(configSections: Tachyon.ConfigSection[]) {
-  return configSections.some(
-    (s) => isConnectionAction(s.action) && s.dashboard_hide_na_servers === '1',
+function shouldHideNaServers(section: Tachyon.ConfigSection) {
+  return (
+    section.enabled !== '0' &&
+    isConnectionAction(section.action) &&
+    section.dashboard_hide_na_servers === '1'
   );
 }
 
@@ -892,10 +894,27 @@ async function readDashboardSectionCache(
     return undefined;
   }
 
+  const path = `${DASHBOARD_SECTION_CACHE_DIR}/${sectionName}.json`;
+
   try {
-    const raw = await fs.read(
-      `${DASHBOARD_SECTION_CACHE_DIR}/${sectionName}.json`,
-    );
+    const raw = await fs.read(path).catch(async () => {
+      const directFs = fs as unknown as {
+        read_direct?: (p: string, type?: string) => Promise<string>;
+        exec_direct?: (
+          cmd: string,
+          args?: string[],
+          type?: string,
+        ) => Promise<string>;
+      };
+      if (typeof directFs.read_direct === 'function') {
+        return directFs.read_direct(path, 'text');
+      }
+      if (typeof directFs.exec_direct === 'function') {
+        return directFs.exec_direct('/bin/cat', [path], 'text');
+      }
+      const res = await fs.exec('/bin/cat', [path]);
+      return res?.stdout || '';
+    });
     const parsed = JSON.parse(raw) as DashboardSectionCache;
 
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -1964,7 +1983,7 @@ export async function getDashboardSections(
               hiddenOutboundTags,
             );
 
-          const hideNa = shouldHideNaServers(configSections);
+          const hideNa = shouldHideNaServers(section);
           const hasTestedServers = outbounds.some((o) => !isNaOutbound(o));
           const filteredOutbounds =
             hideNa && hasTestedServers

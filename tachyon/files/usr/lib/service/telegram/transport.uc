@@ -28,6 +28,7 @@ let command_from_args = common.command_from_args;
 let command_capture = common.command_capture;
 let command_output_from_args = common.command_output_from_args;
 let command_success_from_args = common.command_success_from_args;
+let core_binary_running = common.core_binary_running;
 let write_text_file = helpers.write_text_file;
 
 let cb_map_cache = null;
@@ -114,7 +115,7 @@ function settings() {
 
 function get_mixed_proxy_info() {
     let settings_data = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
-    let config_path = trim(as_string(settings_data.config_path || "")) || "/etc/sing-box/config.json";
+    let config_path = trim(as_string(settings_data.config_path || "")) || "/etc/tachyon-core/config.json";
     let data = fs.readfile(config_path);
     if (data == null) return null;
     let parsed;
@@ -190,7 +191,7 @@ function direct_fallback_enabled() {
 
 function get_proxy_args() {
     let cfg = settings();
-    if (command_success_from_args(["pidof", "sing-box"])) {
+    if (core_binary_running()) {
         let ep = get_mixed_proxy_endpoint() || ("127.0.0.1:" + get_mixed_port());
         if (!mixed_port_alive()) {
             if (direct_fallback_enabled())

@@ -160,12 +160,13 @@ ucode -L "$TACHYON_LIB" "$TACHYON_LIB/nft/apply.uc" nft-populate-runtime-sets-fi
 
 grep -q "tachyon_rule_sec_txt_subnets.*198.51.100.77" "$NFT_LOG" || fail "sec_txt IPv4 subnets from .txt missing in nft set"
 grep -q "tachyon_rule_sec_txt_subnets6.*2001:db8::77" "$NFT_LOG" || fail "sec_txt IPv6 subnets from .txt missing in nft set"
-grep -q "198.51.100.88 . 443" "$NFT_LOG" || fail "sec_lst_ports scoped ip-port missing in nft set"
+grep -q "tachyon_rule_sec_lst_ports_ip_ports.*198.51.100.88 . 443" "$NFT_LOG" || fail "sec_lst_ports scoped TCP ip-port missing in nft set"
+grep -q "tachyon_rule_sec_lst_ports_udp_ip_ports.*198.51.100.88 . 443" "$NFT_LOG" || fail "sec_lst_ports scoped UDP ip-port missing in nft set"
 if grep -q "domain-in-subnets.com" "$NFT_LOG"; then
   fail "domain name unexpectedly placed in nft ip set"
 fi
-mkdir -p /tmp/sing-box/rulesets
-cat >/tmp/sing-box/rulesets/sec_compiled-lists-ruleset.json <<'JSON'
+mkdir -p /tmp/tachyon-core/rulesets
+cat >/tmp/tachyon-core/rulesets/sec_compiled-lists-ruleset.json <<'JSON'
 {
   "version": 1,
   "rules": [
@@ -199,7 +200,7 @@ ucode -L "$TACHYON_LIB" "$TACHYON_LIB/nft/apply.uc" nft-populate-runtime-sets-fi
 grep -q "tachyon_rule_sec_compiled_subnets.*198.51.100.99" "$NFT_LOG" || fail "sec_compiled IPv4 subnets from compiled ruleset missing in nft set"
 grep -q "tachyon_rule_sec_compiled_subnets6.*2001:db8::99" "$NFT_LOG" || fail "sec_compiled IPv6 subnets from compiled ruleset missing in nft set"
 
-rm -rf /tmp/sing-box/rulesets/sec_compiled-lists-ruleset.json
+rm -rf /tmp/tachyon-core/rulesets/sec_compiled-lists-ruleset.json
 
 export PATH="$OLD_PATH"
 

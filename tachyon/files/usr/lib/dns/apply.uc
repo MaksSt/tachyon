@@ -346,27 +346,29 @@ function restore_resolv_conf_symlink() {
 
 // Resolves sing-box multi-fallback PID detection across pidfiles, ubus procd, and pidof
 function sing_box_running_pid() {
-    for (let path in [ "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
+    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid", "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
         let pid = trim(fs.readfile(path) || "");
         if (pid != "" && run("kill -0 " + shell_quote(pid) + " 2>/dev/null"))
             return pid;
     }
 
-    let p = fs.popen("ubus call service list '{\"name\":\"sing-box\"}' 2>/dev/null", "r");
-    if (p) {
-        let out = p.read("all");
-        p.close();
-        if (out != null && out != "") {
-            let matched = match(out, /"pid":\s*([0-9]+)/);
-            if (matched && matched[1] != "") {
-                let pid = matched[1];
-                if (run("kill -0 " + shell_quote(pid) + " 2>/dev/null"))
-                    return pid;
+    for (let svc in [ "tachyon-core", "sing-box" ]) {
+        let p = fs.popen("ubus call service list '{\"name\":\"" + svc + "\"}' 2>/dev/null", "r");
+        if (p) {
+            let out = p.read("all");
+            p.close();
+            if (out != null && out != "") {
+                let matched = match(out, /"pid":\s*([0-9]+)/);
+                if (matched && matched[1] != "") {
+                    let pid = matched[1];
+                    if (run("kill -0 " + shell_quote(pid) + " 2>/dev/null"))
+                        return pid;
+                }
             }
         }
     }
 
-    let p2 = fs.popen("pidof sing-box 2>/dev/null", "r");
+    let p2 = fs.popen("pidof tachyon-core sing-box 2>/dev/null", "r");
     if (p2) {
         let out2 = p2.read("all");
         p2.close();
@@ -391,6 +393,13 @@ function dnsmasq_configure(force) {
         log("dnsmasq configuration skipped: dont_touch_dhcp is enabled", "info");
         return true;
     }
+
+    // The restart churn (stop_main, netifd, dnsmasq) routinely clobbers the
+    // /etc/resolv.conf symlink into a regular file. Restore it here, before the
+    // early returns below — "unclean shutdown, already configured" and
+    // "sing-box not running yet" both used to skip the restore on the happy
+    // path only, leaving a plain-file resolv.conf after every such restart.
+    restore_resolv_conf_symlink();
 
     if (uci_get("dhcp.@dnsmasq[0].port") == "0" && (run("pidof AdGuardHome >/dev/null 2>&1") || run("pidof adguardhome >/dev/null 2>&1"))) {
         log("dnsmasq configuration skipped: AdGuardHome is active and dnsmasq DNS is disabled (port 0)", "info");

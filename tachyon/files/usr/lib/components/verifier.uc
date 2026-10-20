@@ -19,8 +19,24 @@ let as_string = common.as_string;
 // inheriting it from a require graph.
 function core_profile() {
     if (core_profile_module == null)
-        core_profile_module = require("singbox.core_profile");
+        core_profile_module = require("tachyon_core.core_profile");
     return core_profile_module;
+}
+
+// Lazy for the same reason as core_profile(), and additionally guarded: the
+// partial -L tree that components_updater_job stages has no core/gomemlimit.uc,
+// and a hard require here would break that update path outright. There the
+// ceiling is simply skipped - exactly as it was before - while a full install,
+// which is where a second Go runtime competes with the running daemon, gets it.
+let gomemlimit_module = false;
+function gomemlimit_env_map() {
+    if (gomemlimit_module === false) {
+        try { gomemlimit_module = require("core.gomemlimit"); }
+        catch (e) { gomemlimit_module = null; }
+    }
+    if (gomemlimit_module == null) return {};
+    try { return gomemlimit_module.gomemlimit_env_map(); }
+    catch (e) { return {}; }
 }
 
 // ============================================================================
@@ -121,7 +137,7 @@ function validate_sing_box_extended_binary(binary, library_dir, compressed) {
 // Drops the field sing-box named from the outbound it named, and reports whether
 // anything changed.
 //
-// The apply path in singbox/runtime.uc calls this same function now, because its
+// The apply path in tachyon_core/runtime.uc calls this same function now, because its
 // inlined copy drifted into a crash (to_string does not exist in ucode) that took
 // the whole start down on the first rejected field, while this copy stayed tested.
 // It is the reason a build that rejects one field can still run: only the offending
@@ -233,6 +249,11 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
         GODEBUG: "madvdontneed=1",
         GOGC: "30"
     };
+    // A config check loads every .srs the config references while the daemon
+    // already holds its own copy. Without a ceiling here the second Go runtime
+    // balloons by 40-80 MB of RSS and the OOM killer lands on the daemon.
+    for (let name, value in gomemlimit_env_map())
+        env_map[name] = value;
     let lib_path = as_string(library_dir || "");
     if (lib_path != "") {
         if (lib_path == "/usr/lib")
@@ -250,7 +271,7 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
         return { ok: false, reason: "binary unable to report version" };
     }
 
-    let active_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/sing-box-variant";
+    let active_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
     let active_variant = trim(fs.readfile(active_variant_file) || "");
     let target_var = as_string(target_variant || "");
     if (target_var == "") {
@@ -266,7 +287,7 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
 
     let is_variant_switch = (target_var != "" && active_variant != "" && target_var != active_variant);
 
-    config_path = as_string(config_path || "/etc/sing-box/config.json");
+    config_path = as_string(config_path || "/etc/tachyon-core/config.json");
 
     // When changing core/variant, the existing config on disk was built for the
     // old variant/core and may contain incompatible options (e.g. endpoints[0].amnezia).
@@ -315,14 +336,14 @@ function check_sing_box_config_with_binary(binary, config_path, library_dir, tar
         let target_supports_xhttp = core_profile().supports_xhttp(ver_str, xhttp_marker, ver_out) === true;
         let gen_cmd = helpers.command_env(gen_env) + " " +
             common.command_from_args([
-                "ucode", "-L", helpers.LIB_DIR, helpers.LIB_DIR + "/singbox/generator.uc",
+                "ucode", "-L", helpers.LIB_DIR, helpers.LIB_DIR + "/tachyon_core/generator.uc",
                 "generate-config", candidate_cfg, "127.0.0.1", "0", (target_supports_xhttp ? "1" : "0"), ""
             ]) + " >" + common.shell_quote(err_file) + " 2>&1";
         let gen_status = common.command_status(gen_cmd);
         if (gen_status == 0 && helpers.file_nonempty(candidate_cfg)) {
             helpers.remove_file(err_file);
             let repaired = false;
-            for (let attempt = 0; attempt < 4; attempt++) {
+            for (let attempt = 0; attempt < 16; attempt++) {
                 let cand_check_cmd = helpers.command_env(env_map) + " " +
                     common.command_from_args([ binary, "-c", candidate_cfg, "check" ]) +
                     " >" + common.shell_quote(err_file) + " 2>&1";

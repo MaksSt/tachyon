@@ -821,7 +821,8 @@ function netstat_server_port_conflict_owner_list(data, listen, port, proto) {
         let owner = length(fields) > 0 ? as_string(fields[length(fields) - 1]) : "";
         if (owner == "" || owner == "-" || owner == "LISTEN")
             owner = "unknown";
-        if (!str_endswith(owner, "/sing-box"))
+        // Our own core (however the binary is named) is not a conflict.
+        if (!str_endswith(owner, "/sing-box") && !str_endswith(owner, "/tachyon-core"))
             push(owners, owner);
     }
 
@@ -1558,7 +1559,7 @@ function render_matching_log_tail(needle, max_lines) {
             continue;
         if (line_contains(line, needle))
         {
-            if (needle == "sing-box" && is_udp_unsupported_outbound_log(line)) {
+            if ((needle == "tachyon-core" || needle == "sing-box") && is_udp_unsupported_outbound_log(line)) {
                 if (!udp_http_notice_emitted) {
                     push(filtered, "UDP traffic through HTTP outbounds is not supported by sing-box; repeated UDP warnings for HTTP outbounds are hidden by Tachyon.");
                     udp_http_notice_emitted = true;

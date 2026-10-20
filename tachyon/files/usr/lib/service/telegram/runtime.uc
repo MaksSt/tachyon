@@ -27,6 +27,11 @@ const COMPONENT_UPDATE_CHECK_TIMESTAMP = "/var/run/tachyon/component-update-chec
 // raised "left-hand side is not a function" after every successful long-poll,
 // so the worker slept poll_interval seconds between each batch of updates.
 const BLOCKED_POLL_INTERVAL = 60;
+// Also left behind by that split: load/save_blocked_counts() read and wrote
+// an undeclared name (null), so the previous counters were always empty and a
+// schedule with notify=1 re-announced itself every BLOCKED_POLL_INTERVAL.
+// tmpfs on purpose: the counters are meaningless across a reboot.
+const BLOCKED_STATE_FILE = getenv("TACHYON_TELEGRAM_BLOCKED_STATE_FILE") || "/var/run/tachyon_telegram_blocked.json";
 
 let as_string = common.as_string;
 let shell_quote = common.shell_quote;
@@ -55,6 +60,7 @@ let object_or_empty = common.object_or_empty;
 let option = common.option;
 let command_status = common.command_status;
 let command_success_from_args = common.command_success_from_args;
+let core_binary_running = common.core_binary_running;
 let command_from_args = common.command_from_args;
 let command_capture = common.command_capture;
 let command_output_from_args = common.command_output_from_args;
@@ -404,13 +410,15 @@ function process_updates(token, admin_ids) {
                     if (file_url) {
                         let dl_path = "/tmp/restore_" + doc.file_id + ".tar.gz";
                         let proxy = get_proxy_args();
-                        let dl_args = [ "curl", "-s", "-o", dl_path ];
+                        let dl_args = [ "curl", "-sf", "--max-time", "120", "--max-filesize", "20971520", "-o", dl_path ];
                         for (let p in proxy) push(dl_args, p);
                         push(dl_args, file_url);
-                        command_status(command_from_args(dl_args));
-                        if (fs.stat(dl_path)) {
+                        let dl_status = command_status(command_from_args(dl_args));
+                        if (dl_status == 0 && fs.stat(dl_path)) {
                             apply_backup_restore(token, chat_id, dl_path);
                         } else {
+                            // A partial body must not sit in tmpfs.
+                            try { fs.unlink(dl_path); } catch (e) {}
                             send_message(token, chat_id, "❌ <b>" + t("backup_download_error") + "</b>", "HTML");
                         }
                     } else {
@@ -763,7 +771,7 @@ function diagnose() {
     }
 
     // 3. sing-box running
-    let sb_running = command_success_from_args(["pidof", "sing-box"]);
+    let sb_running = core_binary_running();
     push(checks, {
         name: "sing_box",
         ok: sb_running,

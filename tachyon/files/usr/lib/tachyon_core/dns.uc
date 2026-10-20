@@ -2,7 +2,7 @@
 
 let common = require("core.common");
 let core_ip = require("core.ip");
-let runtime_constants = require("singbox.constants");
+let runtime_constants = require("tachyon_core.constants");
 let runtime_url = require("core.url");
 let fs = require("fs");
 
@@ -270,10 +270,27 @@ function server_from_options(tag_name, dns_type, dns_server, detour, mtls_settin
 function bootstrap_server(tag_name, value) {
     let server = runtime_url.host(value);
     let port = runtime_url.port(value);
+    let host = server != "" ? server : value;
+    // The bootstrap server is addressed by IP (it is what resolves the DoH/DoT
+    // hostnames, so it cannot itself depend on a name). Plain UDP/53 still sent
+    // the bootstrap query in the clear on the WAN. When the IP is one we know
+    // the DoT name for, upgrade it to DoT on 853 so the query is encrypted; an
+    // unknown ISP resolver keeps plain UDP because we have no SNI to present.
+    let dot_name = core_ip.valid_ip(host) ? KNOWN_DNS_SERVER_NAMES[host] : null;
+    if (dot_name != null) {
+        let result = {
+            type: "tls",
+            tag: tag_name,
+            server: host,
+            server_port: port != "" ? int(port) : 853,
+            tls: { enabled: true, server_name: dot_name }
+        };
+        return result;
+    }
     return {
         type: "udp",
         tag: tag_name,
-        server: server != "" ? server : value,
+        server: host,
         server_port: port != "" ? int(port) : 53
     };
 }
@@ -359,6 +376,13 @@ function add_health_candidate(result, kind, index_value, server, override_dns_ty
         return;
     }
 
+    if (kind == "main" && bool_option(active_settings, "dns_doq_ech", false)) {
+        if (dns_server.type == "tls" || dns_server.type == "quic" || dns_server.type == "https") {
+            if (!dns_server.tls) dns_server.tls = { enabled: true };
+            dns_server.tls.ech = { enabled: true };
+        }
+    }
+
     push(result.servers, dns_server);
     push(result.inbounds, {
         type: "direct",
@@ -405,9 +429,11 @@ function config(settings, override_state) {
 
         if (length(state.main_servers) > 0)
             for (let i = 0; i < length(state.main_servers); i++) {
-                // Health probes always use direct connection (no detour) to test DNS server reachability
-                let dns_type = is_wan_fallback_index(settings, i) ? "udp" : state.dns_type;
-                add_health_candidate(result, "main", i, state.main_servers[i], dns_type, "", settings);
+                let is_wan = is_wan_fallback_index(settings, i);
+                let is_fallback = is_explicit_fallback_index(settings, i);
+                let dns_type = (is_wan || is_fallback) ? "udp" : state.dns_type;
+                let detour = (is_wan || is_fallback) ? "" : state.dns_detour;
+                add_health_candidate(result, "main", i, state.main_servers[i], dns_type, detour, settings);
             }
 
         if (length(state.bootstrap_servers) > 0)

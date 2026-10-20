@@ -510,6 +510,15 @@ function command_success_from_args(args) {
     return command_success(command_from_args(args));
 }
 
+// The core binary ships under two names depending on the package installed:
+// tachyon-core (current) or sing-box (legacy/unmigrated installs). Every
+// "is the core alive" probe must accept both, or a running core reads as
+// stopped and the service/bot/doctor start issuing bogus kills.
+function core_binary_running() {
+    return command_success_from_args([ "pidof", "tachyon-core" ])
+        || command_success_from_args([ "pidof", "sing-box" ]);
+}
+
 function command_capture(command) {
     let p = fs.popen(command, "r");
     if (!p) return null;
@@ -710,7 +719,7 @@ function remove_tree(path) {
 // Override point for tests, same idea as TACHYON_LIB/TACHYON_CONFIG elsewhere:
 // the suite runs unprivileged and cannot write /etc.
 function singbox_config_path() {
-    return getenv("TACHYON_SINGBOX_CONFIG") || "/etc/sing-box/config.json";
+    return getenv("TACHYON_SINGBOX_CONFIG") || "/etc/tachyon-core/config.json";
 }
 
 function get_mixed_inbound_info() {
@@ -929,6 +938,7 @@ return {
     command_success,
     command_status_from_args,
     command_success_from_args,
+    core_binary_running,
     command_capture,
     command_output,
     command_output_from_args,

@@ -2,8 +2,8 @@
 
 let fs = require("fs");
 let common = require("core.common");
-let runtime_constants = require("singbox.constants");
-let variant_state = require("singbox.variant_state");
+let runtime_constants = require("tachyon_core.constants");
+let variant_state = require("tachyon_core.variant_state");
 let core_ip = require("core.ip");
 
 let as_string = common.as_string;
@@ -162,6 +162,27 @@ function maybe_string(object, key, value) {
         object[key] = value;
 }
 
+const REALITY_FALLBACK_CERTIFICATE = [
+    "-----BEGIN CERTIFICATE-----",
+    "MIIBTzCB9aADAgECAhAdIIOcW0lViVbVrptPiDKtMAoGCCqGSM49BAMCMBQxEjAQ",
+    "BgNVBAMMCWxvY2FsaG9zdDAeFw0yNjEwMTkwMDI4MzNaFw0yNzEwMTQwMTI4MzNa",
+    "MBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IA",
+    "BLFw0A61eMnSgStndfixJXTzu5nRLXIJVJnPgUPzKvUbs6JE0y7Fmx6U/URMf4yn",
+    "rxuuLQS7iKRDXGf3lVba1gOjKTAnMBQGA1UdEQQNMAuCCWxvY2FsaG9zdDAPBgNV",
+    "HRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQDUBUZKKNCiB2hQlSLSO5bz",
+    "h5xULIK0AoFWZ4P7Y/05CwIhAJOgTTkDN8bornbn/AcbabFQjRwhWJNH8Yz3wY0o",
+    "LPFY",
+    "-----END CERTIFICATE-----"
+];
+
+const REALITY_FALLBACK_KEY = [
+    "-----BEGIN PRIVATE KEY-----",
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyxay+uvi+neaI1aC",
+    "l0d/KM8aquKceX5dKMXeNo0k25ShRANCAASxcNAOtXjJ0oErZ3X4sSV087uZ0S1y",
+    "CVSZz4FD8yr1G7OiRNMuxZselP1ETH+Mp68bri0Eu4ikQ1xn95VW2tYD",
+    "-----END PRIVATE KEY-----"
+];
+
 function apply_tls(inbound, section, protocol) {
     let security = effective_security(section, protocol);
     if (security == "" || security == "none")
@@ -191,6 +212,24 @@ function apply_tls(inbound, section, protocol) {
             reality.short_id = short_id;
         maybe_string(reality, "max_time_difference", option(section, "reality_max_time_difference", "1m"));
         tls.reality = reality;
+
+        // tachyon-core's validate_server_tls (still current at 0.1.3) rejects a server
+        // TLS block with a missing certificate or a missing key, and it never looks at
+        // tls.reality: both sides are checked independently, with no key-vs-cert match.
+        // core-runtime is the opposite — on a reality inbound it reads only the reality
+        // block and never touches certificate or key. So fill in whatever the validator
+        // needs for the sides the operator did not configure, while keeping a
+        // configured side instead of discarding half of it.
+        let cert_path = option(section, "tls_certificate_path", "");
+        let k_path = option(section, "tls_key_path", "");
+        if (cert_path != "")
+            maybe_string(tls, "certificate_path", cert_path);
+        else
+            tls.certificate = REALITY_FALLBACK_CERTIFICATE;
+        if (k_path != "")
+            maybe_string(tls, "key_path", k_path);
+        else
+            tls.key = REALITY_FALLBACK_KEY;
     }
 
     inbound.tls = tls;
@@ -488,7 +527,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
             // j1-j3/itime were removed from the extended schema in 2.6.1 and
             // sing-box fatals on unknown fields, so emit them only for builds
             // whose schema still accepts them.
-            let sb_version_state_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/sing-box-version";
+            let sb_version_state_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
             let sb_version = trim(fs.readfile(sb_version_state_file) || "");
             if (common.extended_awg_schema_has_junk_signatures(sb_version)) {
                 if (j1 != "") amnezia.j1 = j1;

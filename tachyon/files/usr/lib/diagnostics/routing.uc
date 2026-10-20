@@ -6,11 +6,12 @@ let core_ip = require("core.ip");
 let uci_core = require("core.uci");
 let common = require("core.common");
 let network_mod = require("diagnostics.network");
-let variant_state = require("singbox.variant_state");
+let variant_state = require("tachyon_core.variant_state");
+let gomemlimit = require("core.gomemlimit");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || constants.TACHYON_CONFIG_NAME || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
-const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || constants.TMP_SING_BOX_FOLDER || "/tmp/sing-box";
+const TMP_SING_BOX_FOLDER = getenv("TMP_SING_BOX_FOLDER") || constants.TMP_SING_BOX_FOLDER || "/tmp/tachyon-core";
 const CHECK_PROXY_IP_DOMAIN = getenv("CHECK_PROXY_IP_DOMAIN") || constants.CHECK_PROXY_IP_DOMAIN || "ip.podkop.fyi";
 const FAKEIP_TEST_DOMAIN = getenv("FAKEIP_TEST_DOMAIN") || constants.FAKEIP_TEST_DOMAIN || "fakeip.podkop.fyi";
 const NFT_TABLE_NAME = getenv("NFT_TABLE_NAME") || constants.NFT_TABLE_NAME || "TachyonTable";
@@ -24,7 +25,7 @@ const STEER_NFT_TABLE = getenv("STEER_NFT_TABLE") || "steer";
 const SB_CLASH_API_CONTROLLER_PORT = getenv("SB_CLASH_API_CONTROLLER_PORT") || constants.SB_CLASH_API_CONTROLLER_PORT || "9090";
 const DEFAULT_LATENCY_TEST_URL = getenv("DEFAULT_LATENCY_TEST_URL") || "https://www.gstatic.com/generate_204";
 const HELPERS_UC = LIB_DIR + "/core/helpers.uc";
-const SINGBOX_RUNTIME_UC = LIB_DIR + "/singbox/runtime.uc";
+const SINGBOX_RUNTIME_UC = LIB_DIR + "/tachyon_core/runtime.uc";
 const PROVIDERS_STATUS_UC = LIB_DIR + "/providers/status.uc";
 const SERVICE_UI_UC = LIB_DIR + "/service/ui.uc";
 
@@ -210,8 +211,7 @@ function helper_output(mode, args) {
     let full = [ mode ];
     for (let arg in args)
         push(full, as_string(arg));
-    return replace(module_output(HELPERS_UC, full), /[
-]+$/g, "");
+    return replace(module_output(HELPERS_UC, full), /[\r\n]+$/g, "");
 }
 
 function uci_show_quote(value) {
@@ -474,7 +474,8 @@ function cleanup_check_proxy_dir(dir) {
 
 function check_proxy() {
     let sing_box_config_path = option(settings(), "config_path", "");
-    if (!command_exists("sing-box")) {
+    let bin = command_exists("tachyon-core") ? "tachyon-core" : (command_exists("sing-box") ? "sing-box" : "");
+    if (bin == "") {
         nolog("sing-box is not installed");
         return 1;
     }
@@ -484,7 +485,7 @@ function check_proxy() {
     }
 
     nolog("Checking sing-box configuration...");
-    if (!command_success_from_args([ "sing-box", "-c", sing_box_config_path, "check" ])) {
+    if (!command_success_from_args([ bin, "-c", sing_box_config_path, "check" ])) {
         nolog("Invalid configuration");
         return 1;
     }
@@ -511,12 +512,14 @@ function check_proxy() {
 
     let response = "";
     for (let attempt = 1; attempt <= 5; attempt++) {
-        let args = [ "sing-box", "tools", "fetch", "ifconfig.me", "-c", check_proxy_config, "-D", check_proxy_dir, "--disable-color" ];
+        let args = [ bin, "tools", "fetch", "ifconfig.me", "-c", check_proxy_config, "-D", check_proxy_dir, "--disable-color" ];
         if (outbound_tag != "") {
             push(args, "-o");
             push(args, outbound_tag);
         }
-        response = command_output(command_from_args(args) + " 2>/dev/null");
+        // A full core run next to the daemon, rulesets included - same ceiling
+        // as `check`, and this one is retried five times.
+        response = command_output(gomemlimit.gomemlimit_env() + command_from_args(args) + " 2>/dev/null");
         if (status_success([ "proxy-response-is-retryable-error" ], response))
             continue;
 
@@ -813,7 +816,7 @@ function clash_api_url() {
 
 function clash_auth_args() {
     let secret = "";
-    let config_data = fs.readfile("/etc/sing-box/config.json");
+    let config_data = fs.readfile("/etc/tachyon-core/config.json");
     if (config_data) {
         try {
             let sb_cfg = json(config_data);
@@ -1274,21 +1277,12 @@ function clash_api(action, arg1, arg2, arg3) {
                     history: sec_hist
                 };
 
-                if (uci_node == "auto" || uci_node == "urltest" || uci_node == null || uci_node == "") {
-                    let target_candidate_indices = [];
-                    let best_node_to_apply = null;
-                    if (proxies[now_tag] != null && proxies[now_tag].type == "URLTest") {
-                        let active_grp = proxies[now_tag];
-                        for (let child in active_grp.all) {
-                            if (ctx.tag_to_idx[child] != null)
-                                push(target_candidate_indices, ctx.tag_to_idx[child]);
-                        }
-                        if (active_grp.now != null && ctx.tag_to_idx[active_grp.now] != null)
-                            best_node_to_apply = ctx.tag_to_idx[active_grp.now];
-                    }
-                    if (best_node_to_apply != null)
-                        steer_apply_best_nodes(sname, best_node_to_apply, target_candidate_indices);
-                }
+                // Deliberately read-only. This branch used to call
+                // steer_apply_best_nodes() for auto sections, so a dashboard
+                // refresh could rewrite /etc/steer/spec.json, restart the vless
+                // workers and run `conntrack -F`. Applying the best node belongs
+                // to the latency probes (clash_api probe paths below), which
+                // already do it after measuring.
             }
             print(sprintf("%J\n", { proxies: proxies }));
             return 0;
@@ -1849,7 +1843,6 @@ function clash_api(action, arg1, arg2, arg3) {
             }
             if (!restarted_vless)
                 command_status("/etc/init.d/steer restart >/dev/null 2>&1");
-            command_status("conntrack -F >/dev/null 2>&1 || true");
             save_persistent_selector_choice(target_group, target_proxy);
             save_persistent_selector_choice(target_group + "-out", target_proxy);
             let result = status_capture([ "clash-set-group-proxy-result", target_group, target_proxy ], "\n204");
@@ -2048,7 +2041,6 @@ function clash_api(action, arg1, arg2, arg3) {
         push(args, payload);
         let result = status_capture([ "clash-set-group-proxy-result", arg1, arg2 ], command_output(command_from_args(args)));
         if (result.status == 0) {
-            command_status("conntrack -F >/dev/null 2>&1 || true");
             save_persistent_selector_choice(arg1, arg2);
         }
         if (result.output != "")

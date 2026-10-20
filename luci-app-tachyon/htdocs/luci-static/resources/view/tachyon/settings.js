@@ -3195,12 +3195,12 @@ function createSettingsContent(section, capabilities) {
     "config_path",
     _("Config File Path"),
     _(
-      "Select path for sing-box config file. Change this ONLY if you know what you are doing",
+      "Select path for tachyon-core config file. Change this ONLY if you know what you are doing",
     ),
   );
-  o.value("/etc/sing-box/config.json", "Flash (/etc/sing-box/config.json)");
-  o.value("/tmp/sing-box/config.json", "RAM (/tmp/sing-box/config.json)");
-  o.default = "/etc/sing-box/config.json";
+  o.value("/etc/tachyon-core/config.json", "Flash (/etc/tachyon-core/config.json)");
+  o.value("/tmp/tachyon-core/config.json", "RAM (/tmp/tachyon-core/config.json)");
+  o.default = "/etc/tachyon-core/config.json";
   o.rmempty = false;
 
   o = section.taboption(
@@ -3209,15 +3209,15 @@ function createSettingsContent(section, capabilities) {
     "cache_path",
     _("Cache File Path"),
     _(
-      "Select or enter path for sing-box cache file. Change this ONLY if you know what you are doing",
+      "Select or enter path for tachyon-core cache file. Change this ONLY if you know what you are doing",
     ),
   );
-  o.value("/tmp/sing-box/cache.db", "RAM (/tmp/sing-box/cache.db)");
   o.value(
-    "/usr/share/sing-box/cache.db",
-    "Flash (/usr/share/sing-box/cache.db)",
+    "/usr/share/tachyon-core/cache.db",
+    "Flash (/usr/share/tachyon-core/cache.db)",
   );
-  o.default = "/tmp/sing-box/cache.db";
+  o.value("/tmp/tachyon-core/cache.db", "RAM (/tmp/tachyon-core/cache.db)");
+  o.default = "/usr/share/tachyon-core/cache.db";
   o.rmempty = false;
   o.validate = function (section_id, value) {
     if (!value) {
@@ -3456,6 +3456,7 @@ function createSettingsContent(section, capabilities) {
   o.value("anthropic", "Anthropic (Claude API)");
   o.value("deepseek", "DeepSeek API");
   o.value("openrouter", "OpenRouter (openrouter.ai)");
+  o.value("gemini", _("Google Gemini API (gemini-2.5-flash / pro)"));
   o.value("ollama", _("Ollama (Local PC / Server)"));
   o.value("lmstudio", _("LM Studio (Local PC / Server)"));
   o.value("custom", _("Custom OpenAI-Compatible API"));
@@ -3467,7 +3468,7 @@ function createSettingsContent(section, capabilities) {
     "ai_doctor_model",
     _("AI Model"),
     _(
-      "Model name to use. Leave empty to use default (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / llama3.2).",
+      "Model name to use. Leave empty to use default (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / gemini-2.5-flash / llama3.2).",
     ),
   );
   o.depends("enable_ai_doctor", "1");
@@ -3492,7 +3493,7 @@ function createSettingsContent(section, capabilities) {
     "ai_doctor_api_key",
     _("AI API Key"),
     _(
-      "API Key for OpenAI (sk-...) or DeepSeek (optional for Ollama / LM Studio)",
+      "API Key for OpenAI (sk-...), Anthropic, DeepSeek, OpenRouter, or Gemini (optional for Ollama / LM Studio)",
     ),
   );
   o.depends("enable_ai_doctor", "1");
@@ -3505,7 +3506,7 @@ function createSettingsContent(section, capabilities) {
     "ai_doctor_custom_url",
     _("Custom API Endpoint URL"),
     _(
-      "Custom OpenAI-compatible API endpoint URL (e.g. http://192.168.1.100:11434/v1/chat/completions)",
+      "Custom OpenAI-compatible API endpoint URL (e.g. http://192.168.1.100:11434/v1/chat/completions or https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)",
     ),
   );
   o.depends("ai_doctor_provider", "custom");
@@ -3746,6 +3747,18 @@ function createSettingsContent(section, capabilities) {
   o.default = "10";
   o.datatype = "min(1)";
   o.depends("ai_anomaly_detection_enabled", "1");
+
+  o = section.taboption(
+    "ai",
+    form.Value,
+    "memory_limit_mb",
+    _("Memory Limit (MB)"),
+    _(
+      "Dynamic GOMEMLIMIT memory cap in MB for sing-box / tachyon-core. Set 0 for auto (50% RAM on low-memory devices or when OOM occurs).",
+    ),
+  );
+  o.default = "0";
+  o.datatype = "uinteger";
 
   // ─── End AI Watchdog Settings ──────────────────────────────────────────────
 

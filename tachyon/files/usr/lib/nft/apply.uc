@@ -9,7 +9,7 @@ let rule_config = require("config.rule");
 let domain_config = require("config.domain");
 let connections = require("config.connections");
 let routing_rulesets = require("routing.rulesets");
-let runtime_constants = require("singbox.constants");
+let runtime_constants = require("tachyon_core.constants");
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const DNS_BLOCK_PORT = int(getenv("SB_DNS_BLOCK_INBOUND_PORT") || runtime_constants.DNS_BLOCK_INBOUND_PORT);
 const DNS_BLOCK_TARGET = ":" + DNS_BLOCK_PORT;
@@ -467,12 +467,28 @@ function nft_create_inet_service_set(table, name) {
     return nft_create_set(table, name, "{ type inet_service; flags interval; auto-merge; }");
 }
 
+let NON_INTERVAL_PORT_SETS = {};
+
 function nft_create_ipv4_port_set(table, name) {
-    return nft_create_set(table, name, "{ type ipv4_addr . inet_service; flags interval; }");
+    if (nft_create_set(table, name, "{ type ipv4_addr . inet_service; flags interval; }"))
+        return true;
+    log_warn("Kernel lacks nft_set_pipapo support for interval concat set " + as_string(name) + "; falling back to non-interval set");
+    if (nft_create_set(table, name, "{ type ipv4_addr . inet_service; }")) {
+        NON_INTERVAL_PORT_SETS[as_string(table) + ":" + as_string(name)] = true;
+        return true;
+    }
+    return false;
 }
 
 function nft_create_ipv6_port_set(table, name) {
-    return nft_create_set(table, name, "{ type ipv6_addr . inet_service; flags interval; }");
+    if (nft_create_set(table, name, "{ type ipv6_addr . inet_service; flags interval; }"))
+        return true;
+    log_warn("Kernel lacks nft_set_pipapo support for interval concat set " + as_string(name) + "; falling back to non-interval set");
+    if (nft_create_set(table, name, "{ type ipv6_addr . inet_service; }")) {
+        NON_INTERVAL_PORT_SETS[as_string(table) + ":" + as_string(name)] = true;
+        return true;
+    }
+    return false;
 }
 
 function nft_create_ifname_set(table, name) {
@@ -483,7 +499,25 @@ function nft_create_ether_set(table, name) {
     return nft_create_set(table, name, "{ type ether_addr; flags interval; }");
 }
 
+function nft_filter_non_interval_elements(elements) {
+    let kept = [];
+    for (let item in split(as_string(elements), ",")) {
+        item = trim(item);
+        if (item == "")
+            continue;
+        if (index(item, "/") >= 0 || index(item, "-") >= 0)
+            continue;
+        push(kept, item);
+    }
+    return join(", ", kept);
+}
+
 function nft_add_set_elements(table, set_name, elements) {
+    if (NON_INTERVAL_PORT_SETS[as_string(table) + ":" + as_string(set_name)]) {
+        elements = nft_filter_non_interval_elements(elements);
+        if (elements == "")
+            return true;
+    }
     let stamp = clock();
     let tmp_path = sprintf("/tmp/nft_elements.%d.%d.tmp", stamp[0], stamp[1]);
     let rules_content = sprintf("add element inet %s %s { %s }\n", table, set_name, as_string(elements));
@@ -507,6 +541,7 @@ function nft_add_set_elements(table, set_name, elements) {
         let err_msg = trim(as_string(fs.readfile("/tmp/nft_err.log") || ""));
         log_warn("nft add element failed: cmd='" + cmd_str + "', code=" + res + ", err='" + err_msg + "'");
     }
+    fs.unlink("/tmp/nft_err.log");
     return res == 0;
 }
 
@@ -660,14 +695,11 @@ function section_priority_prefix(section) {
     return "tachyon_rule_" + as_string(section[".name"]);
 }
 
-// udp_ip_ports / udp_ip6_ports carry ip.port entries that must only ever match
-// UDP. The ip_ports set feeds both the TCP and the UDP matcher, so anything put
-// there is pulled into the section on TCP too. Discord's community list is where
-// that matters: it contains shared Cloudflare Anycast ranges that host plenty of
-// services other than Discord, and 443 is part of the voice port list, so a
-// Cloudflare-addressed TCP:443 connection to an unrelated site would land in the
-// Discord section and pick up its desync strategy. Keeping the shared ranges in a
-// UDP-only set confines them to what they are actually there for.
+// ip_ports / ip6_ports feed the TCP ip.port matchers, while udp_ip_ports /
+// udp_ip6_ports feed the UDP ip.port matchers. Transport-neutral section
+// ip+port entries populate both pairs; protocol-specific entries (such as
+// Discord's Cloudflare Anycast UDP voice ports vs TCP media ports, or
+// transport-scoped JSON rulesets) populate only their respective pair.
 function section_priority_sets(section) {
     let prefix = section_priority_prefix(section);
     return {
@@ -701,9 +733,9 @@ function section_has_subnet_update_sources(section) {
     return has_community ||
         length(connections.rule_sets_with_subnets(section)) > 0 ||
         length(list_option(section, "domain_ip_lists")) > 0 ||
-        helpers.file_is_usable("/tmp/sing-box/rulesets/" + sec_name + "-lists-ruleset.json", 10) ||
+        helpers.file_is_usable("/tmp/tachyon-core/rulesets/" + sec_name + "-lists-ruleset.json", 10) ||
         helpers.file_is_usable("/etc/tachyon/rulesets/" + sec_name + "-lists-ruleset.json", 10) ||
-        helpers.file_is_usable("/tmp/sing-box/rulesets/" + sec_name + "-remote-subnets-ruleset.json", 10) ||
+        helpers.file_is_usable("/tmp/tachyon-core/rulesets/" + sec_name + "-remote-subnets-ruleset.json", 10) ||
         helpers.file_is_usable("/etc/tachyon/rulesets/" + sec_name + "-remote-subnets-ruleset.json", 10);
 }
 
@@ -1727,7 +1759,8 @@ function nft_create_runtime_base(table, localv4_set, common_set, port_set, ip_po
         log_debug("Native Tailscale bypass rules added to mangle chain");
     }
 
-    if (!nft_add_rule(table, "mangle", [ "iifname", "@" + as_string(interface_set), "ip", "daddr", "@" + as_string(localv4_set), "return" ]) ||
+    if (!nft_add_rule(table, "mangle", [ "fib", "daddr", "type", "local", "return" ]) ||
+        !nft_add_rule(table, "mangle", [ "iifname", "@" + as_string(interface_set), "ip", "daddr", "@" + as_string(localv4_set), "return" ]) ||
         !nft_add_rule(table, "mangle", [ "iifname", "@" + as_string(interface_set), "ip6", "daddr", "@" + as_string(localv6_set), "return" ]) ||
         !nft_add_rule(table, "mangle", [ "jump", "parental_control" ]))
         return false;
@@ -2266,6 +2299,11 @@ function nft_add_values_to_family_sets(values, table, ipv4_set, ipv6_set, kind, 
     return ok4 && ok6;
 }
 
+function nft_add_values_to_section_port_sets(values, table, sets, ports_csv, chunk_size_text) {
+    return nft_add_values_to_family_sets(values, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports_csv, chunk_size_text) &&
+        nft_add_values_to_family_sets(values, table, sets.udp_ip_ports, sets.udp_ip6_ports, "ip-port-from-ip", ports_csv, chunk_size_text);
+}
+
 function nft_add_community_subnet_file_to_family_sets(path, table, ipv4_set, ipv6_set, service, chunk_size_text, ip_ports_v4, ip_ports_v6, udp_ports_v4, udp_ports_v6) {
     let non_cf = nft_community_subnet_lines(path, service, "exclude_cloudflare");
     let ok = true;
@@ -2297,12 +2335,16 @@ function nft_add_community_subnet_file_to_family_sets(path, table, ipv4_set, ipv
     return ok;
 }
 
-function nft_add_inline_ip_cidr_matchers(csv, ports_csv, table, common_set, ip_port_set, chunk_size_text, common6_set, ip_port6_set) {
+function nft_add_inline_ip_cidr_matchers(csv, ports_csv, table, common_set, ip_port_set, chunk_size_text, common6_set, ip_port6_set, udp_ip_port_set, udp_ip_port6_set) {
     if (as_string(csv) == "")
         return true;
 
-    if (as_string(ports_csv) != "")
-        return nft_add_csv_chunks_to_family_sets(csv, table, ip_port_set, default_arg(ip_port6_set, "tachyon_ip6_ports"), "ip-port-from-ip", ports_csv, chunk_size_text);
+    if (as_string(ports_csv) != "") {
+        let ok = nft_add_csv_chunks_to_family_sets(csv, table, ip_port_set, default_arg(ip_port6_set, "tachyon_ip6_ports"), "ip-port-from-ip", ports_csv, chunk_size_text);
+        if (ok && as_string(udp_ip_port_set) != "")
+            ok = nft_add_csv_chunks_to_family_sets(csv, table, udp_ip_port_set, default_arg(udp_ip_port6_set, ip_port6_set), "ip-port-from-ip", ports_csv, chunk_size_text);
+        return ok;
+    }
 
     return nft_add_csv_chunks_to_family_sets(csv, table, common_set, default_arg(common6_set, "tachyon_subnets6"), "ips", "", chunk_size_text);
 }
@@ -2320,7 +2362,8 @@ function nft_insert_fully_routed_ip_rules(source_ip, table, interface_set, local
             let ok = run_args([ "nft", "insert", "rule", "inet", table, "mangle", "iifname", "@" + as_string(interface_set), "ether", "saddr", mac, "meta", "l4proto", "tcp", "meta", "mark", "set", mark, "counter" ]) &&
                      run_args([ "nft", "insert", "rule", "inet", table, "mangle", "iifname", "@" + as_string(interface_set), "ether", "saddr", mac, "meta", "l4proto", "udp", "meta", "mark", "set", mark, "counter" ]) &&
                      run_args([ "nft", "insert", "rule", "inet", table, "mangle", "ether", "saddr", mac, "ip", "daddr", "@" + localv4, "return" ]) &&
-                     run_args([ "nft", "insert", "rule", "inet", table, "mangle", "ether", "saddr", mac, "ip6", "daddr", "@" + localv6, "return" ]);
+                     run_args([ "nft", "insert", "rule", "inet", table, "mangle", "ether", "saddr", mac, "ip6", "daddr", "@" + localv6, "return" ]) &&
+                     run_args([ "nft", "insert", "rule", "inet", table, "mangle", "ether", "saddr", mac, "fib", "daddr", "type", "local", "return" ]);
             for (let res_ip in core_ip.resolve_mac_to_ips(mac))
                 nft_insert_fully_routed_ip_rules(res_ip, table, interface_set, localv4_set, localv6_set, mark);
             return ok;
@@ -2331,7 +2374,8 @@ function nft_insert_fully_routed_ip_rules(source_ip, table, interface_set, local
     return (
         run_args([ "nft", "insert", "rule", "inet", table, "mangle", "iifname", "@" + as_string(interface_set), ip_key, "saddr", source_ip, "meta", "l4proto", "tcp", "meta", "mark", "set", mark, "counter" ]) &&
         run_args([ "nft", "insert", "rule", "inet", table, "mangle", "iifname", "@" + as_string(interface_set), ip_key, "saddr", source_ip, "meta", "l4proto", "udp", "meta", "mark", "set", mark, "counter" ]) &&
-        run_args([ "nft", "insert", "rule", "inet", table, "mangle", ip_key, "saddr", source_ip, ip_key, "daddr", "@" + as_string(local_set), "return" ])
+        run_args([ "nft", "insert", "rule", "inet", table, "mangle", ip_key, "saddr", source_ip, ip_key, "daddr", "@" + as_string(local_set), "return" ]) &&
+        run_args([ "nft", "insert", "rule", "inet", table, "mangle", ip_key, "saddr", source_ip, "fib", "daddr", "type", "local", "return" ])
     );
 }
 
@@ -2960,6 +3004,16 @@ function nft_runtime_signature_from_settings_and_sections(settings, sections, sc
     body = signature_add_value(body, "settings.source_network_interfaces", option(settings, "source_network_interfaces", "br-lan"));
     body = signature_add_value(body, "settings.exclude_ntp", bool_option(settings, "exclude_ntp", false) ? "1" : "0");
     body = signature_add_value(body, "settings.block_doh", bool_option(settings, "block_doh", false) ? "1" : "0");
+    let quic_mode = disable_quic_mode(option(settings, "disable_quic", "0"));
+    if (quic_mode != "off")
+        body = signature_add_value(body, "settings.disable_quic", quic_mode);
+    if (bool_option(settings, "webrtc_leak_protect", false))
+        body = signature_add_value(body, "settings.webrtc_leak_protect", "1");
+    if (option(settings, "qos_priority_engine", "1") == "0")
+        body = signature_add_value(body, "settings.qos_priority_engine", "0");
+    let proxy_mode = lc(trim(as_string(option(settings, "proxy_mode", "tproxy"))));
+    if (proxy_mode != "" && proxy_mode != "tproxy")
+        body = signature_add_value(body, "settings.proxy_mode", proxy_mode);
     if (bool_option(settings, "smart_detect", false) && option(settings, "smart_detect_mode", "default") == "plus")
         body = signature_add_value(body, "settings.smart_detect_plus", "1");
     body = signature_add_value(body, "settings.game_console_optimizer", option(settings, "game_console_optimizer", "0"));
@@ -3149,7 +3203,7 @@ function nft_load_community_subnets(section, table, common_set, common6_set, ip_
         if (!rule_config.community_service_has_subnet_list(service)) continue;
 
         let candidates = [
-            "/tmp/sing-box/rulesets/community-subnets-" + service + ".lst",
+            "/tmp/tachyon-core/rulesets/community-subnets-" + service + ".lst",
             "/etc/tachyon/rulesets/community-subnets-" + service + ".lst"
         ];
 
@@ -3221,7 +3275,7 @@ function nft_populate_runtime_set_for_section(section, deferred_sections, table,
         return true;
 
     if (section_needs_priority_sets(section)) {
-        if (!nft_add_inline_ip_cidr_matchers(ip_values, ports, table, sets.subnets, sets.ip_ports, 5000, sets.subnets6, sets.ip6_ports))
+        if (!nft_add_inline_ip_cidr_matchers(ip_values, ports, table, sets.subnets, sets.ip_ports, 5000, sets.subnets6, sets.ip6_ports, sets.udp_ip_ports, sets.udp_ip6_ports))
             return false;
 
         if (ports != "" && !section_has_destination_matchers(section) &&
@@ -3247,17 +3301,17 @@ function nft_populate_runtime_set_for_section(section, deferred_sections, table,
             }
             if (length(subnets) > 0) {
                 if (ports != "")
-                    nft_add_values_to_family_sets(subnets, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports, "5000");
+                    nft_add_values_to_section_port_sets(subnets, table, sets, ports, "5000");
                 else
                     nft_add_values_to_family_sets(subnets, table, sets.subnets, sets.subnets6, "ips", "", "5000");
             }
         }
         let list_json_candidates = [
-            "/tmp/sing-box/rulesets/" + sec_name + "-lists-ruleset.json",
+            "/tmp/tachyon-core/rulesets/" + sec_name + "-lists-ruleset.json",
             "/etc/tachyon/rulesets/" + sec_name + "-lists-ruleset.json",
-            "/tmp/sing-box/rulesets/" + sec_name + "-remote-subnets-ruleset.json",
+            "/tmp/tachyon-core/rulesets/" + sec_name + "-remote-subnets-ruleset.json",
             "/etc/tachyon/rulesets/" + sec_name + "-remote-subnets-ruleset.json",
-            "/tmp/sing-box/rulesets/lists-" + sec_name + ".json",
+            "/tmp/tachyon-core/rulesets/lists-" + sec_name + ".json",
             "/etc/tachyon/rulesets/lists-" + sec_name + ".json"
         ];
         let processed_list_paths = {};
@@ -3283,7 +3337,7 @@ function nft_populate_runtime_set_for_section(section, deferred_sections, table,
                     }
                     if (length(jsubnets) > 0) {
                         if (ports != "")
-                            nft_add_values_to_family_sets(jsubnets, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports, "5000");
+                            nft_add_values_to_section_port_sets(jsubnets, table, sets, ports, "5000");
                         else
                             nft_add_values_to_family_sets(jsubnets, table, sets.subnets, sets.subnets6, "ips", "", "5000");
                     }
@@ -3296,9 +3350,9 @@ function nft_populate_runtime_set_for_section(section, deferred_sections, table,
             ref = as_string(ref);
             if (ref == "") continue;
             let check_paths = (substr(ref, 0, 1) == "/") ? [ ref ] : [
-                "/tmp/sing-box/rulesets/community-subnets-" + ref + ".lst",
+                "/tmp/tachyon-core/rulesets/community-subnets-" + ref + ".lst",
                 "/etc/tachyon/rulesets/community-subnets-" + ref + ".lst",
-                "/tmp/sing-box/rulesets/custom-" + sec_name + ".json",
+                "/tmp/tachyon-core/rulesets/custom-" + sec_name + ".json",
                 "/etc/tachyon/rulesets/custom-" + sec_name + ".json"
             ];
             for (let jpath in check_paths) {
@@ -3319,7 +3373,7 @@ function nft_populate_runtime_set_for_section(section, deferred_sections, table,
                             }
                             if (length(jsubnets) > 0) {
                                 if (ports != "")
-                                    nft_add_values_to_family_sets(jsubnets, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports, "5000");
+                                    nft_add_values_to_section_port_sets(jsubnets, table, sets, ports, "5000");
                                 else
                                     nft_add_values_to_family_sets(jsubnets, table, sets.subnets, sets.subnets6, "ips", "", "5000");
                             }
@@ -3334,7 +3388,7 @@ function nft_populate_runtime_set_for_section(section, deferred_sections, table,
                             }
                             if (length(lsubnets) > 0) {
                                 if (ports != "")
-                                    nft_add_values_to_family_sets(lsubnets, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports, "5000");
+                                    nft_add_values_to_section_port_sets(lsubnets, table, sets, ports, "5000");
                                 else
                                     nft_add_values_to_family_sets(lsubnets, table, sets.subnets, sets.subnets6, "ips", "", "5000");
                             }
@@ -3367,8 +3421,10 @@ function nft_add_subnet_file_for_section(section, filepath, table, common_set, i
     if (!nft_create_priority_sets(table, sets))
         return false;
 
-    if (ports != "")
-        return nft_add_file_chunks_to_family_sets(filepath, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports, chunk_size_text);
+    if (ports != "") {
+        return nft_add_file_chunks_to_family_sets(filepath, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports, chunk_size_text) &&
+            nft_add_file_chunks_to_family_sets(filepath, table, sets.udp_ip_ports, sets.udp_ip6_ports, "ip-port-from-ip", ports, chunk_size_text);
+    }
 
     return nft_add_file_chunks_to_family_sets(filepath, table, sets.subnets, sets.subnets6, "ips", "", chunk_size_text);
 }
@@ -3451,6 +3507,10 @@ function nft_add_community_subnet_file_for_section(section, service, filepath, t
 
     let ports = section_rule_ports_csv(section);
     let sets = section_priority_sets(section);
+
+    if (section_needs_priority_sets(section) && !nft_create_priority_sets(table, sets))
+        return false;
+
     let common_v4 = section_needs_priority_sets(section) ? sets.subnets : common_set;
     let common_v6 = section_needs_priority_sets(section) ? sets.subnets6 : default_arg(common6_set, "tachyon_subnets6");
     let ip_port_v4 = section_needs_priority_sets(section) ? sets.ip_ports : ip_port_set;
@@ -3458,7 +3518,7 @@ function nft_add_community_subnet_file_for_section(section, service, filepath, t
 
     if (section_needs_priority_sets(section) && ports != "" && !section_has_destination_matchers(section)) {
         let lines = nft_community_subnet_lines(filepath, service, "all");
-        return nft_add_values_to_family_sets(lines, table, sets.ip_ports, sets.ip6_ports, "ip-port-from-ip", ports, chunk_size_text);
+        return nft_add_values_to_section_port_sets(lines, table, sets, ports, chunk_size_text);
     }
 
     let udp_port_v4 = section_needs_priority_sets(section) ? sets.udp_ip_ports : "";

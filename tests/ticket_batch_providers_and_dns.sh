@@ -29,8 +29,8 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 TAILSCALE_RT="$TACHYON_LIB/providers/tailscale/runtime.uc"
 FPTN_RT="$TACHYON_LIB/providers/fptn/runtime.uc"
-ROUTES="$TACHYON_LIB/singbox/generator_routes.uc"
-GEN="$TACHYON_LIB/singbox/generator.uc"
+ROUTES="$TACHYON_LIB/tachyon_core/generator_routes.uc"
+GEN="$TACHYON_LIB/tachyon_core/generator.uc"
 STATE="$TACHYON_LIB/service/state.uc"
 ROUTING_DIAG="$TACHYON_LIB/diagnostics/routing.uc"
 STATUS_DIAG="$TACHYON_LIB/diagnostics/status.uc"
@@ -61,7 +61,7 @@ grep -q 'function add_fakeip_query_type' "$ROUTES" ||
   fail "generator_routes.uc must keep add_fakeip_query_type(): without query_type every non-A/AAAA query for a fakeip domain is sent to a server that cannot answer it"
 ok
 
-fakeip_sites="$(grep -c 'add_fakeip_query_type(dns_rule, section_dns_server(section))' "$ROUTES")"
+fakeip_sites="$(grep -c 'add_fakeip_query_type(dns_rule,' "$ROUTES")"
 [ "$fakeip_sites" -ge 3 ] ||
   fail "all three section DNS rule sites must call add_fakeip_query_type, found $fakeip_sites"
 ok

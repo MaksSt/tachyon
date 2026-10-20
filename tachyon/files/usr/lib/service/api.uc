@@ -10,13 +10,14 @@ const WATCHDOG_PID_FILE = "/var/run/tachyon_watchdog.pid";
 let as_string = common.as_string;
 let command_capture = common.command_capture;
 let command_success_from_args = common.command_success_from_args;
+let core_binary_running = common.core_binary_running;
 let command_from_args = common.command_from_args;
 let command_output = common.command_output;
 
 // Helper to get clash url
 function get_clash_url(endpoint) {
     let host = "127.0.0.1:9090"; // default fallback
-    let config_data = fs.readfile("/etc/sing-box/config.json");
+    let config_data = fs.readfile("/etc/tachyon-core/config.json");
     if (config_data) {
         try {
             let sb_cfg = json(config_data);
@@ -41,7 +42,7 @@ function get_clash_url(endpoint) {
 }
 
 function get_clash_secret() {
-    let config_data = fs.readfile("/etc/sing-box/config.json");
+    let config_data = fs.readfile("/etc/tachyon-core/config.json");
     if (config_data) {
         try {
             let sb_cfg = json(config_data);
@@ -127,10 +128,10 @@ function get_system_status() {
     status_obj.uptime = sprintf("%d дн. %02d:%02d", d, h, m);
 
     // sing-box status
-    let sb_running = command_success_from_args(["pidof", "sing-box"]);
+    let sb_running = core_binary_running();
     status_obj.singbox_running = sb_running;
     status_obj.singbox = sb_running ? "🟢 running" : "🔴 stopped";
-    let sb_variant = trim(as_string(fs.readfile("/etc/tachyon/sing-box-variant") || ""));
+    let sb_variant = trim(as_string(fs.readfile("/etc/tachyon/tachyon-core-variant") || ""));
     if (sb_variant != "")
         status_obj.singbox_variant = sb_variant;
 
