@@ -206,10 +206,12 @@ function target(section, outbound_tag_name) {
     let action = option(section, "action", "");
     if (connections.is_connections_action(action) ||
         action == "awg" || action == "warp" ||
-        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
-        action == "masque" || action == "openvpn" ||
+        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || 
+        action == "masque" || action == "openvpn" || action == "openconnect" ||
+        action == "tewfai" || action == "trusttunnel" || action == "mtproto" || action == "shadowtls" ||
+        action == "desync" || action == "chain" || action == "tailscale" ||
         action == "byedpi" || action == "zapret" || action == "zapret2" ||
-        action == "wdtt" || action == "olcrtc" || action == "fptn")
+        action == "wdtt" || action == "olcrtc" || action == "fptn" || action == "group")
         return { action: "route", outbound: outbound_tag_name };
     if (action == "bypass")
         return { action: "route", outbound: runtime_constants.BYPASS_OUTBOUND_TAG };
@@ -228,7 +230,7 @@ function has_resolve_matchers(rule) {
 function resolve_rule_for_section(section, route_rule) {
     let action = option(section, "action", "");
     let should_resolve = action == "byedpi" || action == "zapret" || action == "zapret2" ||
-        action == "wdtt" || action == "olcrtc" ||
+        action == "wdtt" || action == "olcrtc" || action == "desync" ||
         (connections.is_connections_action(action) &&
             bool_option(section, "resolve_real_ip_for_routing", false));
 
@@ -247,8 +249,8 @@ function resolve_rule_for_section(section, route_rule) {
             resolve_rule[key] = route_rule[key];
     }
     resolve_rule.action = "resolve";
-    resolve_rule.server = (action == "zapret" || action == "zapret2")
-        ? runtime_constants.BOOTSTRAP_DNS_SERVER_TAG
+    resolve_rule.server = connections.routed_dns_enabled(section)
+        ? runtime_constants.tag(section[".name"], "routed-dns-server")
         : runtime_constants.DNS_SERVER_TAG;
     if (action == "zapret" || action == "zapret2") {
         let opt_key = action == "zapret2" ? "nfqws2_opt" : "nfqws_opt";

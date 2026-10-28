@@ -202,7 +202,17 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
     if (protocol != "")
         state.outboundMetadata.protocols[tag_name] = protocol;
 
-    let transport = lc(as_string(object_or_empty(outbound.transport).type || ""));
+    let transport = "";
+    if (type(outbound.transport) == "object")
+        transport = lc(as_string(outbound.transport.type || ""));
+    else if (type(outbound.transport) == "array" && length(outbound.transport) > 0)
+        transport = lc(as_string(outbound.transport[0] || ""));
+    else if (type(outbound.transport) == "string")
+        transport = lc(as_string(outbound.transport));
+    if (transport == "" && protocol == "shadowsocks" && index(lc(as_string(outbound.plugin_opts || "")), "websocket") >= 0)
+        transport = "ws";
+    if (transport == "" && (protocol == "naive" || protocol == "trusttunnel") && outbound.quic === true)
+        transport = "quic";
     if (transport == "h2")
         transport = "http";
     else if (transport == "raw")
@@ -210,6 +220,7 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
     else if (transport == "" && protocol != "" &&
              protocol != "direct" && protocol != "wireguard" && protocol != "amneziawg" &&
              protocol != "hysteria" && protocol != "hysteria2" && protocol != "tuic" &&
+             protocol != "masque" && protocol != "desync" && protocol != "chain" &&
              protocol != "dns" && protocol != "block" &&
              protocol != "selector" && protocol != "urltest")
         transport = "tcp";
@@ -241,6 +252,8 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
     let badges = [];
     if (protocol == "urltest")
         push(badges, "авто-группы");
+    if (security == "reality" || security == "tls")
+        push(badges, security);
     let flow = as_string(outbound.flow || "");
     if (flow != "")
         push(badges, flow);
@@ -251,6 +264,16 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
             push(badges, "xmux");
     }
     if (tls != null && tls.enabled !== false) {
+        let sni = as_string(tls.server_name || "");
+        if (sni != "")
+            push(badges, "sni:" + sni);
+        let utls_obj = type(tls.utls) == "object" ? tls.utls : null;
+        if (utls_obj != null && utls_obj.enabled !== false && as_string(utls_obj.fingerprint || "") != "")
+            push(badges, "utls:" + as_string(utls_obj.fingerprint));
+        if (type(tls.alpn) == "array" && length(tls.alpn) > 0)
+            push(badges, "alpn:" + join(",", tls.alpn));
+        else if (type(tls.alpn) == "string" && tls.alpn != "")
+            push(badges, "alpn:" + tls.alpn);
         let csha = tls.certificate_sha256;
         if ((type(csha) == "array" && length(csha) > 0) || (type(csha) == "string" && csha != ""))
             push(badges, "cert_sha256");
@@ -266,13 +289,20 @@ function remember_outbound_metadata(state, tag_name, display_name, outbound, pre
         state.outboundMetadata.details[tag_name] = b_str;
 }
 
-function remember_source_outbound(state, tag_name, display_name, outbound, source_link, prefix) {
+function remember_source_outbound(state, tag_name, display_name, outbound, source_link, prefix, source_key) {
     if (type(state) != "object")
         return;
     let is_cand = index(tag_name, "cand-") == 0 || index(tag_name, " cand-") >= 0;
     if (is_cand)
         return;
     remember_outbound_metadata(state, tag_name, display_name, outbound, prefix);
+    if (index(lc(as_string(source_link || "")), "shadowtls://") == 0)
+        state.outboundMetadata.protocols[tag_name] = "shadowtls";
+    if (source_key != null && as_string(source_key) != "") {
+        if (!state.outboundMetadata.sources)
+            state.outboundMetadata.sources = {};
+        state.outboundMetadata.sources[tag_name] = as_string(source_key);
+    }
     let outbound_type = as_string(outbound.type || "");
     if (outbound_type != "selector" && outbound_type != "urltest") {
         if (subscription_share_link.is_copyable_link(source_link))
@@ -386,7 +416,8 @@ function new_section_state(section_name) {
             securities: {},
             prefixes: {},
             ports: {},
-            details: {}
+            details: {},
+            sources: {}
         },
         servers: {},
         urltestCandidateTags: [],

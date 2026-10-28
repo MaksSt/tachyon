@@ -116,23 +116,16 @@ function normalize_group(group, tag_name) {
 
 function section_cache_files() {
     let result = [];
-    for (let path in split(command_output_from_args([
-        "find",
-        SECTION_CACHE_DIR,
-        "-mindepth",
-        "1",
-        "-maxdepth",
-        "1",
-        "-type",
-        "f",
-        "-name",
-        "*.json"
-    ]), "\n")) {
-        path = as_string(path);
-        if (path != "")
-            push(result, path);
+    let dir = fs.opendir(SECTION_CACHE_DIR);
+    if (!dir)
+        return result;
+    let entry;
+    while ((entry = dir.read()) != null) {
+        if (substr(entry, -5) == ".json")
+            push(result, SECTION_CACHE_DIR + "/" + entry);
     }
-    return result;
+    dir.close();
+    return sort(result);
 }
 
 function priority_groups_from_cache() {
@@ -148,19 +141,109 @@ function priority_groups_from_cache() {
     return result;
 }
 
+let cached_clash_cfg_mtime = -1;
+let cached_clash_base_url = "http://127.0.0.1:9090";
+let cached_clash_secret = "";
+
+function priority_clash_info() {
+    let cfg_path = "/etc/tachyon-core/config.json";
+    let st = fs.stat(cfg_path);
+    let mtime = st ? int(st.mtime || 0) : 0;
+    if (mtime != cached_clash_cfg_mtime) {
+        cached_clash_cfg_mtime = mtime;
+        let host = "127.0.0.1:9090";
+        let secret = "";
+        let data = st ? fs.readfile(cfg_path) : null;
+        if (data) {
+            try {
+                let sb_cfg = json(data);
+                let ext = sb_cfg?.experimental?.clash_api?.external_controller;
+                if (ext) {
+                    let parts = split(as_string(ext), ":");
+                    let ip = length(parts) > 1 ? parts[0] : "";
+                    let port = length(parts) > 1 ? parts[length(parts) - 1] : "9090";
+                    host = (ip == "0.0.0.0" || ip == "") ? ("127.0.0.1:" + port) : as_string(ext);
+                }
+                if (sb_cfg?.experimental?.clash_api?.secret)
+                    secret = as_string(sb_cfg.experimental.clash_api.secret);
+            } catch (e) {}
+        }
+        cached_clash_base_url = "http://" + host;
+        cached_clash_secret = secret;
+    }
+    return { base_url: cached_clash_base_url, secret: cached_clash_secret };
+}
+
+function urlencode_segment(value) {
+    value = as_string(value);
+    let out = [];
+    let len = length(value);
+    for (let i = 0; i < len; i++) {
+        let ch = substr(value, i, 1);
+        if (match(ch, /^[A-Za-z0-9_.~-]$/))
+            push(out, ch);
+        else
+            push(out, sprintf("%%%02X", ord(value, i)));
+    }
+    return join("", out);
+}
+
 function module_capture(args) {
-    let output_path = trim(command_output_from_args([ "mktemp" ]));
-    if (output_path == "")
-        return { status: 1, output: "" };
+    if (getenv("TACHYON_DIAGNOSTICS_UC") == null && type(args) == "array" && length(args) > 0) {
+        let action = as_string(args[0] || "");
+        let info = priority_clash_info();
+        if (action == "get_proxy_latency") {
+            let tag_name = as_string(args[1] || "");
+            let timeout_ms = as_string(args[2] || "2000");
+            let health_url = as_string(args[3] || "https://www.gstatic.com/generate_204");
+            let max_time = int((int(timeout_ms, 10) + 1999) / 1000);
+            if (max_time < 2) max_time = 2;
+            let endpoint = index(tag_name, "-urltest") >= 0
+                ? (info.base_url + "/group/" + urlencode_segment(tag_name) + "/delay")
+                : (info.base_url + "/proxies/" + urlencode_segment(tag_name) + "/delay");
+            let curl_args = [ "curl", "-G", "-s", "-m", as_string(max_time), endpoint ];
+            if (info.secret != "") {
+                push(curl_args, "-H");
+                push(curl_args, "Authorization: Bearer " + info.secret);
+            }
+            push(curl_args, "--data-urlencode");
+            push(curl_args, "url=" + health_url);
+            push(curl_args, "--data-urlencode");
+            push(curl_args, "timeout=" + timeout_ms);
+            return common.command_capture(command_from_args(curl_args));
+        }
+        if (action == "set_group_proxy") {
+            let group_tag = as_string(args[1] || "");
+            let proxy_tag = as_string(args[2] || "");
+            let curl_args = [
+                "curl", "-X", "PUT", "-s", "-m", "5", "-w", "\n%{http_code}",
+                info.base_url + "/proxies/" + urlencode_segment(group_tag),
+                "-H", "Content-Type: application/json"
+            ];
+            if (info.secret != "") {
+                push(curl_args, "-H");
+                push(curl_args, "Authorization: Bearer " + info.secret);
+            }
+            push(curl_args, "--data-raw");
+            push(curl_args, sprintf("%J", { name: proxy_tag }));
+            let res = common.command_capture(command_from_args(curl_args));
+            if (res.status == 0 && match(res.output, /(^|\n)(200|204)\s*$/) != null) {
+                let state_path = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
+                let sel_state = read_json_file(state_path);
+                if (type(sel_state) != "object") sel_state = {};
+                sel_state[group_tag] = proxy_tag;
+                common.write_json_file(state_path, sel_state, 2);
+                return { status: 0, output: res.output };
+            }
+            return { status: 1, output: res.output };
+        }
+    }
 
     let command = command_from_args([ "ucode", "-L", LIB_DIR, DIAGNOSTICS_UC, "clash-api" ]);
     for (let arg in args)
         command += " " + shell_quote(arg);
 
-    let status = command_status(command + " >" + shell_quote(output_path) + " 2>&1");
-    let output = as_string(fs.readfile(output_path) || "");
-    remove_file(output_path);
-    return { status, output };
+    return common.command_capture(command);
 }
 
 function parse_delay_output(output) {
@@ -176,8 +259,18 @@ function parse_delay_output(output) {
         return null;
 
     let delay = value.delay;
-    if (delay == null || as_string(delay) == "")
-        return null;
+    if (delay == null || as_string(delay) == "") {
+        let min_d = null;
+        for (let k, v in value) {
+            if (k == "message" || k == "error")
+                continue;
+            if (type(v) == "int" && v > 0) {
+                if (min_d == null || v < min_d)
+                    min_d = v;
+            }
+        }
+        return min_d;
+    }
 
     delay = int(delay, 10);
     return delay >= 0 ? delay : null;
@@ -212,11 +305,128 @@ function fixture_probe(latencies, tag_name) {
     return { alive: true, delay: int(value, 10) };
 }
 
+// The delays the core already measured. The clash API keeps a history per
+// outbound, so one GET gives the delay of every node in the group without
+// probing each one - which is what made "pick the fastest" expensive before.
+//
+// Returns null when the answer is not available, and the caller then falls
+// back to probing the nodes one by one.
+let cached_delays_mtime = -1;
+let cached_delays = null;
+// A fixture can hand the snapshot in directly, so the ordering logic is
+// testable without a running core.
+let fixture_delays_path = "";
+
+// A fixture can hand the snapshot in directly, so the ordering logic is
+// testable without a running core.
+function fixture_delays_override() {
+    if (fixture_delays_path == "")
+        return null;
+    let data = read_json_file(fixture_delays_path);
+    return type(data) == "object" ? data : null;
+}
+
+function clash_delays_snapshot() {
+    let override = fixture_delays_override();
+    if (override != null)
+        return override;
+
+    let cfg_path = "/etc/tachyon-core/config.json";
+    let st = fs.stat(cfg_path);
+    let mtime = st ? int(st.mtime || 0) : 0;
+    if (cached_delays_mtime == mtime && cached_delays != null)
+        return cached_delays;
+
+    let info = priority_clash_info();
+    let curl_args = [ "curl", "-s", "-m", "5", info.base_url + "/proxies" ];
+    if (info.secret != "") {
+        push(curl_args, "-H");
+        push(curl_args, "Authorization: Bearer " + info.secret);
+    }
+    let res = common.command_capture(command_from_args(curl_args));
+    if (res.status != 0) {
+        cached_delays_mtime = mtime;
+        cached_delays = null;
+        return null;
+    }
+
+    let body = null;
+    try {
+        body = json(res.output);
+    }
+    catch (e) {
+        body = null;
+    }
+    let proxies = type(body) == "object" ? object_or_empty(body.proxies) : {};
+    let delays = {};
+    for (let name in proxies) {
+        let history = object_or_empty(proxies[name]).history;
+        if (type(history) != "array" || length(history) == 0)
+            continue;
+        let last = object_or_empty(history[length(history) - 1]);
+        let delay = int(last.delay, 10);
+        if (delay != null && delay >= 0)
+            delays[as_string(name)] = delay;
+    }
+
+    cached_delays_mtime = mtime;
+    cached_delays = delays;
+    return delays;
+}
+
+// The measured delay of one node, or null when the core has no history for
+// it. A node the core never measured is not a candidate: "the fastest" has to
+// be the fastest of the ones that answered.
+function measured_delay(tag_name) {
+    let delays = clash_delays_snapshot();
+    if (delays == null)
+        return null;
+    let value = delays[as_string(tag_name)];
+    if (value == null)
+        return null;
+    return int(value, 10);
+}
+
 function choose_from_level(group, level_index, probe, skip_tag) {
     let level = object_or_empty(array_or_empty(group.levels)[level_index]);
     let best = null;
+    let candidates = array_or_empty(level.outbounds);
 
-    for (let tag_name in array_or_empty(level.outbounds)) {
+    // The order the nodes are tried in. With pick_fastest on, the delays the
+    // core already measured decide it - one GET on the clash API gives the
+    // delay of every node in the group, instead of one probe per node.
+    //
+    // A measured delay says nothing about liveness - the node may have died
+    // since the last measurement - so the order only decides who is tried
+    // first, and the first node that actually answers wins.
+    let measured = group.pick_fastest ? clash_delays_snapshot() : null;
+    if (measured != null) {
+        let ordered = [];
+        let unordered = [];
+        for (let tag_name in candidates) {
+            if (as_string(skip_tag) != "" && tag_name == skip_tag)
+                continue;
+            let delay = measured[as_string(tag_name)];
+            // A negative delay is a node the core could not reach. It still
+            // has a place in the order - last - because it may answer now.
+            if (delay == null || delay < 0) {
+                push(unordered, tag_name);
+                continue;
+            }
+            push(ordered, { tag: tag_name, delay: delay });
+        }
+        sort(ordered, function(a, b) { return a.delay - b.delay; });
+        let result = [];
+        for (let entry in ordered)
+            push(result, entry.tag);
+        for (let tag_name in unordered)
+            push(result, tag_name);
+        candidates = result;
+    }
+
+    for (let tag_name in candidates) {
+        // The node that just failed must not be picked again - that is the
+        // whole point of the replacement search.
         if (as_string(skip_tag) != "" && tag_name == skip_tag)
             continue;
         let result = probe(tag_name, group);
@@ -474,6 +684,9 @@ function start_runtime() {
 function select_fixture(group_path, latency_path, start_index, end_index, skip_tag) {
     let group = normalize_group(read_json_file(group_path), "fixture");
     let latencies = object_or_empty(read_json_file(latency_path));
+    // The same file feeds the measured-delay snapshot, so the ordering logic
+    // runs exactly as it does on a live core.
+    fixture_delays_path = as_string(latency_path);
     let selected = choose_from_level_range(group, start_index, end_index, function(tag_name, _group) {
         return fixture_probe(latencies, tag_name);
     }, skip_tag);

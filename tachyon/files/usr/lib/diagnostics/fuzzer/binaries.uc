@@ -69,6 +69,14 @@ function get_byedpi_bin() {
     ]);
 }
 
+function get_desync_bin() {
+    return resolve_binary([
+        getenv("TACHYON_CORE_BIN"),
+        "/usr/bin/tachyon-core",
+        "/usr/bin/sing-box"
+    ]);
+}
+
 function get_zapret2_lua_flags(args_str) {
     if (index(args_str, "--lua-init") >= 0)
         return "";
@@ -130,39 +138,28 @@ function get_timeout_prefix(sec) {
     return has_timeout() ? sprintf("timeout %d ", sec) : "";
 }
 
-function wrap_cmd_timeout(cmd, sec, pid_file) {
-    sec = sec || 8;
-    let t = has_timeout();
-    if (pid_file && pid_file != "") {
-        if (t)
-            return sprintf("( echo $$ > %s; timeout -s KILL %d %s )", shell_quote(pid_file), sec, cmd);
-        return sprintf("( echo $$ > %s; %s )", shell_quote(pid_file), cmd);
-    }
-    if (t)
-        return sprintf("timeout -s KILL %d %s", sec, cmd);
-    return cmd;
-}
-
 // Shell watchdog: runs cmd bounded by sec seconds even when the `timeout`
-// binary is unavailable. Blocking forever on system()/pipe.read() wedges the
-// whole fuzzer worker (deadline checks in ucode never get to run), so every
-// blocking call must carry a hard wall-clock bound.
-const _WATCHDOG_SUBSHELL = "( %s & _bp=$!; ( sleep %d; kill -9 $_bp 2>/dev/null ) & _bw=$!; wait $_bp 2>/dev/null; kill $_bw 2>/dev/null; wait $_bw 2>/dev/null )";
+// binary is unavailable or lacks -s/-k flags (BusyBox OpenWrt). Blocking
+// forever on system()/pipe.read() wedges the whole fuzzer worker (deadline
+// checks in ucode never get to run), so every blocking call must carry a hard
+// wall-clock bound around the entire subshell.
+const _WATCHDOG_SUBSHELL = "( ( %s ) & _bp=$!; ( trap 'kill -9 $_bs 2>/dev/null; exit 0' TERM INT; sleep %d & _bs=$!; wait $_bs 2>/dev/null; kill -9 $_bp 2>/dev/null ) </dev/null >/dev/null 2>/dev/null & _bw=$!; wait $_bp 2>/dev/null; _rc=$?; kill -TERM $_bw 2>/dev/null; kill -9 $_bw 2>/dev/null; wait $_bw 2>/dev/null; exit $_rc )";
 
 function run_bounded(cmd, sec) {
     sec = sec || 8;
-    if (has_timeout())
-        return system(sprintf("timeout -s KILL %d %s", sec, cmd));
     return system(sprintf(_WATCHDOG_SUBSHELL, cmd, sec));
 }
 
 function wrap_probe_cmd(cmd, sec, pid_file) {
     sec = sec || 8;
-    if (has_timeout())
-        return wrap_cmd_timeout(cmd, sec, pid_file);
+    let bounded = sprintf(_WATCHDOG_SUBSHELL, cmd, sec);
     if (pid_file && pid_file != "")
-        return sprintf("( echo $$ > %s; %s )", shell_quote(pid_file), sprintf(_WATCHDOG_SUBSHELL, cmd, sec));
-    return sprintf(_WATCHDOG_SUBSHELL, cmd, sec);
+        return sprintf("( echo $$ > %s; %s )", shell_quote(pid_file), bounded);
+    return bounded;
+}
+
+function wrap_cmd_timeout(cmd, sec, pid_file) {
+    return wrap_probe_cmd(cmd, sec, pid_file);
 }
 
 function is_valid_public_ip(ip) {
@@ -259,7 +256,7 @@ function get_resolved_host_flags(url) {
     }
 
     for (let srv in dns_candidates) {
-        let np = fs.popen(sprintf("nslookup %s %s 2>/dev/null", safe_host, srv), "r");
+        let np = fs.popen(wrap_probe_cmd(sprintf("nslookup %s %s 2>/dev/null", safe_host, srv), 3), "r");
         let nout = np ? np.read("all") : "";
         if (np) np.close();
         if (nout && nout != "") {
@@ -664,7 +661,7 @@ const TARGET_SUITES = {
     youtube_suite: {
         name: "YouTube Full Suite (Stream + CDN + Web)",
         urls: [
-            { name: "GoogleVideo Stream CDN", url: "https://redirector.googlevideo.com/videoplayback", weight: 60, required: true, probe_kind: "streaming" },
+            { name: "GoogleVideo Stream CDN", url: "https://rr1.googlevideo.com/videoplayback", weight: 60, required: true, probe_kind: "streaming" },
             { name: "Static Assets (i.ytimg)", url: "https://i.ytimg.com/generate_204", weight: 15, required: false, probe_kind: "tls_http" },
             { name: "Web Interface", url: "https://www.youtube.com/", weight: 25, required: true, probe_kind: "tls_http" }
         ]
@@ -745,8 +742,14 @@ const TARGET_URLS = {
 };
 
 function resolve_target_url(target_key, custom_url) {
-    if (custom_url && custom_url != "")
-        return custom_url;
+    if (custom_url && custom_url != "") {
+        let urls = split(custom_url, /[,\n]+/);
+        for (let u in urls) {
+            let trimmed = trim(as_string(u));
+            if (trimmed != "")
+                return trimmed;
+        }
+    }
     return TARGET_URLS[target_key] || TARGET_URLS.youtube;
 }
 
@@ -794,6 +797,7 @@ function module_exports() {
         get_zapret2_bin,
         get_zapret_bin,
         get_byedpi_bin,
+        get_desync_bin,
         get_zapret2_lua_flags,
         has_timeout,
         get_timeout_prefix,

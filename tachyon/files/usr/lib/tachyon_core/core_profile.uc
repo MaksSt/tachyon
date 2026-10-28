@@ -33,7 +33,10 @@ const CORE_PROFILES = {
         schema_1_14: FROM_VERSION_PREFIX + "1.14",
         schema_1_15: FROM_VERSION_PREFIX + "1.15",
         xhttp: "build-tag",
-        tailscale: "build-tag"
+        tailscale: "build-tag",
+        // Native desync is a tachyon-core feature. No sing-box build has it,
+        // so the answer is a flat "no" for every sing-box profile.
+        desync: "no"
     },
     "lx": {
         marker: "lx",
@@ -45,7 +48,8 @@ const CORE_PROFILES = {
         schema_1_14: FROM_VERSION_PREFIX + "1.14",
         schema_1_15: "no",
         xhttp: "yes",
-        tailscale: "yes"
+        tailscale: "yes",
+        desync: "no"
     },
     "extended": {
         marker: "extended",
@@ -58,7 +62,8 @@ const CORE_PROFILES = {
         // shtorm-7 compiles xhttp in unconditionally, and every caller used to
         // answer "extended supports xhttp" by hand anyway.
         xhttp: "yes",
-        tailscale: "yes"
+        tailscale: "yes",
+        desync: "no"
     },
     "extended-compressed": {
         marker: "extended-compressed",
@@ -71,7 +76,8 @@ const CORE_PROFILES = {
         schema_1_14: FROM_VERSION_PREFIX + "1.14",
         schema_1_15: FROM_VERSION_PREFIX + "1.15",
         xhttp: "yes",
-        tailscale: "yes"
+        tailscale: "yes",
+        desync: "no"
     },
     // Our own core. Its version is a different series entirely - the released
     // build reports "tachyon-core 0.0.1", a bare number with no fork suffix -
@@ -91,7 +97,11 @@ const CORE_PROFILES = {
         schema_1_14: "yes",
         schema_1_15: "yes",
         xhttp: "yes",
-        tailscale: "yes"
+        tailscale: "yes",
+        // Native desync landed in tachyon-core 0.1.7. Older builds of our own
+        // core do not have the outbound, so the gate is a version floor and
+        // not a flat yes.
+        desync: FROM_VERSION_PREFIX + "0.1.7"
     }
 };
 
@@ -104,7 +114,8 @@ const CORE_PROFILE_PRECEDENCE = [ "tachyon-core", "extended-compressed", "extend
 const TACHYON_PROTOCOLS = [ "vless", "vmess", "trojan", "shadowsocks", "hysteria2",
     "tuic", "hysteria", "anytls", "snell", "naive", "shadowtls", "ssh", "tor",
     "socks", "http", "wireguard", "awg", "openvpn", "masque", "fptn",
-    "selector", "urltest", "cloudflared", "tailscale", "openconnect", "bridge" ];
+    "selector", "urltest", "cloudflared", "tailscale", "openconnect", "bridge",
+    "mieru", "tewfai", "trusttunnel", "desync" ];
 
 // Read off the cores themselves rather than off their names: KNOWN_INBOUND_TYPES
 // and KNOWN_OUTBOUND_TYPES in tachyon-core's crates/core-config/src/validate.rs,
@@ -128,7 +139,7 @@ const CORE_PROTOCOLS = {
     "tachyon-core": [ "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic",
         "hysteria", "anytls", "snell", "naive", "shadowtls", "ssh", "tor",
         "socks", "http", "wireguard", "awg", "warp", "openvpn", "masque", "fptn", "selector", "urltest",
-        "cloudflared", "tailscale", "openconnect", "bridge", "mieru" ]
+        "cloudflared", "tailscale", "openconnect", "bridge", "mieru", "tewfai", "trusttunnel", "desync", "mtproto" ]
 };
 
 // Inbound kinds, which are a separate question from protocols: a core can speak
@@ -157,7 +168,7 @@ const CORE_INBOUNDS = {
         "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic", "shadowtls" ],
     "tachyon-core": [ "mixed", "direct", "redirect", "tproxy", "socks", "http", "tun",
         "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic", "anytls",
-        "naive", "shadowtls", "fptn", "mieru" ]
+        "naive", "shadowtls", "fptn", "mieru", "trusttunnel", "tewfai", "masque", "openconnect", "mtproto" ]
 };
 
 // Local, like every other module: core.common has no contains(), and the
@@ -197,16 +208,51 @@ function version_pair(value) {
     return [ major, minor ];
 }
 
-// Does a build reach a schema level? "1.14.2-lx.12" reaches 1.15: no. A core on
-// its own version series reaches whatever its profile says it does.
-function reaches(value, level) {
-    let build = version_pair(as_string(value));
-    let want = version_pair(as_string(level));
+// major/minor/patch of a version string, or null when there is none. The
+// patch level matters for tachyon-core, whose own series carries the
+// capability gates (native desync arrived in 0.1.7), so a major/minor pair
+// is not enough to answer "does this build have it".
+function version_triple(value) {
+    let text = trim(as_string(value));
+    if (substr(text, 0, 1) == "v" || substr(text, 0, 1) == "V")
+        text = trim(substr(text, 1, length(text)));
+    let parts = split(text, ".");
+    if (length(parts) < 2)
+        return null;
+    let major = int(trim(parts[0]));
+    let minor = int(trim(parts[1]));
+    if (major == null || minor == null || major < 0 || minor < 0)
+        return null;
+    let patch = 0;
+    if (length(parts) > 2) {
+        let parsed = int(trim(parts[2]));
+        if (parsed != null && parsed >= 0)
+            patch = parsed;
+    }
+    return [ major, minor, patch ];
+}
+
+// Does a build reach a given major.minor.patch level? A build with no patch
+// number ("0.1") counts as the .0 of that line.
+function reaches_triple(value, level) {
+    let build = version_triple(value);
+    let want = version_triple(level);
     if (build == null || want == null)
         return false;
     if (build[0] != want[0])
         return build[0] > want[0];
-    return build[1] >= want[1];
+    if (build[1] != want[1])
+        return build[1] > want[1];
+    return build[2] >= want[2];
+}
+
+// Does a build reach a schema level? "1.14.2-lx.12" reaches 1.15: no. A core on
+// its own version series reaches whatever its profile says it does.
+function reaches(value, level) {
+    // The patch level is part of the answer: a capability that arrived in
+    // 0.1.7 is not there in 0.1.6, and a major/minor comparison would call
+    // them the same build.
+    return reaches_triple(value, level);
 }
 
 function profile_matches_version(profile, version) {
@@ -371,6 +417,13 @@ function supports_tailscale(version, marker, version_output) {
     return flag(version, marker, "tailscale", "with_tailscale", version_output);
 }
 
+// Native desync: a tachyon-core outbound. sing-box has no such thing, so
+// every sing-box profile answers "no" and only our own core can say yes -
+// and only from 0.1.7 on.
+function supports_desync(version, marker) {
+    return flag(version, marker, "desync", "with_desync", null);
+}
+
 return {
     CORE_PROFILES,
     CORE_PROTOCOLS,
@@ -395,6 +448,9 @@ return {
     flag,
     supports_xhttp,
     supports_tailscale,
+    supports_desync,
+    version_triple,
+    reaches_triple,
     reaches,
     version_pair
 };

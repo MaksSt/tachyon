@@ -40,7 +40,13 @@ export function renderStrategyFuzzerModal(
   let patternsConfig: Tachyon.FuzzerPatternsConfig = {
     zapret2: {
       splits: ['1', '2', '3', 'midsld', 'sniext+4', '1,midsld', '1,sniext+2'],
-      foolings: ['badseq', 'md5sig', 'badack', 'datanoack', 'fakeddrop'],
+      foolings: [
+        'tcp_seq=1000000',
+        'tcp_md5',
+        'tcp_ack=-66000',
+        'tcp_flags_unset=ack',
+        'badsum',
+      ],
       ttls: [2, 3, 4, 5, 6, 8],
       seqovls: ['1', '2'],
       wsizes: ['1'],
@@ -60,6 +66,15 @@ export function renderStrategyFuzzerModal(
       autos: ['t,r,a,s', 'r,s', 't,a'],
       tlsrecs: ['1+sniext'],
       ipfrags: ['24'],
+    },
+    desync: {
+      modes: ['fake_split', 'tlsrec', 'disorder', 'split', 'fake', 'oob'],
+      split_poses: ['midsld', 'sni', 1, 2],
+      fake_ttls: [3, 4, 5, 6, 8],
+      fake_snis: ['www.google.com', 'dl.google.com', 'ya.ru'],
+      repeats: [1, 2, 3, 4],
+      split_delays: [1, 2, 3],
+      udp_fakes: [true, false],
     },
     custom_strategies: [],
   };
@@ -165,14 +180,32 @@ export function renderStrategyFuzzerModal(
     style: selectStyle,
   });
 
+  const dpiActions = ['zapret2', 'zapret', 'byedpi', 'desync'];
+
   const getApplicableRules = (engine: Tachyon.FuzzerEngine) => {
-    return normalizedRules.filter((r) => {
-      if (!r.action) return true;
+    const exact = normalizedRules.filter((r) => {
+      if (!r.action) return false;
       if (engine === 'all') {
-        return ['zapret2', 'zapret', 'byedpi'].includes(r.action);
+        return dpiActions.includes(r.action);
       }
       return r.action === engine;
     });
+    const connectionRules = normalizedRules.filter(
+      (r) =>
+        (!r.action || r.action === 'connection') &&
+        !exact.some((e) => e.id === r.id),
+    );
+    const otherDpi = normalizedRules.filter(
+      (r) =>
+        r.action &&
+        dpiActions.includes(r.action) &&
+        !exact.some((e) => e.id === r.id) &&
+        !connectionRules.some((c) => c.id === r.id),
+    );
+    if (exact.length > 0 || connectionRules.length > 0 || otherDpi.length > 0) {
+      return [...exact, ...connectionRules, ...otherDpi];
+    }
+    return normalizedRules;
   };
 
   const populateRuleSelect = () => {
@@ -225,6 +258,7 @@ export function renderStrategyFuzzerModal(
       E('option', { value: 'zapret2' }, _('Zapret v2 (nfqws2)')),
       E('option', { value: 'zapret' }, _('Zapret v1 (nfqws)')),
       E('option', { value: 'byedpi' }, _('ByeDPI (ciadpi)')),
+      E('option', { value: 'desync' }, _('Native Desync (tachyon-core)')),
       E('option', { value: 'all' }, _('All Engines (Full Matrix)')),
     ],
   );
@@ -470,6 +504,7 @@ export function renderStrategyFuzzerModal(
     disabled: true,
     onClick: () => handleApplyBest(),
   });
+  applyBestBtn.id = 'tachyon-fuzzer-apply-best-btn';
 
   // Results Filter Toolbar
   const filterToolbar = E(
@@ -668,6 +703,7 @@ export function renderStrategyFuzzerModal(
         text: _('Close'),
         classNames: ['cbi-button-neutral'],
         onClick: () => {
+          isDisposed = true;
           stopPolling();
           ui.hideModal();
         },
@@ -768,6 +804,18 @@ export function renderStrategyFuzzerModal(
     const z2 = patternsConfig.zapret2;
     const z1 = patternsConfig.zapret;
     const bd = patternsConfig.byedpi;
+    if (!patternsConfig.desync) {
+      patternsConfig.desync = {
+        modes: ['fake_split', 'tlsrec', 'disorder', 'split', 'fake', 'oob'],
+        split_poses: ['midsld', 'sni', 1, 2],
+        fake_ttls: [3, 4, 5, 6, 8],
+        fake_snis: ['www.google.com', 'dl.google.com', 'ya.ru'],
+        repeats: [1, 2, 3, 4],
+        split_delays: [1, 2, 3],
+        udp_fakes: [true, false],
+      };
+    }
+    const ds = patternsConfig.desync;
 
     const z2Card = E(
       'div',
@@ -904,6 +952,60 @@ export function renderStrategyFuzzerModal(
       ],
     );
 
+    const dsCard = E(
+      'div',
+      {
+        style:
+          'padding: 12px; background: var(--background-color-secondary, rgba(0,0,0,0.15)); border-radius: 6px; border: 1px solid var(--border-color, rgba(255,255,255,0.1)); display: flex; flex-direction: column; gap: 10px;',
+      },
+      [
+        E(
+          'div',
+          { style: 'font-size: 13px; font-weight: bold;' },
+          '⚡ Native Desync (tachyon-core) Matrix Patterns',
+        ),
+        renderChipGroup(
+          _('Desync Modes (--mode)'),
+          ds.modes,
+          (v) => ds.modes.push(v),
+          (i) => ds.modes.splice(i, 1),
+        ),
+        renderChipGroup(
+          _('Split Positions (--split-pos)'),
+          ds.split_poses,
+          (v) =>
+            ds.split_poses.push(
+              v === 'midsld' || v === 'sni' ? v : Number(v) || 1,
+            ),
+          (i) => ds.split_poses.splice(i, 1),
+        ),
+        renderChipGroup(
+          _('Fake TTLs (--fake-ttl)'),
+          ds.fake_ttls,
+          (v) => ds.fake_ttls.push(Number(v) || 3),
+          (i) => ds.fake_ttls.splice(i, 1),
+        ),
+        renderChipGroup(
+          _('Fake SNI Hosts (--fake-sni)'),
+          ds.fake_snis,
+          (v) => ds.fake_snis.push(v),
+          (i) => ds.fake_snis.splice(i, 1),
+        ),
+        renderChipGroup(
+          _('Fake Repeats (--repeats)'),
+          ds.repeats,
+          (v) => ds.repeats.push(Number(v) || 2),
+          (i) => ds.repeats.splice(i, 1),
+        ),
+        renderChipGroup(
+          _('Split Delays ms (--split-delay)'),
+          ds.split_delays,
+          (v) => ds.split_delays.push(Number(v) || 1),
+          (i) => ds.split_delays.splice(i, 1),
+        ),
+      ],
+    );
+
     const patternsFooter = E(
       'div',
       {
@@ -939,7 +1041,7 @@ export function renderStrategyFuzzerModal(
       ],
     );
 
-    tabContentPatterns.append(z2Card, z1Card, bdCard, patternsFooter);
+    tabContentPatterns.append(z2Card, z1Card, bdCard, dsCard, patternsFooter);
   };
 
   // ═════════════════════════════════════════════════════════════════════════════
@@ -965,6 +1067,7 @@ export function renderStrategyFuzzerModal(
         E('option', { value: 'zapret2' }, _('Zapret v2')),
         E('option', { value: 'zapret' }, _('Zapret v1')),
         E('option', { value: 'byedpi' }, _('ByeDPI')),
+        E('option', { value: 'desync' }, _('Native Desync')),
       ],
     );
     const argsInput = E('input', {
@@ -992,7 +1095,7 @@ export function renderStrategyFuzzerModal(
         patternsConfig.custom_strategies.push({
           id: `custom_${Date.now()}`,
           name,
-          engine: eng as 'zapret2' | 'zapret' | 'byedpi',
+          engine: eng as 'zapret2' | 'zapret' | 'byedpi' | 'desync',
           args,
           description: _('User custom strategy'),
         });
@@ -1431,6 +1534,11 @@ export function renderStrategyFuzzerModal(
     }
 
     if (list.length === 0) {
+      const emptyMsg = state.running
+        ? _('Running benchmarks...')
+        : state.error
+          ? `⚠️ ${state.error}`
+          : _('No strategies match the active filter.');
       tbody.appendChild(
         E(
           'tr',
@@ -1439,11 +1547,9 @@ export function renderStrategyFuzzerModal(
             'td',
             {
               colSpan: 8,
-              style: 'padding: 24px; text-align: center; opacity: 0.6;',
+              style: 'padding: 24px; text-align: center; opacity: 0.75;',
             },
-            state.running
-              ? _('Running benchmarks...')
-              : _('No strategies match the active filter.'),
+            emptyMsg,
           ),
         ),
       );
@@ -1716,14 +1822,18 @@ export function renderStrategyFuzzerModal(
     const currentStratEl = document.getElementById(
       'tachyon-fuzzer-current-strategy',
     );
-    const applyBestBtn = document.getElementById(
-      'tachyon-fuzzer-apply-best-btn',
-    );
+    const applyBestBtnEl =
+      document.getElementById('tachyon-fuzzer-apply-best-btn') || applyBestBtn;
 
     if (progressContainer) {
-      progressContainer.style.display =
-        state.running || state.results?.length ? 'flex' : 'none';
-      if (state.running || state.results?.length) {
+      const showProgress = Boolean(
+        state.running ||
+          state.results?.length ||
+          state.error ||
+          state.finished_at > 0,
+      );
+      progressContainer.style.display = showProgress ? 'flex' : 'none';
+      if (showProgress) {
         progressContainer.style.minHeight = '62px';
       }
     }
@@ -1743,7 +1853,11 @@ export function renderStrategyFuzzerModal(
         } else {
           statusText.innerText = `${_('Stage 1: Exploration Scan')} (${state.current_index} / ${state.total_strategies})...`;
         }
-      } else if (state.finished_at > 0 || state.results?.length) {
+      } else if (
+        state.finished_at > 0 ||
+        state.results?.length ||
+        state.error
+      ) {
         if (bestStrategy || workingResults.length > 0) {
           if (state.error) {
             statusText.innerText = `${_('🛑 Benchmark stopped')}. ${_('Found')} ${workingResults.length} ${_('working strategies')}.`;
@@ -1770,28 +1884,65 @@ export function renderStrategyFuzzerModal(
       }
     }
 
-    if (applyBestBtn) {
-      (applyBestBtn as HTMLButtonElement).disabled = !bestStrategy;
+    if (applyBestBtnEl) {
+      (applyBestBtnEl as HTMLButtonElement).disabled = !bestStrategy;
+      applyBestBtnEl.classList.toggle(
+        'tachyon-partial-button--disabled',
+        !bestStrategy,
+      );
     }
   };
 
   // ── Polling & Execution Logic ─────────────────────────────────────────────
   let lastRenderedCount = 0;
   let lastRenderedFinishedAt = 0;
+  let lastRenderedError = '';
+  let pollEpoch = 0;
+  let activeJobId: string | null = null;
+  let isDisposed = false;
+  let hasMounted = false;
 
   const pollStatus = async () => {
+    if (modalContainer.isConnected) {
+      hasMounted = true;
+    }
+    if (isDisposed || (hasMounted && !modalContainer.isConnected)) {
+      stopPolling();
+      return;
+    }
     if (isPolling) return;
     isPolling = true;
+    const myEpoch = pollEpoch;
     try {
       const res = await TachyonShellMethods.getFuzzerStatus();
+      if (myEpoch !== pollEpoch) {
+        return;
+      }
+      if (isDisposed || (hasMounted && !modalContainer.isConnected)) {
+        stopPolling();
+        return;
+      }
       if (res.success && res.data) {
+        if (
+          activeJobId &&
+          res.data.job_id &&
+          res.data.job_id !== activeJobId &&
+          !res.data.running
+        ) {
+          return;
+        }
+        if (res.data.running && res.data.job_id) {
+          activeJobId = res.data.job_id;
+        }
         currentState = res.data;
         isRunning = res.data.running;
 
         if (isRunning) {
           startBtn.innerText = _('🛑 Stop Benchmark');
           (startBtn as HTMLButtonElement).disabled = false;
-          startPolling();
+          if (!pollingInterval) {
+            pollingInterval = setInterval(pollStatus, 1200);
+          }
         } else {
           stopPolling();
           startBtn.innerText = _('🚀 Start Benchmark');
@@ -1805,16 +1956,19 @@ export function renderStrategyFuzzerModal(
           updateDpiBanner(res.data.dpi_detection);
         }
 
-        // Only re-render results when new results arrive or benchmark finishes
+        // Re-render results when new results arrive, benchmark finishes, or error state changes
         const resultCount = res.data.results?.length || 0;
         const finishedAt = res.data.finished_at || 0;
+        const errStr = res.data.error || '';
         if (
           resultCount !== lastRenderedCount ||
-          finishedAt !== lastRenderedFinishedAt
+          finishedAt !== lastRenderedFinishedAt ||
+          errStr !== lastRenderedError
         ) {
           renderResults(res.data);
           lastRenderedCount = resultCount;
           lastRenderedFinishedAt = finishedAt;
+          lastRenderedError = errStr;
         }
 
         if (!isRunning && !stoppedManually) {
@@ -1855,7 +2009,9 @@ export function renderStrategyFuzzerModal(
     } catch {
       // transient error ignore
     } finally {
-      isPolling = false;
+      if (myEpoch === pollEpoch) {
+        isPolling = false;
+      }
     }
   };
 
@@ -1905,7 +2061,7 @@ export function renderStrategyFuzzerModal(
       switch (det.type) {
         case 'ip_block':
           return _(
-            'TCP connect timed out before TLS handshake — host is blocked at the IP layer. DPI bypass cannot unblock this; route via Sing-box VPN/Proxy outbound instead.',
+            'TCP connect timed out before TLS handshake — host is blocked at the IP layer. DPI bypass cannot unblock this; route via VPN/Proxy outbound instead.',
           );
         case 'rst':
           return _(
@@ -1932,7 +2088,7 @@ export function renderStrategyFuzzerModal(
     const ipBlockNotice =
       detection.type === 'ip_block'
         ? `<div class="alert-message danger" style="margin-top: 8px;">
-             ⚠️ ${_('IP-level blocking detected! The resource is blocked at the network level (no TCP SYN response). DPI bypass methods (Zapret / ByeDPI) cannot bypass this address — configure proxy/VPN routing (Sing-box) for this domain!')}
+             ⚠️ ${_('IP-level blocking detected! The resource is blocked at the network level (no TCP SYN response). DPI bypass methods (Zapret / ByeDPI) cannot bypass this address — configure proxy/VPN routing for this domain!')}
            </div>`
         : '';
 
@@ -1954,17 +2110,23 @@ export function renderStrategyFuzzerModal(
   const handleToggleRun = async () => {
     if (isRunning) {
       stoppedManually = true;
+      pollEpoch++;
+      isPolling = false;
+      stopPolling();
       (startBtn as HTMLButtonElement).disabled = true;
       startBtn.innerText = _('⏳ Stopping...');
       await TachyonShellMethods.stopFuzzer();
       showToast(_('Benchmark stopped'), 'success');
       isRunning = false;
-      stopPolling();
+      activeJobId = null;
       await pollStatus();
       return;
     }
 
     stoppedManually = false;
+    pollEpoch++;
+    isPolling = false;
+    stopPolling();
     (startBtn as HTMLButtonElement).disabled = true;
     startBtn.innerText = _('🛑 Stop Benchmark');
 
@@ -2024,10 +2186,31 @@ export function renderStrategyFuzzerModal(
       showToast(_('Strategy benchmark started'), 'success');
       (startBtn as HTMLButtonElement).disabled = false;
       isRunning = true;
-      lastRenderedCount = 0;
-      lastRenderedFinishedAt = 0;
+      activeJobId = res.data?.job_id || null;
+      lastRenderedCount = -1;
+      lastRenderedFinishedAt = -1;
+      lastRenderedError = '';
+      pollEpoch++;
+      isPolling = false;
       startPolling();
     } else {
+      // If the RPC/XHR call timed out, check if the benchmark actually started in the background
+      const statusRes = await TachyonShellMethods.getFuzzerStatus().catch(
+        () => null,
+      );
+      if (statusRes?.success && statusRes.data?.running) {
+        showToast(_('Strategy benchmark started'), 'success');
+        (startBtn as HTMLButtonElement).disabled = false;
+        isRunning = true;
+        activeJobId = statusRes.data.job_id || null;
+        lastRenderedCount = -1;
+        lastRenderedFinishedAt = -1;
+        lastRenderedError = '';
+        pollEpoch++;
+        isPolling = false;
+        startPolling();
+        return;
+      }
       const errMsg = !res.success ? res.error : _('Unknown error');
       showToast(`${_('Failed to start benchmark')}: ${errMsg}`, 'error');
       (startBtn as HTMLButtonElement).disabled = false;
@@ -2087,6 +2270,12 @@ export function renderStrategyFuzzerModal(
 
         if (startRes.success) {
           isRunning = true;
+          activeJobId = startRes.data?.job_id || null;
+          lastRenderedCount = -1;
+          lastRenderedFinishedAt = -1;
+          lastRenderedError = '';
+          pollEpoch++;
+          isPolling = false;
           startPolling();
         }
       } else {
@@ -2113,7 +2302,13 @@ export function renderStrategyFuzzerModal(
     const targetRule = normalizedRules.find(
       (r) => r.id === selectedRuleSection,
     );
-    if (targetRule && targetRule.action && targetRule.action !== item.engine) {
+    if (
+      targetRule &&
+      targetRule.action &&
+      targetRule.action !== item.engine &&
+      targetRule.action !== 'connection' &&
+      !dpiActions.includes(targetRule.action)
+    ) {
       showToast(
         `${_('Cannot apply')} ${item.engine} ${_('strategy to section configured for')} ${targetRule.action}`,
         'error',
@@ -2198,6 +2393,11 @@ export function renderStrategyFuzzerModal(
               ? _('ByeDPI (ciadpi)') + ' — ' + _('Installed')
               : _('ByeDPI (ciadpi)') + ' — ' + _('Not installed');
             if (!av.byedpi) opt.disabled = true;
+          } else if (opt.value === 'desync') {
+            opt.text = av.desync
+              ? _('Native Desync (tachyon-core)') + ' — ' + _('Installed')
+              : _('Native Desync (tachyon-core)') + ' — ' + _('Not installed');
+            if (av.desync === false) opt.disabled = true;
           }
         }
       }

@@ -171,7 +171,7 @@ function list_option(section, key) {
 }
 
 function bool_value(value) {
-    value = lc(as_string(value));
+    value = lc(trim(as_string(value)));
     return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
@@ -191,7 +191,8 @@ function disable_quic_mode(value) {
 function bool_option(section, key, fallback) {
     if (fallback == null)
         fallback = false;
-    let value = option(section, key, fallback ? "1" : "0");
+    let raw = trim(option(section, key, ""));
+    let value = raw == "" ? (fallback ? "1" : "0") : raw;
     return bool_value(value);
 }
 
@@ -619,6 +620,8 @@ function kill_orphaned_logread() {
 function ensure_dir(path) {
     path = as_string(path);
     if (path == "") return false;
+    let st = fs.stat(path);
+    if (st != null && st.type == "directory") return true;
     let result = system("mkdir -p " + shell_quote(path) + " 2>/dev/null");
     return result == 0;
 }

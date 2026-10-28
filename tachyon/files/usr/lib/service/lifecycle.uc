@@ -959,12 +959,7 @@ function start_steer_main(active_engine) {
     // Make sure the sing-box service is not left running: two engines must not
     // fight over nftables and policy routing.
     if (fs.stat("/etc/init.d/tachyon-core") != null)
-        command_status_from_args([ "/etc/init.d/tachyon-core", "stop" ]);
-
-    // Watchdog first, so auto-healing is active through a failed boot.
-    let wd_status = module_status(WATCHDOG_UC, [ "start-runtime" ]);
-    if (wd_status != 0)
-        log_message("Watchdog start-runtime failed (status " + as_string(wd_status) + ")", "warn");
+        command_success_from_args([ "/etc/init.d/tachyon-core", "stop" ]);
 
     let engine_runtime = require("service.engine_runtime");
 
@@ -1035,8 +1030,6 @@ function start_steer_main(active_engine) {
     module_success(OLCRTC_UC, [ "start-runtime" ]);
     module_success(FPTN_UC, [ "start-runtime" ]);
     module_success(TAILSCALE_UC, [ "start-runtime" ]);
-
-    module_background(TELEGRAM_UC, [ "start-runtime" ]);
 
     return 0;
 }
@@ -1170,6 +1163,7 @@ function start_main() {
 
     restore_selector_state(null);
 
+    try { fs.unlink("/var/run/tachyon/boot-sweep-done"); } catch (e) {}
     module_background(UI_UC, [ "latency-boot-sweep" ]);
     module_background(UPDATES_UC, [ "list-update" ]);
     module_background(LIB_DIR + "/service/lifecycle.uc", [ "discover-awg-mtu" ]);
@@ -1181,6 +1175,11 @@ function start_impl() {
     // (e.g. config generator killed during restart). 30-min threshold is safe since
     // all tachyon temp files are created and deleted within seconds under normal operation.
     command_status("find /tmp -maxdepth 1 -name 'tachyon-*' -mmin +30 -delete 2>/dev/null; true");
+
+    if (config_get(CONFIG_NAME + ".settings.shutdown_correctly") == "0") {
+        log_message("Previous shutdown was unclean; restoring dnsmasq to failsafe before start", "warn");
+        dnsmasq_restore_fail_safe();
+    }
 
     // Watchdog must start early so auto-healing is active even through a failed boot.
     // Telegram (119 KB) is heavy but non-critical: move to background after the proxy
@@ -1233,12 +1232,15 @@ function start_impl() {
     if (status != 0)
         return status;
 
-    status = module_status(DNS_FAILOVER_UC, [ "start-runtime" ]);
-    if (status != 0) {
-        log_message("Failed to start DNS failover runtime", "fatal");
-        return status;
+    if (!active_engine_is_steer()) {
+        status = module_status(DNS_FAILOVER_UC, [ "start-runtime" ]);
+        if (status != 0) {
+            log_message("Failed to start DNS failover runtime", "fatal");
+            return status;
+        }
     }
 
+    module_background(UI_UC, [ "get-ui-capabilities" ]);
     module_background(DIAGNOSTICS_UC, [ "get-system-info" ]);
     module_background(TELEGRAM_UC, [ "start-runtime" ]);
     fs.unlink("/var/run/tachyon/starting");
@@ -1256,9 +1258,9 @@ function stop_main() {
     // takes over the dataplane. The zapret handler service must go first: its
     // processes hold the engine's nfqueue sockets.
     if (fs.stat("/etc/init.d/tachyon-steer-zapret") != null)
-        command_status_from_args([ "/etc/init.d/tachyon-steer-zapret", "stop" ]);
+        command_success_from_args([ "/etc/init.d/tachyon-steer-zapret", "stop" ]);
     if (fs.stat("/etc/init.d/steer") != null) {
-        command_status_from_args([ "/etc/init.d/steer", "stop" ]);
+        command_success_from_args([ "/etc/init.d/steer", "stop" ]);
     }
 
     // Stop the steer DNS upstream (smartdns). Must happen after steer dnsd is
@@ -1314,11 +1316,11 @@ function stop_main() {
     if (module_success(STATE_UC, [ "core-is-foreign" ]))
         log_message("Sing-box PID provenance mismatch: the running sing-box was not started by Tachyon; stopping it anyway", "warn");
 
-    if (fs.stat("/etc/init.d/tachyon-core") != null) {
-        let sing_box_status = command_status_from_args([ "/etc/init.d/tachyon-core", "stop" ]);
-        command_success_from_args([ "killall", "-q", "-9", "tachyon-core" ]);
-        if (!active_engine_is_steer() && sing_box_status != 0)
-            status = sing_box_status;
+    let core_proc = require("core.process");
+    let core_init = core_proc.core_contract().init_script;
+    if (fs.stat(core_init) != null) {
+        command_success_from_args([ core_init, "stop" ]);
+        core_proc.kill_core_daemons();
     }
 
     module_success(STATE_UC, [ "cleanup-provenance" ]);
@@ -1698,9 +1700,14 @@ function reload(reason) {
     // Skip all work when config fingerprint is unchanged since the last reload.
     // Applies to user-triggered reloads as well as on_config_change; saves ~4
     // ucode forks (3 validate + 1 plan) when nothing actually changed.
-    if (reason != "force" && current_config_hash() == last_completed_reload_hash()) {
-        log_message("Reload skipped: configuration is unchanged", "info");
-        return 0;
+    if (reason != "force" &&
+        as_string(getenv("TACHYON_RUNTIME_CACHE_INVALIDATED") || "0") != "1" &&
+        current_config_hash() == last_completed_reload_hash() &&
+        !module_success(SUBSCRIPTION_CACHE_UC, [ "runtime-cache-needs-rebuild", SECTION_CACHE_DIR ])) {
+        if (module_success(STATE_UC, [ "tachyon-running", RT_TABLE_NAME, NFT_TABLE_NAME, NFT_FAKEIP_MARK ])) {
+            log_message("Reload skipped: configuration is unchanged", "info");
+            return 0;
+        }
     }
 
     status = validate_start_config();

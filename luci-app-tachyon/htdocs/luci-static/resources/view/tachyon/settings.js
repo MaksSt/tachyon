@@ -12,6 +12,32 @@
 
 const UCI_PACKAGE = main.TACHYON_UCI_PACKAGE;
 
+function _tr(ru, en) {
+  const envLang =
+    (typeof L !== "undefined" && L.env && L.env.lang) ||
+    (typeof window !== "undefined" &&
+      window.L &&
+      window.L.env &&
+      window.L.env.lang) ||
+    "";
+  const docLang = (
+    (typeof document !== "undefined" &&
+      document.documentElement &&
+      document.documentElement.lang) ||
+    (typeof document !== "undefined" &&
+      document.querySelector("html")?.getAttribute("lang")) ||
+    ""
+  ).toLowerCase();
+  const lang = (envLang || docLang).toLowerCase();
+  const isRu =
+    lang.startsWith("ru") ||
+    (typeof _ === "function" &&
+      (_("Status") === "Статус" ||
+        _("Overview") === "Обзор" ||
+        _("Save") === "Сохранить"));
+  return isRu ? ru : en;
+}
+
 function isSingBoxDuration(value) {
   return /^(?=.*[1-9])([0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h|d))+$/.test(value);
 }
@@ -27,12 +53,44 @@ function validateLatencyTestUrl(value) {
   return validation.valid ? true : validation.message;
 }
 
+function disablePasswordAutofill(option) {
+  if (!option || typeof option.renderWidget !== "function") return;
+  const origRenderWidget = option.renderWidget;
+  option.renderWidget = function (section_id, option_index, cfgvalue) {
+    const node = origRenderWidget.call(
+      this,
+      section_id,
+      option_index,
+      cfgvalue,
+    );
+    const applyAttrs = function (el) {
+      if (!el) return;
+      const input = el.querySelector ? el.querySelector("input") || el : el;
+      if (input && input.setAttribute) {
+        input.setAttribute("autocomplete", "new-password");
+        input.setAttribute("data-lpignore", "true");
+        input.setAttribute("data-1p-ignore", "true");
+        input.setAttribute("data-bwignore", "true");
+      }
+    };
+    if (node instanceof Promise) {
+      return node.then(function (res) {
+        applyAttrs(res);
+        return res;
+      });
+    }
+    applyAttrs(node);
+    return node;
+  };
+}
+
 function isDownloadSectionAction(action, capabilities) {
   switch (action) {
     case "connection":
     case "proxy":
     case "outbound":
     case "vpn":
+    case "group":
     case "fptn":
     case "awg":
     case "warp":
@@ -97,6 +155,50 @@ function configureDownloadSectionOption(option, sectionOption, capabilities) {
   };
   option.validate = function (_section_id, value) {
     return value ? true : _("Select a section");
+  };
+}
+
+function configureDefaultTunnelSectionOption(
+  option,
+  sectionOption,
+  capabilities,
+) {
+  option.default = "";
+  option.rmempty = true;
+  option.cfgvalue = function (section_id) {
+    return uci.get(UCI_PACKAGE, section_id, sectionOption) || "";
+  };
+  option.load = function (section_id) {
+    const sections = this.map?.data?.state?.values?.[UCI_PACKAGE] ?? {};
+    this.keylist = [""];
+    this.vallist = [
+      _tr(
+        "Автоматически (первая активная секция)",
+        "Auto (First available active section)",
+      ),
+    ];
+    for (const secName in sections) {
+      const sec = sections[secName];
+      if (
+        sec[".type"] === "section" &&
+        sec.enabled !== "0" &&
+        isDownloadSectionAction(sec.action, capabilities)
+      ) {
+        this.value(secName, sec.label || secName);
+      }
+    }
+    return this.cfgvalue(section_id);
+  };
+  option.write = function (section_id, value) {
+    const normalized = value ? `${value}`.trim() : "";
+    if (normalized) {
+      uci.set(UCI_PACKAGE, section_id, sectionOption, normalized);
+    } else {
+      uci.unset(UCI_PACKAGE, section_id, sectionOption);
+    }
+  };
+  option.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, sectionOption);
   };
 }
 
@@ -361,7 +463,20 @@ function createWatchdogStatusWidget() {
     }
   }
 
-  function refreshWdStatus() {
+  let wdInFlight = false;
+  let wdHasMounted = false;
+  let wdLoadedOnce = false;
+
+  function refreshWdStatus(force) {
+    if (wdInFlight) return Promise.resolve();
+    if (
+      !force &&
+      (!wrapper.isConnected || wrapper.offsetParent === null || document.hidden)
+    ) {
+      return Promise.resolve();
+    }
+    wdInFlight = true;
+    wdLoadedOnce = true;
     return fs
       .exec("/usr/bin/tachyon", ["watchdog", "status"])
       .then(function (res) {
@@ -376,6 +491,9 @@ function createWatchdogStatusWidget() {
       .catch(function () {
         dot.style.background = "#aaa";
         statusText.textContent = _("Unknown");
+      })
+      .finally(function () {
+        wdInFlight = false;
       });
   }
 
@@ -385,7 +503,7 @@ function createWatchdogStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["watchdog_start"])
       .then(function () {
         msgEl.textContent = "";
-        return refreshWdStatus();
+        return refreshWdStatus(true);
       })
       .catch(function () {
         msgEl.textContent = _("Failed to start watchdog");
@@ -399,7 +517,7 @@ function createWatchdogStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["watchdog_stop"])
       .then(function () {
         msgEl.textContent = "";
-        return refreshWdStatus();
+        return refreshWdStatus(true);
       })
       .catch(function () {
         msgEl.textContent = _("Failed to stop watchdog");
@@ -412,16 +530,28 @@ function createWatchdogStatusWidget() {
   wrapper.appendChild(btnStop);
   wrapper.appendChild(msgEl);
 
-  refreshWdStatus();
+  let wdVisibilityObserver = null;
+  if (typeof IntersectionObserver !== "undefined") {
+    wdVisibilityObserver = new IntersectionObserver(function (entries) {
+      if (entries.some((e) => e.isIntersecting) && !wdLoadedOnce) {
+        refreshWdStatus(true);
+      }
+    });
+    wdVisibilityObserver.observe(wrapper);
+  } else {
+    refreshWdStatus(true);
+  }
 
-  const wdTimer = setInterval(refreshWdStatus, 10000);
-  const wdObserver = new MutationObserver(function () {
-    if (!document.body.contains(wrapper)) {
+  const wdTimer = setInterval(function () {
+    if (wrapper.isConnected) {
+      wdHasMounted = true;
+    } else if (wdHasMounted) {
       clearInterval(wdTimer);
-      wdObserver.disconnect();
+      if (wdVisibilityObserver) wdVisibilityObserver.disconnect();
+      return;
     }
-  });
-  wdObserver.observe(document.body, { childList: true, subtree: true });
+    refreshWdStatus(false);
+  }, 10000);
 
   return wrapper;
 }
@@ -1066,7 +1196,19 @@ function createSnapshotsWidget() {
   );
   wrapper.appendChild(listEl);
 
-  loadSnapshots();
+  if (typeof IntersectionObserver !== "undefined") {
+    let snapshotsLoaded = false;
+    const snapObserver = new IntersectionObserver(function (entries) {
+      if (entries.some((e) => e.isIntersecting) && !snapshotsLoaded) {
+        snapshotsLoaded = true;
+        snapObserver.disconnect();
+        loadSnapshots();
+      }
+    });
+    snapObserver.observe(wrapper);
+  } else {
+    loadSnapshots();
+  }
 
   return wrapper;
 }
@@ -1077,6 +1219,7 @@ function createSmartDetectSectionsWidget(section_id) {
     "proxy",
     "outbound",
     "vpn",
+    "group",
     "awg",
     "warp",
     "anytls",
@@ -1089,11 +1232,13 @@ function createSmartDetectSectionsWidget(section_id) {
     "olcrtc",
     "fptn",
   ];
+  const sectionActionByName = {};
   const allSections = (uci.sections(UCI_PACKAGE, "section") || [])
     .filter(function (s) {
       return s.enabled !== "0" && TESTABLE_ACTIONS.indexOf(s.action) >= 0;
     })
     .map(function (s) {
+      sectionActionByName[s[".name"]] = s.action;
       return s[".name"];
     });
 
@@ -1206,6 +1351,18 @@ function createSmartDetectSectionsWidget(section_id) {
 
     row.appendChild(cb);
     row.appendChild(label);
+    if (sectionActionByName[name] === "group") {
+      const groupBadge = E("span", {
+        "data-section-type": "group",
+        title: _(
+          "Routing rule target: detected domains are saved to the group's rules, and the group's own logic selects the active member.",
+        ),
+        style:
+          "display:inline-block;padding:1px 6px;font-size:0.75rem;font-weight:600;line-height:1.4;border-radius:4px;background:rgba(49,130,206,0.12);color:var(--blue-color,#3182ce);border:1px solid rgba(49,130,206,0.3);user-select:none;",
+      });
+      groupBadge.textContent = _("Group");
+      row.appendChild(groupBadge);
+    }
     row.appendChild(upBtn);
     row.appendChild(downBtn);
     return row;
@@ -1229,78 +1386,111 @@ function createMenuTabsOrderWidget(option, section_id) {
   const ALL_MENU_TABS = [
     {
       id: "dashboard",
-      label: _("Dashboard"),
-      desc: _("Main overview and status widgets"),
+      label: _tr("Дашборд", "Dashboard"),
+      desc: _tr(
+        "Главный экран и виджеты статуса",
+        "Main overview and status widgets",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "section",
-      label: _("Sections"),
-      desc: _("Routing sections, rules and strategies"),
+      label: _tr("Секции", "Sections"),
+      desc: _tr(
+        "Секции маршрутизации, правила и стратегии",
+        "Routing sections, rules and strategies",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "server",
-      label: _("Servers"),
-      desc: _("External inbound proxy servers"),
+      label: _tr("Серверы", "Servers"),
+      desc: _tr(
+        "Внешние серверы и входящие подключения",
+        "External inbound proxy servers",
+      ),
       defaultVisible: false,
       fixed: false,
     },
     {
       id: "profile",
-      label: _("Family Profiles"),
-      desc: _("Family profiles and device grouping"),
+      label: _tr("Семейные профили", "Family Profiles"),
+      desc: _tr(
+        "Семейные профили и группы устройств",
+        "Family profiles and device grouping",
+      ),
       defaultVisible: false,
       fixed: false,
     },
     {
       id: "schedule",
-      label: _("Parental Control"),
-      desc: _("Access schedule and screen time limits"),
+      label: _tr("Родительский контроль", "Parental Control"),
+      desc: _tr(
+        "Расписание доступа и лимиты экранного времени",
+        "Access schedule and screen time limits",
+      ),
       defaultVisible: false,
       fixed: false,
     },
     {
       id: "guest_mode",
-      label: _("Guest Mode"),
-      desc: _("Guest network isolation and device quotas"),
+      label: _tr("Гостевой режим", "Guest Mode"),
+      desc: _tr(
+        "Изоляция гостевой сети и квоты устройств",
+        "Guest network isolation and device quotas",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "monitoring",
-      label: _("Monitoring"),
-      desc: _("Traffic statistics and active connections"),
+      label: _tr("Мониторинг", "Monitoring"),
+      desc: _tr(
+        "Статистика трафика и активные соединения",
+        "Traffic statistics and active connections",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "diagnostic",
-      label: _("Diagnostics"),
-      desc: _("System diagnostics, AI Doctor and logs"),
+      label: _tr("Диагностика", "Diagnostics"),
+      desc: _tr(
+        "Системная диагностика, AI Доктор и журналы",
+        "System diagnostics, AI Doctor and logs",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "updates",
-      label: _("Components"),
-      desc: _("Component versions and update manager"),
+      label: _tr("Компоненты", "Components"),
+      desc: _tr(
+        "Версии компонентов и менеджер обновлений",
+        "Component versions and update manager",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "settings",
-      label: _("Settings"),
-      desc: _("Core configuration and preferences"),
+      label: _tr("Настройки", "Settings"),
+      desc: _tr(
+        "Основные настройки системы",
+        "Core configuration and preferences",
+      ),
       defaultVisible: true,
       fixed: true,
     },
     {
       id: "telegram",
-      label: _("Telegram Bot"),
-      desc: _("Remote management Telegram daemon"),
+      label: _tr("Телеграм-бот", "Telegram Bot"),
+      desc: _tr(
+        "Удаленное управление через Telegram",
+        "Remote management Telegram daemon",
+      ),
       defaultVisible: true,
       fixed: false,
     },
@@ -1548,77 +1738,104 @@ function createComponentsVisibilityWidget(option, section_id) {
     {
       id: "tachyon",
       label: "Tachyon",
-      desc: _("Core orchestration service and LuCI application"),
+      desc: _tr(
+        "Основной сервис оркестрации и веб-интерфейс LuCI",
+        "Core orchestration service and LuCI application",
+      ),
       defaultVisible: true,
       fixed: true,
     },
     {
       id: "sing_box",
       label: "Sing-box",
-      desc: _("Universal proxy platform routing engine"),
+      desc: _tr(
+        "Универсальная платформа и движок маршрутизации",
+        "Universal proxy platform routing engine",
+      ),
       defaultVisible: true,
       fixed: true,
     },
     {
       id: "zapret",
       label: "Zapret",
-      desc: _("DPI bypass engine (nfqws v1)"),
+      desc: _tr("Движок обхода DPI (nfqws v1)", "DPI bypass engine (nfqws v1)"),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "zapret2",
       label: "Zapret2",
-      desc: _("Advanced DPI bypass engine with Lua scripts (nfqws2)"),
+      desc: _tr(
+        "Продвинутый движок обхода DPI со скриптами Lua (nfqws2)",
+        "Advanced DPI bypass engine with Lua scripts (nfqws2)",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "byedpi",
       label: "ByeDPI",
-      desc: _("Local SOCKS proxy desynchronizer (ciadpi)"),
+      desc: _tr(
+        "Локальный десинхронизатор SOCKS (ciadpi)",
+        "Local SOCKS proxy desynchronizer (ciadpi)",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "wdtt",
       label: "WDTT",
-      desc: _("WireGuard over TURN Tunnel"),
+      desc: _tr("Туннель WireGuard поверх TURN", "WireGuard over TURN Tunnel"),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "olcrtc",
       label: "OlcRTC",
-      desc: _("Real-time WebRTC anti-censorship tunnel"),
+      desc: _tr(
+        "Антицензурный WebRTC-туннель реального времени",
+        "Real-time WebRTC anti-censorship tunnel",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "fptn",
       label: "FPTN",
-      desc: _("Fast packet transport network client"),
+      desc: _tr(
+        "Клиент быстрого протокола FPTN",
+        "Fast packet transport network client",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "tailscale",
       label: "Tailscale",
-      desc: _("Zero config mesh VPN daemon"),
+      desc: _tr(
+        "Mesh VPN демон с автоматической настройкой",
+        "Zero config mesh VPN daemon",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "direct_bypass",
-      label: _("Direct Proxy"),
-      desc: _("Dedicated direct HTTP/SOCKS5 outbound proxy"),
+      label: _tr("Direct Proxy", "Direct Proxy"),
+      desc: _tr(
+        "Выделенный прямой прокси HTTP/SOCKS5",
+        "Dedicated direct HTTP/SOCKS5 outbound proxy",
+      ),
       defaultVisible: true,
       fixed: false,
     },
     {
       id: "torrserver_direct",
-      label: _("TorrServer Direct"),
-      desc: _("Direct cgroup bypass for TorrServer"),
+      label: _tr("TorrServer Direct", "TorrServer Direct"),
+      desc: _tr(
+        "Прямой обход cgroup для TorrServer",
+        "Direct cgroup bypass for TorrServer",
+      ),
       defaultVisible: true,
       fixed: false,
     },
@@ -1745,7 +1962,7 @@ function createComponentsVisibilityWidget(option, section_id) {
 }
 
 function createSettingsContent(section, capabilities) {
-  section.tab("navigation", _("Menu & Navigation"));
+  section.tab("navigation", _tr("Меню и навигация", "Menu & Navigation"));
   section.tab("dns", _("DNS Settings"));
   section.tab("network", _("Network & Interfaces"));
   section.tab("services", _("Services & Access"));
@@ -1759,19 +1976,22 @@ function createSettingsContent(section, capabilities) {
     "navigation",
     form.ListValue,
     "default_tab",
-    _("Default Tab on Startup"),
-    _("Select which tab opens automatically when entering Tachyon."),
+    _tr("Вкладка по умолчанию при входе", "Default Tab on Startup"),
+    _tr(
+      "Выберите, какая вкладка открывается автоматически при входе в Tachyon.",
+      "Select which tab opens automatically when entering Tachyon.",
+    ),
   );
-  o.value("dashboard", _("Dashboard"));
-  o.value("section", _("Sections"));
-  o.value("server", _("Servers"));
-  o.value("profile", _("Family Profiles"));
-  o.value("schedule", _("Parental Control"));
-  o.value("monitoring", _("Monitoring"));
-  o.value("diagnostic", _("Diagnostics"));
-  o.value("updates", _("Components"));
-  o.value("settings", _("Settings"));
-  o.value("telegram", _("Telegram Bot"));
+  o.value("dashboard", _tr("Дашборд", "Dashboard"));
+  o.value("section", _tr("Секции", "Sections"));
+  o.value("server", _tr("Серверы", "Servers"));
+  o.value("profile", _tr("Семейные профили", "Family Profiles"));
+  o.value("schedule", _tr("Родительский контроль", "Parental Control"));
+  o.value("monitoring", _tr("Мониторинг", "Monitoring"));
+  o.value("diagnostic", _tr("Диагностика", "Diagnostics"));
+  o.value("updates", _tr("Компоненты", "Components"));
+  o.value("settings", _tr("Настройки", "Settings"));
+  o.value("telegram", _tr("Телеграм-бот", "Telegram Bot"));
   o.default = "dashboard";
   o.rmempty = false;
 
@@ -1779,8 +1999,9 @@ function createSettingsContent(section, capabilities) {
     "navigation",
     form.Value,
     "_tabs_order_widget",
-    _("Tab Order & Visibility"),
-    _(
+    _tr("Порядок и видимость вкладок меню", "Tab Order & Visibility"),
+    _tr(
+      "Настройте порядок и видимость вкладок главного меню. Используйте стрелки для перемещения и переключатели для показа/скрытия.",
       "Customize the order and visibility of tabs in the main navigation menu. Use the arrows to reorder and checkboxes to show or hide tabs.",
     ),
   );
@@ -1802,8 +2023,9 @@ function createSettingsContent(section, capabilities) {
     "navigation",
     form.Value,
     "_components_visibility_widget",
-    _("Component Cards Visibility"),
-    _(
+    _tr("Видимость карточек компонентов", "Component Cards Visibility"),
+    _tr(
+      "Настройте, какие карточки компонентов отображаются во вкладке «Компоненты».",
       "Customize which component cards are displayed in the Components tab. Checkboxes show or hide components.",
     ),
   );
@@ -1825,6 +2047,143 @@ function createSettingsContent(section, capabilities) {
     }
   };
   compVisOpt.remove = function () {};
+
+  // ── Dashboard Outbound Display & Navigation ──────────────────────────────
+
+  o = section.taboption(
+    "navigation",
+    form.ListValue,
+    "dashboard_country_grouping",
+    _tr("Группировка серверов по странам", "Server Grouping by Country"),
+    _tr(
+      "Выберите способ группировки и навигации по серверам на дашборде.",
+      "Choose how servers are grouped and navigated on the Dashboard.",
+    ),
+  );
+  o.value(
+    "chips",
+    _tr("Кнопки фильтра по странам (Чипсы)", "Country filter buttons (Chips)"),
+  );
+  o.value(
+    "accordion",
+    _tr("Группы по странам (Аккордеоны)", "Country groups (Accordions)"),
+  );
+  o.value("none", _tr("Отключено (Общий список)", "Disabled (Flat list)"));
+  o.default = "chips";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "navigation",
+    form.ListValue,
+    "dashboard_chips_grouping",
+    _tr("Организация чипсов стран", "Country Chips Grouping"),
+    _tr(
+      "Выберите порядок и способ отображения чипсов стран на дашборде.",
+      "Select how country chips are organized and displayed on the Dashboard.",
+    ),
+  );
+  o.value(
+    "regions",
+    _tr(
+      "По частям света (Регионы: Европа, Азия, Америка...)",
+      "By world regions (Europe, Asia, Americas...)",
+    ),
+  );
+  o.value(
+    "smart_top",
+    _tr(
+      "Умный топ (Активная и популярные страны впереди)",
+      "Smart top (Active and popular countries first)",
+    ),
+  );
+  o.value(
+    "latency",
+    _tr("По качеству связи (Пинг первыми)", "By latency (Best ping first)"),
+  );
+  o.value("alphabetical", _tr("По алфавиту (А–Я)", "Alphabetical (A–Z)"));
+  o.default = "regions";
+  o.depends("dashboard_country_grouping", "chips");
+  o.rmempty = false;
+
+  o = section.taboption(
+    "navigation",
+    form.ListValue,
+    "dashboard_country_chips_latency_mode",
+    _tr("Отображение пинга на чипсах стран", "Country Chips Ping Display"),
+    _tr(
+      "Выберите, какой пинг отображать на кнопках-чипсах стран при наличии нескольких серверов.",
+      "Choose which ping to display on country chip buttons when multiple servers exist in a country.",
+    ),
+  );
+  o.value(
+    "min",
+    _tr("Минимальный пинг (По умолчанию)", "Minimum ping (Default)"),
+  );
+  o.value("max", _tr("Максимальный пинг", "Maximum ping"));
+  o.default = "min";
+  o.depends("dashboard_country_grouping", "chips");
+  o.rmempty = false;
+
+  o = section.taboption(
+    "navigation",
+    form.ListValue,
+    "dashboard_sort_mode",
+    _tr("Сортировка серверов на дашборде", "Dashboard Server Sorting"),
+    _tr(
+      "Выберите порядок сортировки серверов на дашборде.",
+      "Select the server sorting order on the Dashboard.",
+    ),
+  );
+  o.value(
+    "latency",
+    _tr("По задержке (Пинг - По умолчанию)", "By latency (Ping - Default)"),
+  );
+  o.value(
+    "country_latency",
+    _tr("По странам, затем по задержке", "By country, then by latency"),
+  );
+  o.value(
+    "country_alpha",
+    _tr("По алфавиту (Страна и имя)", "Alphabetical (Country and name)"),
+  );
+  o.value(
+    "default",
+    _tr("Исходный порядок из подписки", "Original subscription order"),
+  );
+  o.default = "latency";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "navigation",
+    form.Flag,
+    "dashboard_hover_freeze",
+    _tr(
+      "Защита от случайных кликов (Hover Freeze)",
+      "Prevent Misclicks (Hover Freeze)",
+    ),
+    _tr(
+      "Временно фиксирует позиции карточек серверов, пока курсор мыши находится над списком, предотвращая случайные клики при обновлении пинга.",
+      "Temporarily lock server card positions while the mouse cursor is over the server grid to prevent misclicks when latencies update.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "navigation",
+    form.Flag,
+    "dashboard_show_subscription_metadata",
+    _tr(
+      "Показывать информацию о подписках на дашборде",
+      "Show Subscription Info on Dashboard",
+    ),
+    _tr(
+      "Отображать шапки с информацией о трафике, сроке действия и объявлениями подписок над списками серверов на дашборде.",
+      "Display subscription info headers (traffic usage, expiration date, announcements) above server lists on the Dashboard.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = false;
 
   // ── DNS Settings ────────────────────────────────────────────────────────
 
@@ -2002,7 +2361,14 @@ function createSettingsContent(section, capabilities) {
 
     const refreshers = settingsDnsDynamicState.refreshers.get(section_id);
     if (refreshers) {
-      refreshers.forEach((fn) => fn());
+      refreshers.forEach((fn) => {
+        if (fn() === false) {
+          refreshers.delete(fn);
+        }
+      });
+      if (refreshers.size === 0) {
+        settingsDnsDynamicState.refreshers.delete(section_id);
+      }
     }
   };
 
@@ -2268,6 +2634,139 @@ function createSettingsContent(section, capabilities) {
 
   o = section.taboption(
     "network",
+    form.ListValue,
+    "routing_strategy",
+    _tr("Глобальная стратегия маршрутизации", "Global Routing Strategy"),
+    _tr(
+      "Выберите общую модель маршрутизации: выборочный обход (по спискам секций) или «Всё в туннель» (весь трафик через прокси, кроме исключений).",
+      "Choose overall routing model: Selective split routing (only domains/subnets from sections go to proxy) or Full tunnel (all traffic routes through proxy, sections define exceptions and bypasses).",
+    ),
+  );
+  o.value(
+    "split",
+    _tr(
+      "Выборочная маршрутизация (по умолчанию)",
+      "Selective Split Routing (Default)",
+    ),
+  );
+  o.value(
+    "full_tunnel",
+    _tr(
+      "Всё в туннель, кроме исключений",
+      "Full Tunnel (All traffic via proxy, exceptions direct)",
+    ),
+  );
+  o.default = "split";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "default_tunnel_section",
+    _tr("Основная секция для туннеля", "Default Tunnel Section"),
+    _tr(
+      "Секция (прокси, VPN или группа), через которую будет направляться весь остальной трафик в режиме «Всё в туннель».",
+      "Section (proxy, VPN, or group) through which all remaining traffic will be routed in Full Tunnel mode.",
+    ),
+  );
+  o.depends("routing_strategy", "full_tunnel");
+  configureDefaultTunnelSectionOption(
+    o,
+    "default_tunnel_section",
+    capabilities,
+  );
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "proxy_mode",
+    _tr("Режим перехвата трафика", "Traffic Interception Mode"),
+    _tr(
+      "TProxy: ядро Tachyon перехватывает трафик через nftables (по умолчанию). TUN: ядро само владеет маршрутами через tun-интерфейс, nftables не перехватывает. SOCKS: прокси доступен только по SOCKS/HTTP на порту Tachyon.",
+      "TProxy: the Tachyon core intercepts traffic through nftables (default). TUN: the core owns the routes itself through a tun interface, nftables does not intercept. SOCKS: the proxy is only reachable over SOCKS/HTTP on the Tachyon port.",
+    ),
+  );
+  o.value(
+    "tproxy",
+    _tr("TProxy + nftables (по умолчанию)", "TProxy + nftables (Default)"),
+  );
+  o.value(
+    "tun",
+    _tr("TUN (ядро владеет маршрутами)", "TUN (the core owns the routes)"),
+  );
+  o.value(
+    "socks",
+    _tr(
+      "SOCKS/HTTP только (без перехвата)",
+      "SOCKS/HTTP only (no interception)",
+    ),
+  );
+  o.default = "tproxy";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "tun_interface",
+    _tr("Имя TUN-интерфейса", "TUN Interface Name"),
+    _tr(
+      "Имя tun-интерфейса, который создаёт ядро в режиме TUN.",
+      "The name of the tun interface the core creates in TUN mode.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "tun0";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.ListValue,
+    "tun_stack",
+    _tr("Сетевой стек TUN", "TUN Network Stack"),
+    _tr(
+      "Стек пользовательского пространства в tun-интерфейсе: mixed (быстрее), system (системный стек ядра), gvisor.",
+      "The user-space stack behind the tun interface: mixed (faster), system (the kernel stack), gvisor.",
+    ),
+  );
+  o.value("mixed", _tr("Mixed (по умолчанию)", "Mixed (Default)"));
+  o.value("system", _tr("System", "System"));
+  o.value("gvisor", _tr("gVisor", "gVisor"));
+  o.depends("proxy_mode", "tun");
+  o.default = "mixed";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
+    form.Flag,
+    "tun_auto_route",
+    _tr(
+      "Ядро само ставит маршрут по умолчанию",
+      "The core installs the default route itself",
+    ),
+    _tr(
+      "Ядро переносит маршрут по умолчанию в таблицу 2022 и не трогает main. Выключите, если маршруты управляются вручную.",
+      "The core moves the default route into table 2022 and leaves main alone. Turn this off when the routes are managed by hand.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "1";
+
+  o = section.taboption(
+    "network",
+    form.Value,
+    "tun_mtu",
+    _tr("MTU TUN-интерфейса", "TUN Interface MTU"),
+    _tr(
+      "MTU tun-интерфейса. Слишком большое значение ломает передачу пакетов, слишком маленькое снижает скорость.",
+      "The MTU of the tun interface. Too large a value breaks packet delivery, too small a value costs throughput.",
+    ),
+  );
+  o.depends("proxy_mode", "tun");
+  o.default = "9000";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "network",
     widgets.DeviceSelect,
     "source_network_interfaces",
     _("Source Network Interface"),
@@ -2477,7 +2976,16 @@ function createSettingsContent(section, capabilities) {
     ),
   );
   o.depends("enable_yacd_wan_access", "1");
-  o.rmempty = false;
+  o.rmempty = true;
+  o.validate = function (section_id, value) {
+    if (
+      this.section.formvalue(section_id, "enable_yacd_wan_access") === "1" &&
+      (!value || !`${value}`.trim())
+    ) {
+      return _("Secret key is required when WAN access is enabled");
+    }
+    return true;
+  };
 
   o = section.taboption(
     "services",
@@ -2485,12 +2993,12 @@ function createSettingsContent(section, capabilities) {
     "disable_quic",
     _("Disable QUIC"),
     _(
-      "Disable the QUIC protocol to improve compatibility or fix issues with video streaming. Tunneled also rejects QUIC handed to the proxy; All rejects every UDP/443 outright.",
+      "Disable the QUIC protocol to improve compatibility or fix issues with video streaming. Tunneled rejects QUIC for proxied traffic; All rejects every UDP/443 outright.",
     ),
   );
-  o.value("off", _("Off"));
-  o.value("tunneled", _("Tunneled"));
-  o.value("all", _("All"));
+  o.value("off", _("No"));
+  o.value("tunneled", _("Only for proxy"));
+  o.value("all", _("Yes (all traffic)"));
   o.default = "off";
   o.rmempty = false;
   o.cfgvalue = function (section_id) {
@@ -2651,6 +3159,36 @@ function createSettingsContent(section, capabilities) {
   );
   o.default = "1";
   o.rmempty = false;
+
+  // ── GitHub API token (issue #226) ─────────────────────────────────────────
+  // GitHub counts the unauthenticated API budget per IP. Everyone behind the
+  // same exit node (WARP, CGNAT) shares 60 requests/hour; a personal access
+  // token lifts that to 5000 per account without any other change.
+  o = section.taboption(
+    "updates",
+    form.Value,
+    "github_token",
+    _("GitHub API Token (optional)"),
+    _(
+      "Personal access token to avoid the 60 req/hour per-IP GitHub API limit during update checks. Leave empty if update checks work fine.",
+    ),
+  );
+  o.password = true;
+  o.rmempty = true;
+  o.validate = function (section_id, value) {
+    const v = (value || "").trim();
+    if (
+      v !== "" &&
+      !/^(?:gh[pousr]_[A-Za-z0-9_]{36,255}|github_pat_[A-Za-z0-9_]{22,255}|[A-Fa-f0-9]{40})$/.test(
+        v,
+      )
+    )
+      return _(
+        "Does not look like a GitHub token (expected ghp_… / github_pat_… or a 40-hex classic token)",
+      );
+    return true;
+  };
+  disablePasswordAutofill(o);
 
   o = section.taboption(
     "updates",
@@ -2863,11 +3401,23 @@ function createSettingsContent(section, capabilities) {
       ),
     ]);
 
+    let checkInFlight = false;
+
     function checkStatus() {
+      if (checkInFlight) return;
+      if (!modalBody.isConnected) {
+        stopPolling();
+        return;
+      }
+      checkInFlight = true;
       pollAttempts++;
       return fs
         .exec("/usr/bin/tachyon", ["list_update_status"])
         .then(function (res) {
+          if (!modalBody.isConnected) {
+            stopPolling();
+            return;
+          }
           let data = {};
           try {
             data = JSON.parse((res.stdout || "").trim() || "{}");
@@ -2882,7 +3432,7 @@ function createSettingsContent(section, capabilities) {
             }
             if (pollAttempts >= maxPollAttempts) {
               stopPolling();
-              ui.hideModal();
+              if (modalBody.isConnected) ui.hideModal();
               ui.addNotification(
                 null,
                 E(
@@ -2903,7 +3453,7 @@ function createSettingsContent(section, capabilities) {
               );
               detailText.style.color = "var(--color-green-base, #2ecc71)";
               setTimeout(function () {
-                ui.hideModal();
+                if (modalBody.isConnected) ui.hideModal();
                 ui.addNotification(
                   null,
                   E("p", _("Lists and rule sets successfully updated!")),
@@ -2915,7 +3465,7 @@ function createSettingsContent(section, capabilities) {
               detailText.textContent = data.message || _("Update failed");
               detailText.style.color = "var(--color-red-base, #e74c3c)";
               setTimeout(function () {
-                ui.hideModal();
+                if (modalBody.isConnected) ui.hideModal();
                 ui.addNotification(
                   null,
                   E(
@@ -2933,8 +3483,11 @@ function createSettingsContent(section, capabilities) {
         .catch(function () {
           if (pollAttempts >= maxPollAttempts) {
             stopPolling();
-            ui.hideModal();
+            if (modalBody.isConnected) ui.hideModal();
           }
+        })
+        .finally(function () {
+          checkInFlight = false;
         });
     }
 
@@ -3198,8 +3751,14 @@ function createSettingsContent(section, capabilities) {
       "Select path for tachyon-core config file. Change this ONLY if you know what you are doing",
     ),
   );
-  o.value("/etc/tachyon-core/config.json", "Flash (/etc/tachyon-core/config.json)");
-  o.value("/tmp/tachyon-core/config.json", "RAM (/tmp/tachyon-core/config.json)");
+  o.value(
+    "/etc/tachyon-core/config.json",
+    "Flash (/etc/tachyon-core/config.json)",
+  );
+  o.value(
+    "/tmp/tachyon-core/config.json",
+    "RAM (/tmp/tachyon-core/config.json)",
+  );
   o.default = "/etc/tachyon-core/config.json";
   o.rmempty = false;
 
@@ -3330,32 +3889,39 @@ function createSettingsContent(section, capabilities) {
       }
     }
 
+    const currentVal = this.cfgvalue(section_id);
+    if (currentVal && !this.keylist.includes(currentVal)) {
+      this.value(currentVal, `${_("Interface")}: ${currentVal}`);
+    }
+
     if (
       typeof network !== "undefined" &&
       typeof network.getDevices === "function"
     ) {
-      return network.getDevices().then(
-        L.bind(function (devices) {
-          (devices || []).forEach((dev) => {
-            const name =
-              typeof dev.getName === "function" ? dev.getName() : dev.name;
-            if (name && name !== "lo" && !this.keylist.includes(name)) {
-              const type =
-                typeof dev.getTypeI18n === "function"
-                  ? dev.getTypeI18n()
-                  : typeof dev.getType === "function"
-                    ? dev.getType()
-                    : "";
-              const desc = type ? ` (${type})` : "";
-              this.value(name, `${_("Interface")}: ${name}${desc}`);
-            }
-          });
-          return this.cfgvalue(section_id);
-        }, this),
-      );
+      network
+        .getDevices()
+        .then(
+          L.bind(function (devices) {
+            (devices || []).forEach((dev) => {
+              const name =
+                typeof dev.getName === "function" ? dev.getName() : dev.name;
+              if (name && name !== "lo" && !this.keylist.includes(name)) {
+                const type =
+                  typeof dev.getTypeI18n === "function"
+                    ? dev.getTypeI18n()
+                    : typeof dev.getType === "function"
+                      ? dev.getType()
+                      : "";
+                const desc = type ? ` (${type})` : "";
+                this.value(name, `${_("Interface")}: ${name}${desc}`);
+              }
+            });
+          }, this),
+        )
+        .catch(() => null);
     }
 
-    return this.cfgvalue(section_id);
+    return currentVal;
   };
   o.write = function (section_id, value) {
     const normalized = value ? `${value}`.trim() : "";
@@ -3430,6 +3996,7 @@ function createSettingsContent(section, capabilities) {
   );
   o.password = true;
   o.rmempty = true;
+  disablePasswordAutofill(o);
 
   // AI Doctor (ChatGPT / LLM Integration)
   o = section.taboption(
@@ -3468,7 +4035,7 @@ function createSettingsContent(section, capabilities) {
     "ai_doctor_model",
     _("AI Model"),
     _(
-      "Model name to use. Leave empty to use default (gpt-6-luna / claude-haiku-4-5 / deepseek-chat / gemini-2.5-flash / llama3.2).",
+      "Model name to use. Leave empty to auto-detect or use provider default (gpt-4o-mini / claude-haiku-4-5 / deepseek-chat / gemini-2.5-flash / llama3.2).",
     ),
   );
   o.depends("enable_ai_doctor", "1");
@@ -3499,6 +4066,7 @@ function createSettingsContent(section, capabilities) {
   o.depends("enable_ai_doctor", "1");
   o.password = true;
   o.rmempty = true;
+  disablePasswordAutofill(o);
 
   o = section.taboption(
     "ai",
@@ -3506,14 +4074,12 @@ function createSettingsContent(section, capabilities) {
     "ai_doctor_custom_url",
     _("Custom API Endpoint URL"),
     _(
-      "Custom OpenAI-compatible API endpoint URL (e.g. http://192.168.1.100:11434/v1/chat/completions or https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)",
+      "Custom OpenAI-compatible API endpoint or base URL (e.g. http://192.168.1.100:1234 or http://192.168.1.100:11434/v1/chat/completions). Leave empty to use official provider URL.",
     ),
   );
-  o.depends("ai_doctor_provider", "custom");
-  o.depends("ai_doctor_provider", "ollama");
-  o.depends("ai_doctor_provider", "lmstudio");
+  o.depends("enable_ai_doctor", "1");
   o.rmempty = true;
-  o.placeholder = "http://192.168.1.100:11434/v1/chat/completions";
+  o.placeholder = "http://192.168.1.100:1234/v1/chat/completions";
 
   // RAG (Knowledge Base Retrieval)
   o = section.taboption(
@@ -4014,7 +4580,20 @@ function createTelegramStatusWidget() {
     }
   }
 
-  function refreshStatus() {
+  let tgInFlight = false;
+  let tgHasMounted = false;
+  let tgLoadedOnce = false;
+
+  function refreshStatus(force) {
+    if (tgInFlight) return Promise.resolve();
+    if (
+      !force &&
+      (!wrapper.isConnected || wrapper.offsetParent === null || document.hidden)
+    ) {
+      return Promise.resolve();
+    }
+    tgInFlight = true;
+    tgLoadedOnce = true;
     return fs
       .exec("/usr/bin/tachyon", ["telegram_status"])
       .then(function (res) {
@@ -4026,6 +4605,9 @@ function createTelegramStatusWidget() {
       .catch(function () {
         dot.style.background = "#aaa";
         statusText.textContent = _("Unknown");
+      })
+      .finally(function () {
+        tgInFlight = false;
       });
   }
 
@@ -4035,7 +4617,7 @@ function createTelegramStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["telegram_start"])
       .then(function () {
         statusMsg.textContent = "";
-        return refreshStatus();
+        return refreshStatus(true);
       })
       .catch(function () {
         statusMsg.textContent = _("Failed to start bot");
@@ -4049,7 +4631,7 @@ function createTelegramStatusWidget() {
     fs.exec("/usr/bin/tachyon", ["telegram_stop"])
       .then(function () {
         statusMsg.textContent = "";
-        return refreshStatus();
+        return refreshStatus(true);
       })
       .catch(function () {
         statusMsg.textContent = _("Failed to stop bot");
@@ -4062,17 +4644,29 @@ function createTelegramStatusWidget() {
   wrapper.appendChild(btnStop);
   wrapper.appendChild(statusMsg);
 
-  // Initial status fetch
-  refreshStatus();
+  let tgVisibilityObserver = null;
+  if (typeof IntersectionObserver !== "undefined") {
+    tgVisibilityObserver = new IntersectionObserver(function (entries) {
+      if (entries.some((e) => e.isIntersecting) && !tgLoadedOnce) {
+        refreshStatus(true);
+      }
+    });
+    tgVisibilityObserver.observe(wrapper);
+  } else {
+    refreshStatus(true);
+  }
+
   // Refresh every 10s while visible
-  const timer = setInterval(refreshStatus, 10000);
-  const observer = new MutationObserver(function () {
-    if (!document.body.contains(wrapper)) {
+  const timer = setInterval(function () {
+    if (wrapper.isConnected) {
+      tgHasMounted = true;
+    } else if (tgHasMounted) {
       clearInterval(timer);
-      observer.disconnect();
+      if (tgVisibilityObserver) tgVisibilityObserver.disconnect();
+      return;
     }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+    refreshStatus(false);
+  }, 10000);
 
   return wrapper;
 }
@@ -4114,6 +4708,7 @@ function createTelegramContent(section) {
     }
     return true;
   };
+  disablePasswordAutofill(o);
   o.write = function (section_id, value) {
     const val = value ? `${value}`.trim() : "";
     if (val) {

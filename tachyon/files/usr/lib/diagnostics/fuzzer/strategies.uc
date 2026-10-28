@@ -37,7 +37,7 @@ const USER_PRESETS_FILE = "/etc/tachyon/dpi-presets-user.json";
 const DEFAULT_PATTERNS = {
     zapret2: {
         splits: [ "1", "2", "3", "midsld", "sniext+2", "sniext+4", "1,midsld", "1,sniext+2" ],
-        foolings: [ "badseq", "md5sig", "badack", "datanoack", "fakeddrop" ],
+        foolings: [ "tcp_seq=1000000", "tcp_md5", "tcp_ack=-66000", "tcp_flags_unset=ack", "badsum" ],
         ttls: [ 2, 3, 4, 5, 6, 8 ],
         seqovls: [ "1", "2" ],
         wsizes: [ "1" ],
@@ -60,6 +60,14 @@ const DEFAULT_PATTERNS = {
         autos: [ "t,r,a,s", "r,s", "t,a" ],
         tlsrecs: [ "1+sniext" ],
         ipfrags: [ "24" ]
+    },
+    desync: {
+        presets: [ "fake_split", "tlsrec", "disorder", "split", "fake", "oob", "auto" ],
+        modes: [ "fake_split", "tlsrec", "disorder", "split", "fake", "oob" ],
+        splits: [ "1", "2", "midsld", "sni" ],
+        ttls: [ 3, 4, 5, 6, 8 ],
+        fake_snis: [ "www.google.com", "max.ru", "gosuslugi.ru", "sberbank.ru" ],
+        repeats: [ 2, 4, 6, 8 ]
     },
     custom_strategies: []
 };
@@ -203,6 +211,13 @@ const STRATEGIES_ZAPRET2 = [
         args: "--filter-udp=443 --filter-l7=quic --payload=quic_initial --lua-desync=fake:blob=quic_google:repeats=11",
         description: "UDP fake desync using 1200-byte Google QUIC Initial blob with 11 repeats."
     },
+    {
+        id: "z2_game_udp",
+        name: "Gaming & Generic UDP Fake Desync (Fortnite, Voice)",
+        engine: "zapret2",
+        args: "--filter-udp=1024-65535 --out-range=-d2 --lua-desync=fake:blob=stun_fake:payload=all",
+        description: "UDP fake packet desync for custom gaming and voice protocols. Uses payload=all to allow fake packet injection on unknown/proprietary UDP payloads where nfqws2 has no built-in L7 dissector."
+    },
 
     // ── 6. ADVANCED REORDER & FAKED SEGMENTS ────────────────────────────────────
     {
@@ -260,42 +275,42 @@ const STRATEGIES_ZAPRET2 = [
         id: "z2_fake_ttl3_md5sig",
         name: "Fake (TTL=3, MD5Sig) + Multisplit",
         engine: "zapret2",
-        args: "--lua-desync=fake:ttl=3:fooling=tcp_md5 --lua-desync=multisplit:pos=1,midsld",
+        args: "--lua-desync=fake:blob=tls_max:ip_ttl=3:fooling=tcp_md5 --lua-desync=multisplit:pos=1,midsld",
         description: "Aggressive low-TTL MD5Sig injection for close TSPU hops."
     },
     {
         id: "z2_fake_ttl4_badseq",
         name: "Fake (TTL=4, BadSeq) + Multisplit",
         engine: "zapret2",
-        args: "--lua-desync=fake:ttl=4:fooling=tcp_seq=1000000 --lua-desync=multisplit:pos=1,midsld",
+        args: "--lua-desync=fake:blob=tls_max:ip_ttl=4:fooling=tcp_seq=1000000 --lua-desync=multisplit:pos=1,midsld",
         description: "Low-TTL fake ClientHello with badseq fooling and multisplit segmentation."
     },
     {
         id: "z2_fake_ttl5_md5sig",
         name: "Fake (TTL=5, MD5Sig) + Multisplit",
         engine: "zapret2",
-        args: "--lua-desync=fake:ttl=5:fooling=tcp_md5 --lua-desync=multisplit:pos=1,midsld",
+        args: "--lua-desync=fake:blob=tls_max:ip_ttl=5:fooling=tcp_md5 --lua-desync=multisplit:pos=1,midsld",
         description: "MD5Sig TCP option drops packet at DPI while reaching end server."
     },
     {
         id: "z2_fake_ttl6_badack",
         name: "Fake (TTL=6, BadACK) + Multisplit",
         engine: "zapret2",
-        args: "--lua-desync=fake:ttl=6:fooling=tcp_ack=1000000 --lua-desync=multisplit:pos=1,sniext+2",
+        args: "--lua-desync=fake:blob=tls_max:ip_ttl=6:fooling=tcp_ack=1000000 --lua-desync=multisplit:pos=1,sniext+2",
         description: "BadACK fooling invalidates packet in DPI state tracking."
     },
     {
         id: "z2_fake_badseq_mid",
         name: "Fake Packet (TTL=8) + MidSLD Split",
         engine: "zapret2",
-        args: "--lua-desync=fake:ttl=8:fooling=tcp_seq=1000000 --lua-desync=multisplit:pos=midsld",
+        args: "--lua-desync=fake:blob=tls_max:ip_ttl=8:fooling=tcp_seq=1000000 --lua-desync=multisplit:pos=midsld",
         description: "Injects fake ClientHello before segmented payload."
     },
     {
         id: "z2_fake_datanoack",
         name: "Fake (TTL=8, DataNoAck) + Multisplit",
         engine: "zapret2",
-        args: "--lua-desync=fake:ttl=8:fooling=tcp_flags_unset=ack --lua-desync=multisplit:pos=1",
+        args: "--lua-desync=fake:blob=tls_max:ip_ttl=8:fooling=tcp_flags_unset=ack --lua-desync=multisplit:pos=1",
         description: "DataNoAck fooling confuses stateful DPI without triggering ACK RST."
     },
     {
@@ -983,6 +998,138 @@ const STRATEGIES_BYEDPI = [
     }
 ];
 
+const STRATEGIES_DESYNC = [
+    // ── 1. BUILT-IN CORE PRESETS ───────────────────────────────────────────────
+    {
+        id: "ds_preset_fake_split",
+        name: "Native Desync Preset: Fake + Split (midsld, TTL=6, UDP Fake)",
+        engine: "desync",
+        args: "preset=fake_split",
+        description: "Built-in tachyon-core default preset: low-TTL Fake ClientHello + mid-SLD TCP split + UDP QUIC/STUN fake."
+    },
+    {
+        id: "ds_preset_tlsrec",
+        name: "Native Desync Preset: TLS Record Split (pos=sni)",
+        engine: "desync",
+        args: "preset=tlsrec",
+        description: "Built-in tachyon-core RFC-compliant outer TLS Record splitting at SNI extension."
+    },
+    {
+        id: "ds_preset_disorder",
+        name: "Native Desync Preset: TTL=1 Disorder (pos=1)",
+        engine: "desync",
+        args: "preset=disorder",
+        description: "Built-in tachyon-core TTL=1 first-segment drop forcing server retransmission disorder."
+    },
+    {
+        id: "ds_preset_split",
+        name: "Native Desync Preset: Mid-SLD Split",
+        engine: "desync",
+        args: "preset=split",
+        description: "Built-in tachyon-core clean TCP segment split at middle of second-level domain."
+    },
+    {
+        id: "ds_preset_fake",
+        name: "Native Desync Preset: Low-TTL Fake Only (TTL=6, UDP Fake)",
+        engine: "desync",
+        args: "preset=fake",
+        description: "Built-in tachyon-core fake ClientHello + UDP QUIC/STUN fake injection without splitting."
+    },
+    {
+        id: "ds_preset_oob",
+        name: "Native Desync Preset: TCP Out-Of-Band URG (pos=1)",
+        engine: "desync",
+        args: "preset=oob",
+        description: "Built-in tachyon-core TCP MSG_OOB urgent byte injection + 1-byte split."
+    },
+
+    // ── 2. TUNED MODE & PARAMETER STRATEGIES ───────────────────────────────────
+    {
+        id: "ds_fake_split_midsld_ttl4_max",
+        name: "Fake + Split (midsld, TTL=4, max.ru, repeats=6)",
+        engine: "desync",
+        args: "mode=fake_split split_pos=midsld fake_ttl=4 fake_sni=max.ru repeats=6",
+        description: "Low-TTL max.ru fake ClientHello burst followed by mid-SLD split."
+    },
+    {
+        id: "ds_fake_split_midsld_ttl6_google",
+        name: "Fake + Split (midsld, TTL=6, www.google.com, repeats=6)",
+        engine: "desync",
+        args: "mode=fake_split split_pos=midsld fake_ttl=6 fake_sni=www.google.com repeats=6",
+        description: "TTL=6 Google fake ClientHello burst followed by mid-SLD split."
+    },
+    {
+        id: "ds_fake_split_sni_ttl5_gosuslugi",
+        name: "Fake + Split (sni, TTL=5, gosuslugi.ru, repeats=6)",
+        engine: "desync",
+        args: "mode=fake_split split_pos=sni fake_ttl=5 fake_sni=gosuslugi.ru repeats=6",
+        description: "Gosuslugi fake ClientHello with SNI extension boundary split."
+    },
+    {
+        id: "ds_fake_split_pos1_ttl4_sber",
+        name: "Fake + Split (pos=1, TTL=4, sberbank.ru, repeats=6)",
+        engine: "desync",
+        args: "mode=fake_split split_pos=1 fake_ttl=4 fake_sni=sberbank.ru repeats=6",
+        description: "1-byte ClientHello split preceded by Sberbank low-TTL fake burst."
+    },
+    {
+        id: "ds_fake_split_pos2_ttl8_max",
+        name: "Fake + Split (pos=2, TTL=8, max.ru, repeats=8)",
+        engine: "desync",
+        args: "mode=fake_split split_pos=2 fake_ttl=8 fake_sni=max.ru repeats=8",
+        description: "Higher TTL=8 fake burst for distant ISP TSPU hops + 2-byte split."
+    },
+    {
+        id: "ds_tlsrec_midsld",
+        name: "TLS Record Split (pos=midsld, delay=2ms)",
+        engine: "desync",
+        args: "mode=tlsrec split_pos=midsld split_delay_ms=2",
+        description: "Splits outer TLS record header right at middle of domain name."
+    },
+    {
+        id: "ds_tlsrec_pos2",
+        name: "TLS Record Split (pos=2, delay=1ms)",
+        engine: "desync",
+        args: "mode=tlsrec split_pos=2 split_delay_ms=1",
+        description: "2-byte TLS record split for stateless DPI parsers."
+    },
+    {
+        id: "ds_disorder_midsld",
+        name: "TTL=1 Disorder (pos=midsld)",
+        engine: "desync",
+        args: "mode=disorder split_pos=midsld",
+        description: "Drops initial segment up to mid-SLD at TTL=1 so real second segment arrives first."
+    },
+    {
+        id: "ds_disorder_sni",
+        name: "TTL=1 Disorder (pos=sni)",
+        engine: "desync",
+        args: "mode=disorder split_pos=sni",
+        description: "Drops initial segment up to SNI extension at TTL=1 to desynchronize stateful DPI."
+    },
+    {
+        id: "ds_split_sni_delay2",
+        name: "TCP Split (pos=sni, delay=2ms)",
+        engine: "desync",
+        args: "mode=split split_pos=sni split_delay_ms=2",
+        description: "Clean TCP segmentation at SNI extension with 2ms pacing."
+    },
+    {
+        id: "ds_oob_midsld",
+        name: "TCP Out-Of-Band URG Desync (pos=midsld)",
+        engine: "desync",
+        args: "mode=oob split_pos=midsld",
+        description: "Injects TCP URG out-of-band byte and splits at mid-SLD."
+    },
+    {
+        id: "ds_discord_voice_combo",
+        name: "Discord TCP + UDP Voice Fake Burst (midsld, TTL=6, UDP=8x)",
+        engine: "desync",
+        args: "mode=fake_split split_pos=midsld fake_ttl=6 fake_sni=www.google.com repeats=4 udp_fake=true udp_repeats=8 udp_fake_ttl=6",
+        description: "Combined TCP Fake+Split and 8x UDP STUN/QUIC fake burst for Discord & WebRTC."
+    }
+];
+
 const PRESETS_MIRRORS = [
     "https://raw.githubusercontent.com/Dushnilin/tachyon/main/tachyon/files/usr/share/tachyon/dpi-presets.json",
     "https://gh-proxy.com/https://raw.githubusercontent.com/Dushnilin/tachyon/main/tachyon/files/usr/share/tachyon/dpi-presets.json",
@@ -1109,6 +1256,7 @@ function get_patterns_config() {
             zapret2: custom.zapret2 || DEFAULT_PATTERNS.zapret2,
             zapret: custom.zapret || DEFAULT_PATTERNS.zapret,
             byedpi: custom.byedpi || DEFAULT_PATTERNS.byedpi,
+            desync: custom.desync || DEFAULT_PATTERNS.desync,
             custom_strategies: custom.custom_strategies || []
         };
     }
@@ -1128,6 +1276,17 @@ function save_patterns_config(cfg_obj) {
 function reset_patterns_config() {
     try { fs.unlink(PATTERNS_FILE); } catch(e) {}
     print(sprintf("%J\n", { success: true, message: "Patterns configuration reset to factory defaults", patterns: DEFAULT_PATTERNS }));
+}
+
+function normalize_z2_fooling(f) {
+    f = trim(as_string(f || ""));
+    if (f == "badseq") return "tcp_seq=1000000";
+    if (f == "md5sig") return "tcp_md5";
+    if (f == "badack") return "tcp_ack=-66000";
+    if (f == "datanoack") return "tcp_flags_unset=ack";
+    if (f == "fakeddrop" || f == "fakedrop") return "badsum";
+    if (f == "ts") return "tcp_ts=-600000";
+    return f;
 }
 
 function generate_combinatorial_zapret2() {
@@ -1161,7 +1320,12 @@ function generate_combinatorial_zapret2() {
     }
     
     let splits = p.splits || [ "1", "2", "3", "midsld", "sniext+2", "sniext+4", "1,midsld", "1,sniext+2" ];
-    let foolings = p.foolings || [ "badseq", "md5sig", "badack", "datanoack", "fakeddrop" ];
+    let raw_foolings = p.foolings || [ "tcp_seq=1000000", "tcp_md5", "tcp_ack=-66000", "tcp_flags_unset=ack", "badsum" ];
+    let foolings = [];
+    for (let rf in raw_foolings) {
+        let nf = normalize_z2_fooling(rf);
+        if (nf != "" && index(foolings, nf) < 0) push(foolings, nf);
+    }
     let ttls = p.ttls || [ 2, 3, 4, 5, 6, 8 ];
     let seqovls = p.seqovls || [ "1", "2" ];
     let wsizes = p.wsizes || [ "1" ];
@@ -1176,12 +1340,12 @@ function generate_combinatorial_zapret2() {
                 "Multisplit position and fooling method");
         }
         for (let sq in seqovls) {
-            add(sprintf("Multisplit + SeqOvl %s (pos=%s, badseq)", sq, pos),
+            add(sprintf("Multisplit + SeqOvl %s (pos=%s, tcp_seq)", sq, pos),
                 sprintf("--lua-desync=multisplit:pos=%s:seqovl=%s:fooling=tcp_seq=1000000", pos, sq),
                 "Multisplit with sequence overlap");
         }
         for (let w in wsizes) {
-            add(sprintf("Multisplit + Window %s (pos=%s, badseq)", w, pos),
+            add(sprintf("Multisplit + Window %s (pos=%s, tcp_seq)", w, pos),
                 sprintf("--lua-desync=multisplit:pos=%s:wsize=%s:fooling=tcp_seq=1000000", pos, w),
                 "Multisplit with TCP window size clamping");
         }
@@ -1189,7 +1353,7 @@ function generate_combinatorial_zapret2() {
     
     // 2. Multidisorder combinations
     for (let pos in [ "2", "midsld", "1,midsld" ]) {
-        for (let fooling in [ "badseq", "md5sig", "badack" ]) {
+        for (let fooling in [ "tcp_seq=1000000", "tcp_md5", "tcp_ack=-66000" ]) {
             add(sprintf("Multidisorder (pos=%s, %s)", pos, fooling),
                 sprintf("--lua-desync=multidisorder:pos=%s:fooling=%s", pos, fooling),
                 "Out-of-order segment delivery with fooling");
@@ -1243,14 +1407,14 @@ function generate_combinatorial_zapret2() {
     
     // 6. Low-TTL Fake combinations
     for (let ttl in ttls) {
-        for (let fooling in [ "badseq", "md5sig", "badack" ]) {
+        for (let fooling in [ "tcp_seq=1000000", "tcp_md5", "tcp_ack=-66000" ]) {
             for (let pos in [ "1", "1,midsld", "midsld" ]) {
                 add(sprintf("Fake (TTL=%d, %s) + Multisplit (pos=%s)", ttl, fooling, pos),
-                    sprintf("--lua-desync=fake:ttl=%d:fooling=%s --lua-desync=multisplit:pos=%s", ttl, fooling, pos),
+                    sprintf("--lua-desync=fake:blob=tls_max:ip_ttl=%d:fooling=%s --lua-desync=multisplit:pos=%s", ttl, fooling, pos),
                     "Low-TTL fake injection followed by multisplit payload");
                 let dis_pos = (pos == "1") ? "2" : pos;
                 add(sprintf("Fake (TTL=%d, %s) + Multidisorder (pos=%s)", ttl, fooling, dis_pos),
-                    sprintf("--lua-desync=fake:ttl=%d:fooling=%s --lua-desync=multidisorder:pos=%s", ttl, fooling, dis_pos),
+                    sprintf("--lua-desync=fake:blob=tls_max:ip_ttl=%d:fooling=%s --lua-desync=multidisorder:pos=%s", ttl, fooling, dis_pos),
                     "Low-TTL fake injection followed by multidisorder payload");
             }
         }
@@ -1478,6 +1642,70 @@ function generate_combinatorial_byedpi() {
     return list;
 }
 
+function generate_combinatorial_desync() {
+    let cfg = get_patterns_config();
+    let p = cfg.desync || DEFAULT_PATTERNS.desync;
+    let list = [];
+    let seen = {};
+
+    let add = function(name, args, desc) {
+        args = trim(as_string(args));
+        if (args == "" || seen[args]) return;
+        if (!fuzzer_runner.validate_strategy_args("desync", args)) return;
+        seen[args] = true;
+        push(list, {
+            id: sprintf("ds_gen_%d", length(list) + 1),
+            name: name,
+            engine: "desync",
+            args: args,
+            description: desc
+        });
+    };
+
+    for (let s in STRATEGIES_DESYNC) add(s.name, s.args, s.description);
+
+    if (cfg.custom_strategies && length(cfg.custom_strategies) > 0) {
+        for (let cs in cfg.custom_strategies) {
+            if (cs && cs.engine == "desync" && cs.args) {
+                add(cs.name || "Custom Desync", cs.args, cs.description || "User custom strategy");
+            }
+        }
+    }
+
+    let presets = p.presets || DEFAULT_PATTERNS.desync.presets;
+    for (let pr in presets) {
+        add(sprintf("Preset: %s", pr), sprintf("preset=%s", pr), "Built-in tachyon-core desync preset");
+    }
+
+    let modes = p.modes || DEFAULT_PATTERNS.desync.modes;
+    let splits = p.splits || p.split_poses || [ "1", "2", "midsld", "sni" ];
+    let ttls = p.ttls || p.fake_ttls || [ 3, 4, 5, 6, 8 ];
+    let fake_snis = p.fake_snis || [ "www.google.com", "max.ru", "gosuslugi.ru" ];
+
+    for (let mode in modes) {
+        for (let pos in splits) {
+            if (index(mode, "fake") >= 0 || mode == "disorder") {
+                for (let ttl in ttls) {
+                    for (let fsni in fake_snis) {
+                        add(sprintf("%s (pos=%s, TTL=%d, sni=%s)", mode, pos, ttl, fsni),
+                            sprintf("mode=%s split_pos=%s fake_ttl=%d fake_sni=%s repeats=6", mode, pos, ttl, fsni),
+                            "Combinatorial native desync fake + split/disorder");
+                    }
+                }
+            } else {
+                add(sprintf("%s (pos=%s)", mode, pos),
+                    sprintf("mode=%s split_pos=%s", mode, pos),
+                    "Combinatorial native desync segmentation");
+                add(sprintf("%s (pos=%s, delay=2ms)", mode, pos),
+                    sprintf("mode=%s split_pos=%s split_delay_ms=2", mode, pos),
+                    "Combinatorial native desync segmentation with 2ms delay");
+            }
+        }
+    }
+
+    return list;
+}
+
 // ── Target port profiles ─────────────────────────────────────────────────────
 // The generic lists are all TCP/443 TLS desync, so a Discord run over them cannot
 // find a fix for voice: the traffic the DPI actually touches is UDP STUN/RTP on
@@ -1633,11 +1861,11 @@ function generate_adaptive_strategies(engine, target) {
         add("SYN Data + Window Clamp wsize=1",
             "--lua-desync=syndata --lua-desync=multisplit:pos=1,midsld:wsize=1",
             "SYN data injection with 1-byte TCP window clamping");
-        for (let fooling in [ "badseq", "fakeddrop", "badack" ]) {
+        for (let fooling in [ "tcp_seq=1000000", "badsum", "tcp_ack=-66000" ]) {
             for (let ttl in [ 3, 4, 6 ]) {
                 for (let pos in [ "1", "1,midsld", "sniext+4" ]) {
                     add(sprintf("Fake (%s, ttl=%d) + Multisplit %s", fooling, ttl, pos),
-                        sprintf("--lua-desync=fake:blob=tls_max:repeats=6:ttl=%d:fooling=%s --lua-desync=multisplit:pos=%s", ttl, fooling, pos),
+                        sprintf("--lua-desync=fake:blob=tls_max:repeats=6:ip_ttl=%d:fooling=%s --lua-desync=multisplit:pos=%s", ttl, fooling, pos),
                         "Evolved fake desync parameter combination");
                 }
             }
@@ -1678,6 +1906,26 @@ function generate_adaptive_strategies(engine, target) {
                     sprintf("--split %s --fake -1 --ttl %d", s, ttl),
                     "ByeDPI fake injection with split");
             }
+        }
+    }
+
+    if (engine == "desync" || engine == "all") {
+        let add_ds = function(name, args, desc) {
+            args = trim(as_string(args));
+            if (args == "" || seen[args]) return;
+            if (!fuzzer_runner.validate_strategy_args("desync", args)) return;
+            seen[args] = true;
+            push(list, {
+                id: sprintf("adapt_desync_%d", length(list) + 1),
+                name: name,
+                engine: "desync",
+                args: args,
+                description: desc || "Adaptive native desync strategy",
+                rationale: "Synthesized from target profile for tachyon-core desync"
+            });
+        };
+        for (let s in STRATEGIES_DESYNC) {
+            add_ds(s.name, s.args, s.description);
         }
     }
 
@@ -1726,10 +1974,12 @@ function get_strategies_for_engine(engine, mode, target) {
         if (engine == "zapret2") combo = generate_combinatorial_zapret2();
         else if (engine == "zapret") combo = generate_combinatorial_zapret();
         else if (engine == "byedpi") combo = generate_combinatorial_byedpi();
+        else if (engine == "desync") combo = generate_combinatorial_desync();
         else if (engine == "all") {
             for (let s in generate_combinatorial_zapret2()) push(combo, s);
             for (let s in generate_combinatorial_zapret()) push(combo, s);
             for (let s in generate_combinatorial_byedpi()) push(combo, s);
+            for (let s in generate_combinatorial_desync()) push(combo, s);
         }
 
         let avail_kb = fuzzer_runner.get_system_memory_kb();
@@ -1744,15 +1994,18 @@ function get_strategies_for_engine(engine, mode, target) {
     let has_z2 = binaries.get_zapret2_bin() != null;
     let has_z1 = binaries.get_zapret_bin() != null;
     let has_bd = binaries.get_byedpi_bin() != null;
+    let has_ds = binaries.get_desync_bin() != null;
 
     let base = [];
     if (engine == "zapret2") base = STRATEGIES_ZAPRET2;
     else if (engine == "zapret") { base = []; for (let s in STRATEGIES_ZAPRET) push(base, s); for (let s in STRATEGIES_FLOWSEAL) push(base, s); }
     else if (engine == "byedpi") base = STRATEGIES_BYEDPI;
+    else if (engine == "desync") base = STRATEGIES_DESYNC;
     else if (engine == "all") {
         if (has_z2) for (let s in STRATEGIES_ZAPRET2) push(base, s);
         if (has_z1) { for (let s in STRATEGIES_ZAPRET) push(base, s); for (let s in STRATEGIES_FLOWSEAL) push(base, s); }
         if (has_bd) for (let s in STRATEGIES_BYEDPI) push(base, s);
+        if (has_ds) for (let s in STRATEGIES_DESYNC) push(base, s);
     }
     
     let result = [];
@@ -1915,6 +2168,7 @@ function module_exports() {
         STRATEGIES_ZAPRET,
         STRATEGIES_FLOWSEAL,
         STRATEGIES_BYEDPI,
+        STRATEGIES_DESYNC,
         PATTERNS_FILE,
         BUILTIN_PRESETS_FILE,
         USER_PRESETS_FILE,
@@ -1935,6 +2189,7 @@ function module_exports() {
         generate_combinatorial_zapret2,
         generate_combinatorial_zapret,
         generate_combinatorial_byedpi,
+        generate_combinatorial_desync,
         generate_adaptive_strategies,
         get_strategies_for_engine,
         get_presets_info,

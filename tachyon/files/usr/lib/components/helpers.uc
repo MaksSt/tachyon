@@ -33,6 +33,7 @@ let bounded_command = common.bounded_command;
 let tmp_dir = "";
 let current_job_phase = "";
 let job_phase_started_at = 0;
+let _seen_unreachable_hosts = {};
 
 // ============================================================================
 // Generic command and filesystem utilities
@@ -181,7 +182,70 @@ function job_log_append(message, level) {
     file.close();
 }
 
+function get_ui_language() {
+    try {
+        let uci = require("core.uci");
+        let lang = uci && uci.available() ? trim(as_string(uci.get("luci.main.lang") || "")) : "";
+        lang = lc(lang);
+        if (lang == "ru" || lang == "ru_ru")
+            return "ru";
+        if (lang == "en")
+            return "en";
+        if (fs.stat("/usr/lib/lua/luci/i18n/tachyon.ru.lmo") != null)
+            return "ru";
+    } catch (e) {}
+    return "en";
+}
+
+function sanitize_package_log_line(message) {
+    let str = trim(as_string(message));
+    if (str == "")
+        return null;
+
+    // Suppress raw wget failure messages triggered during repository index refresh (apk / opkg)
+    // and harmless upstream zapret2 postinst nftables IPv6/IPv4 exclude set warnings (#205)
+    if (match(str, /^ERROR:[ \t]+wget:[ \t]+exited with error/i) ||
+        match(str, /^\*?[ \t]*wget(:[ \t]+|Failed)/i) ||
+        match(str, /^Collected errors:/i) ||
+        match(str, /^\*?[ \t]*opkg_download:[ \t]+Check your network settings/i) ||
+        match(str, /^\*?[ \t]*sh:[ \t]+write error:[ \t]+Broken pipe/i) ||
+        match(str, /^\*?[ \t]*\/dev\/stdin:[0-9]+:[0-9-]+:[ \t]+Error:[ \t]+Could not resolve hostname:[ \t]+Name has no usable address/i) ||
+        match(str, /^\*?[ \t]*(::1|fc00::\/7|fe80::\/10),?[ \t]*$/i) ||
+        match(str, /^\*?[ \t]*\^+[ \t]*$/) ||
+        match(str, /^\*?[ \t]*Notice:[ \t]+Service[ \t]+\/etc\/init\.d\/zapret2\b.*option[ \t]+run_on_boot[ \t]+is[ \t]+not[ \t]+set/i))
+        return null;
+
+    // Format apk/opkg repository index warnings into calm, informative notices
+    let host = null;
+    let m_apk = match(str, /^WARNING:[ \t]+updating([ \t]+and[ \t]+opening)?[ \t]+https?:\/\/([^\/:]+)/i);
+    if (m_apk && m_apk[2]) {
+        host = m_apk[2];
+    } else {
+        let m_opkg = match(str, /^\*?[ \t]*opkg_download:[ \t]+Failed to download[ \t]+https?:\/\/([^\/:]+)/i);
+        if (m_opkg && m_opkg[1])
+            host = m_opkg[1];
+    }
+
+    if (host) {
+        if (_seen_unreachable_hosts[host] === true)
+            return null;
+        _seen_unreachable_hosts[host] = true;
+        let lang = get_ui_language();
+        if (lang == "ru") {
+            return sprintf("Пропуск недоступного репозитория: %s (не критично при обновлении)", host);
+        } else {
+            return sprintf("Skipping unreachable package feed: %s (non-critical)", host);
+        }
+    }
+
+    return message;
+}
+
 function updates_log(message, level) {
+    let sanitized = sanitize_package_log_line(message);
+    if (sanitized == null)
+        return;
+    message = sanitized;
     level = as_string(level || "info");
     log_message("Updates: " + as_string(message), level);
     job_log_append(message, level);
@@ -626,10 +690,7 @@ function service_proxy_address() {
     if (file_exists(LIB_DIR + "/service/state.uc") &&
         !module_success([ LIB_DIR + "/service/state.uc", "sing-box-service-running" ]))
         return "";
-    let addr = trim(module_output([ LIB_DIR + "/tachyon_core/runtime.uc", "service-proxy-address", "components" ]));
-    if (addr == "")
-        addr = trim(module_output([ LIB_DIR + "/tachyon_core/runtime.uc", "service-proxy-address", "lists" ]));
-    return addr;
+    return trim(module_output([ LIB_DIR + "/tachyon_core/runtime.uc", "service-proxy-address", "components" ]));
 }
 
 // Forward-referenced helpers
@@ -685,7 +746,9 @@ job_log_time,
         stream_command_output,
         run_logged_retrying,
         read_openwrt_release_value,
-        service_proxy_address
+        service_proxy_address,
+        get_ui_language,
+        sanitize_package_log_line
     };
 }
 

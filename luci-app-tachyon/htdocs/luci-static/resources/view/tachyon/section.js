@@ -35,7 +35,13 @@ const ROUTING_ACTIONS = [
   "sudoku",
   "masque",
   "openvpn",
+  "openconnect",
+  "desync",
+  "shadowtls",
+  "trusttunnel",
+  "tewfai",
   "hosts",
+  "group",
 ];
 const CONNECTIONS_BLOCKED_INTERFACES = [
   "br-lan",
@@ -112,7 +118,13 @@ function isOutboundDetourTargetSection(section, currentSectionId) {
       "sudoku",
       "masque",
       "openvpn",
+      "openconnect",
       "fptn",
+      "desync",
+      "shadowtls",
+      "trusttunnel",
+      "tewfai",
+      "group",
     ].includes(action)
   );
 }
@@ -168,7 +180,13 @@ function isDnsDetourTargetSection(section, currentSectionId) {
       "sudoku",
       "masque",
       "openvpn",
+      "openconnect",
       "fptn",
+      "desync",
+      "shadowtls",
+      "trusttunnel",
+      "tewfai",
+      "group",
     ].includes(action)
   ) {
     return true;
@@ -957,8 +975,7 @@ function filteredOutboundMetadataFromCache(cache) {
   return result;
 }
 
-function readOutboundMetadataFromSectionCache(section_id) {
-  const targetId = section_id || "Main";
+function readSingleSectionCacheMetadata(targetId) {
   if (!safeCacheSectionName(targetId)) {
     return Promise.resolve({
       names: {},
@@ -991,6 +1008,49 @@ function readOutboundMetadataFromSectionCache(section_id) {
       securities: {},
       ports: {},
     }));
+}
+
+function readOutboundMetadataFromSectionCache(section_id) {
+  const targetId = section_id || "Main";
+  const memberIds =
+    getRuleResolvedAction(targetId) === "group"
+      ? currentSourceOptionValues(targetId, "group_members")
+      : [];
+  const sourceRefs = currentSourceOptionValues(
+    targetId,
+    "outbound_source_refs",
+  );
+  const extraIds = [...new Set([...memberIds, ...sourceRefs])].filter(
+    (id) => id && id !== targetId,
+  );
+
+  if (extraIds.length === 0) {
+    return readSingleSectionCacheMetadata(targetId);
+  }
+
+  return Promise.all([
+    readSingleSectionCacheMetadata(targetId),
+    ...extraIds.map((memberId) => readSingleSectionCacheMetadata(memberId)),
+  ]).then((metaList) => {
+    const merged = {
+      names: {},
+      countries: {},
+      protocols: {},
+      transports: {},
+      securities: {},
+      ports: {},
+    };
+    metaList.forEach((meta) => {
+      if (!meta) return;
+      Object.assign(merged.names, meta.names);
+      Object.assign(merged.countries, meta.countries);
+      Object.assign(merged.protocols, meta.protocols);
+      Object.assign(merged.transports, meta.transports);
+      Object.assign(merged.securities, meta.securities);
+      Object.assign(merged.ports, meta.ports);
+    });
+    return merged;
+  });
 }
 
 function extractCountryFromFlagEmojiName(name) {
@@ -1245,8 +1305,10 @@ function evaluateLiveServerFilterPreview(metadata, filterSpec) {
 
 function loadOutboundNameChoices(section_id) {
   const targetId = section_id || "Main";
+  const isGroup = getRuleResolvedAction(targetId) === "group";
   const fetchedAt = outboundNameChoicesFetchedAt.get(targetId) || 0;
   if (
+    !isGroup &&
     outboundNameChoicesCache.has(targetId) &&
     Date.now() - fetchedAt < OUTBOUND_NAME_CHOICES_TTL_MS
   ) {
@@ -2559,6 +2621,15 @@ function currentSectionGroupChoices(section_id, selectedValues = []) {
   currentSectionGroupValues(section_id, "priority_group").forEach((value) =>
     append("priority_group", value),
   );
+  normalizeOptionValues(
+    uci.get(UCI_PACKAGE, section_id, "balancer_refs"),
+  ).forEach((balId) => {
+    const name = `${uci.get(UCI_PACKAGE, balId, "name") || balId}`.trim();
+    if (name && !seen.has(name)) {
+      seen.add(name);
+      result.push({ value: name, label: name });
+    }
+  });
   normalizeDynamicListItems(selectedValues).forEach((value) => {
     value = `${value || ""}`.trim();
     if (value && !seen.has(value)) {
@@ -2610,7 +2681,13 @@ function isDownloadThroughTargetSection(section, currentSectionId) {
       "sudoku",
       "masque",
       "openvpn",
+      "openconnect",
       "fptn",
+      "desync",
+      "shadowtls",
+      "trusttunnel",
+      "tewfai",
+      "group",
     ].includes(action)
   ) {
     return true;
@@ -2831,12 +2908,26 @@ function serverCountryDetectionChoices() {
 function proxyProtocolChoices() {
   return [
     ["vless", "VLESS"],
-    ["vmess", "VMess"],
+    ["hysteria2", "Hysteria2"],
+    ["tuic", "TUIC"],
     ["trojan", "Trojan"],
+    ["vmess", "VMess"],
     ["shadowsocks", "Shadowsocks"],
+    ["anytls", "AnyTLS"],
+    ["naive", "NaiveProxy"],
+    ["amneziawg", "AmneziaWG / WireGuard"],
+    ["wireguard", "WireGuard"],
+    ["openvpn", "OpenVPN"],
+    ["fptn", "FPTN"],
+    ["mieru", "Mieru"],
+    ["trusttunnel", "TrustTunnel"],
+    ["masque", "MASQUE"],
+    ["openconnect", "OpenConnect"],
+    ["shadowtls", "ShadowTLS"],
+    ["snell", "Snell"],
+    ["sudoku", "Sudoku"],
     ["socks", "SOCKS"],
     ["http", "HTTP"],
-    ["hysteria2", "Hysteria2"],
     ["direct", "Direct"],
   ];
 }
@@ -2848,6 +2939,7 @@ function proxyTransportChoices() {
     ["grpc", "gRPC"],
     ["http", "HTTP"],
     ["httpupgrade", "HTTPUpgrade"],
+    ["quic", "QUIC"],
     ["xhttp", "XHTTP"],
   ];
 }
@@ -3435,6 +3527,7 @@ function subscriptionUrlSettingsKeys() {
     "node_prefix_color",
     "include_urltest_groups",
     "hide_urltest_group_outbounds",
+    "urltest_idle_timeout",
     "hide_detour_outbounds",
     "subscription_insecure",
   ];
@@ -3465,6 +3558,7 @@ function defaultSubscriptionUrlSettings() {
     node_prefix_color: "",
     include_urltest_groups: "1",
     hide_urltest_group_outbounds: "1",
+    urltest_idle_timeout: "",
     hide_detour_outbounds: "1",
     subscription_insecure: "0",
   };
@@ -3585,7 +3679,7 @@ function defaultPriorityGroupSettings() {
     active_check_interval: "5s",
     check_timeout: "2s",
     recovery_check_interval: "15s",
-    pick_fastest: "0",
+    pick_fastest: "1",
     switch_to_faster_same_priority: "0",
     fastest_check_interval: "3m",
     interrupt_exist_connections: "1",
@@ -3599,7 +3693,7 @@ function priorityGroupChildDefaults() {
     active_check_interval: "5s",
     check_timeout: "2s",
     recovery_check_interval: "15s",
-    pick_fastest: "0",
+    pick_fastest: "1",
     switch_to_faster_same_priority: "0",
     fastest_check_interval: "3m",
     interrupt_exist_connections: "1",
@@ -3804,6 +3898,32 @@ function addSubscriptionUrlItemOptions(itemSection, options = {}) {
     _("Override the default OpenWrt device headers for this subscription"),
   );
   o.default = "0";
+  o.rmempty = false;
+
+  o = itemSection.option(
+    form.Value,
+    "urltest_idle_timeout",
+    _("URLTest idle timeout"),
+    _(
+      "Stop checking imported URLTest groups when not used (e.g. 30m, 12h, 1d). Leave empty to use provider or default value.",
+    ),
+  );
+  o.rmempty = true;
+  o.validate = function (_itemId, value) {
+    return value ? validateOptionalSingBoxDuration(value) : true;
+  };
+
+  o = itemSection.option(
+    form.Value,
+    "check_interval",
+    _("URLTest check interval"),
+    _("Interval between URLTest latency checks (e.g. 3m, 30s)"),
+  );
+  o.rmempty = true;
+  o.validate = function (_itemId, value) {
+    return value ? validateOptionalSingBoxDuration(value) : true;
+  };
+
   o.rmempty = false;
 
   [
@@ -4089,6 +4209,22 @@ function addSubscriptionUrlItemOptions(itemSection, options = {}) {
   o.depends("include_urltest_groups", "1");
   o.default = "1";
   o.rmempty = false;
+
+  o = itemSection.option(
+    form.Value,
+    "urltest_idle_timeout",
+    _("URLTest idle timeout"),
+    _(
+      "Stop checking imported URLTest groups when not used (e.g. 30m, 12h, 1d). Leave empty to use provider or default value.",
+    ),
+  );
+  o.depends("include_urltest_groups", "1");
+  o.placeholder = "30m";
+  o.rmempty = true;
+  o.validate = function (_itemId, value) {
+    if (value == null || `${value}`.trim() === "") return true;
+    return validateRequiredSingBoxDuration(value);
+  };
 
   o = itemSection.option(
     form.Flag,
@@ -4861,6 +4997,11 @@ function addDashboardGroupFilterOption(
       action: "connection",
       dashboard_filter_mode: mode,
       priority_group: /.+/,
+    });
+    list.depends({
+      action: "connection",
+      dashboard_filter_mode: mode,
+      balancer_refs: /.+/,
     });
   });
   list.rmempty = true;
@@ -5750,6 +5891,7 @@ function showAmneziaConfigSettingsModal(
         // Several files at once: each becomes its own item straight away —
         // a review modal per file would be noise. Content is validated per
         // file; duplicates and anything else are caught on save.
+        const validFiles = [];
         for (const file of files) {
           if (!/\.conf$/i.test(file.name) || file.size > 65536) {
             ui.addNotification(
@@ -5763,27 +5905,73 @@ function showAmneziaConfigSettingsModal(
             );
             continue;
           }
-          const reader = new FileReader();
-          reader.onerror = () =>
-            ui.addNotification(
-              null,
-              E("p", _("Cannot read the Amnezia .conf file")),
-            );
-          reader.onload = () => {
-            const config = `${reader.result || ""}`.replace(/^\uFEFF/, "");
-            const name = file.name.replace(/\.conf$/i, "");
-            const result = validateAmneziaConfig(name, config);
+          validFiles.push(file);
+        }
+        if (!validFiles.length) return;
+        Promise.all(
+          validFiles.map(
+            (file) =>
+              new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onerror = () => resolve({ file, error: true });
+                reader.onload = () =>
+                  resolve({
+                    file,
+                    config: `${reader.result || ""}`.replace(/^\uFEFF/, ""),
+                  });
+                reader.readAsText(file);
+              }),
+          ),
+        ).then((results) => {
+          const existingNames = new Set(
+            (widget && widget.node ? dynamicListItemValues(widget.node) : [])
+              .map((v) => {
+                const parsed = parseAmneziaConfig(v);
+                return parsed && parsed.name ? parsed.name.trim() : "";
+              })
+              .filter(Boolean),
+          );
+          let addedCount = 0;
+          let lastAddedValue = "";
+          for (const res of results) {
+            if (res.error) {
+              ui.addNotification(
+                null,
+                E("p", _("Cannot read the Amnezia .conf file")),
+              );
+              continue;
+            }
+            const baseName = res.file.name.replace(/\.conf$/i, "").trim();
+            let name = baseName;
+            let suffix = 2;
+            while (existingNames.has(name)) {
+              name = `${baseName} (${suffix})`;
+              suffix += 1;
+            }
+            const result = validateAmneziaConfig(name, res.config);
             if (result !== true) {
               ui.addNotification(
                 null,
-                E("p", "%s: %s".format(file.name, result)),
+                E("p", "%s: %s".format(res.file.name, result)),
               );
-              return;
+              continue;
             }
-            addDynamicListItem(widget, JSON.stringify({ name, config }));
-          };
-          reader.readAsText(file);
-        }
+            existingNames.add(name);
+            const serialized = JSON.stringify({ name, config: res.config });
+            if (widget && widget.node) {
+              widget.addItem(widget.node, serialized, null, false);
+              lastAddedValue = serialized;
+              addedCount += 1;
+            }
+          }
+          if (addedCount > 0 && widget && widget.node) {
+            widget.dispatchCbiDynlistChange(widget.node, lastAddedValue);
+            updateButtonAddDynamicListLayout(
+              widget.node,
+              widget.options.addButtonLabel,
+            );
+          }
+        });
         return;
       }
       const file = files[0];
@@ -6164,6 +6352,111 @@ function getRuleResolvedAction(section_id) {
   return getRuleConfiguredAction(section_id) || "connection";
 }
 
+// Returns a human-readable label for a given outbound_source source_type.
+function getSourceTypeLabel(stype) {
+  switch (`${stype}`.toLowerCase()) {
+    case "zapret":
+      return "Zapret";
+    case "zapret2":
+      return "Zapret2";
+    case "byedpi":
+      return "ByeDPI";
+    case "desync":
+      return "Desync";
+    case "wdtt":
+      return "WDTT";
+    case "olcrtc":
+      return "OlcRTC";
+    case "fptn":
+      return "FPTN";
+    case "awg":
+    case "amnezia_config":
+      return "AmneziaWG";
+    case "warp":
+      return "WARP";
+    case "anytls":
+      return "AnyTLS";
+    case "naive":
+      return "NaiveProxy";
+    case "mieru":
+      return "Mieru";
+    case "snell":
+      return "Snell";
+    case "masque":
+      return "MASQUE";
+    case "openconnect":
+      return "OpenConnect";
+    case "openvpn":
+      return "OpenVPN";
+    case "shadowtls":
+      return "ShadowTLS";
+    case "trusttunnel":
+      return "TrustTunnel";
+    case "tor":
+      return "Tor";
+    case "tailscale":
+      return "Tailscale";
+    case "interface":
+      return _("Interface");
+    case "outbound_json":
+    case "json":
+      return _("JSON outbound");
+    case "proxy_links":
+    case "links":
+      return _("Links");
+    case "subscription":
+      return _("Subscription");
+    default:
+      return `${stype}`;
+  }
+}
+
+// Returns an HTML string with badges for each unique connection type used by
+// this section (via outbound_source_refs → outbound_source.source_type).
+// For non-connection actions (bypass, block, dns, …) returns null.
+function getSectionConnectionTypeBadges(section_id) {
+  const action = getRuleResolvedAction(section_id);
+  // Only "connection"-family actions use outbound_source_refs.
+  const connectionActions = [
+    "connection",
+    "proxy",
+    "outbound",
+    "vpn",
+    "awg",
+    "fptn",
+    "group",
+  ];
+  if (!connectionActions.includes(action)) return null;
+
+  const srcRefRaw = uci.get(UCI_PACKAGE, section_id, "outbound_source_refs");
+  const srcRefs = normalizeOptionValues(srcRefRaw);
+  if (!srcRefs.length) return null;
+
+  // Collect unique source types (preserve insertion order).
+  const seen = {};
+  const types = [];
+  srcRefs.forEach(function (id) {
+    const src = uci.get(UCI_PACKAGE, id);
+    if (!src) return;
+    const stype = (src.source_type || "subscription").toLowerCase();
+    if (!seen[stype]) {
+      seen[stype] = true;
+      types.push(stype);
+    }
+  });
+  if (!types.length) return null;
+  return types
+    .map(function (stype) {
+      return (
+        '<span style="display:inline-block;background:rgba(49,130,206,0.12);color:var(--blue-color,#3182ce);' +
+        'padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;border:1px solid rgba(49,130,206,0.3);margin:1px 2px 1px 0;">' +
+        getSourceTypeLabel(stype) +
+        "</span>"
+      );
+    })
+    .join("");
+}
+
 function getActionOptionLabel(action) {
   switch (`${action}`) {
     case "block":
@@ -6209,6 +6502,16 @@ function getActionOptionLabel(action) {
       return "MASQUE";
     case "openvpn":
       return "OpenVPN";
+    case "openconnect":
+      return "OpenConnect";
+    case "desync":
+      return "Native Desync";
+    case "shadowtls":
+      return "ShadowTLS";
+    case "trusttunnel":
+      return "TrustTunnel";
+    case "tewfai":
+      return "TewFai";
     case "hosts":
       return _("Hosts");
     case "outbound":
@@ -6282,7 +6585,26 @@ function getRuleActionDisplayValue(section_id) {
 }
 
 function getRuleActionDisplayMarkup(section_id) {
-  return getRuleActionDisplayValue(section_id);
+  const base = getRuleActionDisplayValue(section_id);
+  const action = getRuleResolvedAction(section_id);
+  if (action !== "connection") return base;
+  const srcRefs = normalizeOptionValues(
+    uci.get(UCI_PACKAGE, section_id, "outbound_source_refs"),
+  );
+  const balRefs = normalizeOptionValues(
+    uci.get(UCI_PACKAGE, section_id, "balancer_refs"),
+  );
+  const tags = [];
+  srcRefs.forEach((id) => {
+    const s = uci.get(UCI_PACKAGE, id);
+    if (s) tags.push(s.name || id);
+  });
+  balRefs.forEach((id) => {
+    const b = uci.get(UCI_PACKAGE, id);
+    if (b) tags.push(b.name || id);
+  });
+  if (!tags.length) return base;
+  return `${base} <span style="font-size:11px;opacity:0.78;">(${tags.join(" → ")})</span>`;
 }
 
 function populateActionOptionValues(option) {
@@ -6305,6 +6627,13 @@ function populateActionOptionValues(option) {
     option.value("snell", getActionOptionLabel("snell"));
     option.value("mieru", getActionOptionLabel("mieru"));
     option.value("sudoku", getActionOptionLabel("sudoku"));
+  }
+  if (isTachyonCoreForUi()) {
+    option.value("openconnect", getActionOptionLabel("openconnect"));
+    option.value("desync", getActionOptionLabel("desync"));
+    option.value("shadowtls", getActionOptionLabel("shadowtls"));
+    option.value("trusttunnel", getActionOptionLabel("trusttunnel"));
+    option.value("tewfai", getActionOptionLabel("tewfai"));
   }
   option.value("bypass", "Bypass");
   option.value("block", "Block");
@@ -6330,8 +6659,97 @@ function populateActionOptionValues(option) {
   option.value("hosts", getActionOptionLabel("hosts"));
 }
 
+const LINKED_CONDITION_OPTION_KEYS = new Set([
+  "community_lists",
+  "community_subnets",
+  "rule_set",
+  "rule_set_with_subnets",
+  "domain_ip_lists",
+  "domain",
+  "domain_suffix",
+  "domain_keyword",
+  "domain_regex",
+  "domain_text",
+  "domain_suffix_text",
+  "domain_keyword_text",
+  "domain_regex_text",
+  "domain_text_mode",
+  "domain_suffix_text_mode",
+  "domain_keyword_text_mode",
+  "domain_regex_text_mode",
+  "user_domains",
+  "user_domains_text",
+  "user_domains_text_mode",
+  "ip_cidr",
+  "ip_cidr_text",
+  "ip_cidr_text_mode",
+  "source_ip_cidr",
+  "source_ip_cidr_text",
+  "source_ip_cidr_text_mode",
+  "source_macs",
+  "fully_routed_ips",
+  "fully_routed_ips_text",
+  "fully_routed_ips_text_mode",
+  "excluded_ips",
+  "excluded_ips_text",
+  "excluded_ips_text_mode",
+  "ports",
+  "ports_text",
+  "ports_text_mode",
+  "dscp",
+  "dscp_text",
+  "dscp_text_mode",
+  "protocol",
+  "excluded_protocol",
+  "geoip_mode",
+  "geoip_country",
+]);
+
+function getLinkedSectionConditionId(section_id) {
+  if (!section_id || String(section_id).startsWith("cond_")) return null;
+  const condId = `cond_${section_id}`;
+  return uci.get(UCI_PACKAGE, condId, ".type") === "condition" ? condId : null;
+}
+
+function getSectionOrLinkedConditionOption(section_id, key) {
+  const direct = uci.get(UCI_PACKAGE, section_id, key);
+  if (
+    direct !== null &&
+    direct !== undefined &&
+    direct !== "" &&
+    (!Array.isArray(direct) || direct.length > 0)
+  ) {
+    return direct;
+  }
+  if (LINKED_CONDITION_OPTION_KEYS.has(key)) {
+    const condId = getLinkedSectionConditionId(section_id);
+    if (condId) {
+      return uci.get(UCI_PACKAGE, condId, key);
+    }
+  }
+  return direct;
+}
+
+function syncLinkedConditionOption(section_id, key, value) {
+  if (!LINKED_CONDITION_OPTION_KEYS.has(key)) return;
+  const condId = getLinkedSectionConditionId(section_id);
+  if (!condId) return;
+  if (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    (Array.isArray(value) && value.length === 0)
+  ) {
+    uci.unset(UCI_PACKAGE, condId, key);
+  } else {
+    uci.set(UCI_PACKAGE, condId, key, value);
+  }
+}
+
 function getConfigListValues(section_id, key) {
-  return normalizeOptionValues(uci.get(UCI_PACKAGE, section_id, key));
+  return normalizeOptionValues(
+    getSectionOrLinkedConditionOption(section_id, key),
+  );
 }
 
 function stringArraysEqual(left, right) {
@@ -6346,8 +6764,14 @@ function stringArraysEqual(left, right) {
 
 function writeListOption(section_id, key, values) {
   const normalized = normalizeOptionValues(values);
+  syncLinkedConditionOption(section_id, key, normalized);
 
-  if (stringArraysEqual(getConfigListValues(section_id, key), normalized)) {
+  if (
+    stringArraysEqual(
+      normalizeOptionValues(uci.get(UCI_PACKAGE, section_id, key)),
+      normalized,
+    )
+  ) {
     return;
   }
 
@@ -7066,15 +7490,25 @@ function attachAnnotatedTextarea(textarea, analyzer) {
   textarea.__tachyonAnnotatedTextareaController = controller;
 
   const updateAnnotatedTextarea = () => controller.update();
+  const syncAnnotatedScroll = () => {
+    overlay.scrollTop = textarea.scrollTop;
+    overlay.scrollLeft = textarea.scrollLeft;
+  };
   textarea.addEventListener("input", updateAnnotatedTextarea);
   textarea.addEventListener("change", updateAnnotatedTextarea);
-  textarea.addEventListener("scroll", updateAnnotatedTextarea, {
+  textarea.addEventListener("scroll", syncAnnotatedScroll, {
     passive: true,
   });
   textarea.addEventListener("keyup", updateAnnotatedTextarea);
 
   if (typeof ResizeObserver === "function") {
-    const resizeObserver = new ResizeObserver(() => controller.update());
+    const resizeObserver = new ResizeObserver(() => {
+      if (!textarea.isConnected) {
+        resizeObserver.disconnect();
+        return;
+      }
+      controller.update();
+    });
     resizeObserver.observe(textarea);
     controller.resizeObserver = resizeObserver;
   }
@@ -7357,7 +7791,10 @@ function domainValuesWithPrefix(section_id, key, prefix) {
 }
 
 function domainTextValuesWithPrefix(section_id, key, prefix) {
-  const legacyText = uci.get(UCI_PACKAGE, section_id, `${key}_text`);
+  const legacyText = getSectionOrLinkedConditionOption(
+    section_id,
+    `${key}_text`,
+  );
   if (!legacyText) {
     return [];
   }
@@ -7435,8 +7872,8 @@ function stripDomainFullPrefix(val) {
 
 function loadCombinedDomainText(section_id) {
   const rawTextValue =
-    uci.get(UCI_PACKAGE, section_id, "domain") ||
-    uci.get(UCI_PACKAGE, section_id, "domain_suffix_text");
+    getSectionOrLinkedConditionOption(section_id, "domain") ||
+    getSectionOrLinkedConditionOption(section_id, "domain_suffix_text");
   const textValue = stripDomainFullPrefix(rawTextValue);
   const values = [
     ...domainValuesWithPrefix(section_id, "domain_suffix", ""),
@@ -7576,6 +8013,11 @@ function cacheNfqwsRemoteValidation(value, result) {
           : [],
   };
 
+  if (nfqwsRemoteValidationCache.size >= 100) {
+    nfqwsRemoteValidationCache.delete(
+      nfqwsRemoteValidationCache.keys().next().value,
+    );
+  }
   nfqwsRemoteValidationCache.set(normalized, cached);
   return cached;
 }
@@ -8021,6 +8463,11 @@ function cacheNfqws2RemoteValidation(value, result) {
           : [],
   };
 
+  if (nfqws2RemoteValidationCache.size >= 100) {
+    nfqws2RemoteValidationCache.delete(
+      nfqws2RemoteValidationCache.keys().next().value,
+    );
+  }
   nfqws2RemoteValidationCache.set(normalized, cached);
   return cached;
 }
@@ -8433,6 +8880,11 @@ function cacheByedpiRemoteValidation(value, result) {
           : [],
   };
 
+  if (byedpiRemoteValidationCache.size >= 100) {
+    byedpiRemoteValidationCache.delete(
+      byedpiRemoteValidationCache.keys().next().value,
+    );
+  }
   byedpiRemoteValidationCache.set(normalized, cached);
   return cached;
 }
@@ -8957,7 +9409,10 @@ function addDynamicConditionField(section, config) {
       return values;
     }
 
-    const legacyText = uci.get(UCI_PACKAGE, section_id, `${config.key}_text`);
+    const legacyText = getSectionOrLinkedConditionOption(
+      section_id,
+      `${config.key}_text`,
+    );
     return legacyText ? main.parseValueList(legacyText) : [];
   };
 
@@ -8965,6 +9420,17 @@ function addDynamicConditionField(section, config) {
     writeListOption(section_id, config.key, value);
     uci.unset(UCI_PACKAGE, section_id, `${config.key}_text`);
     uci.unset(UCI_PACKAGE, section_id, `${config.key}_text_mode`);
+    syncLinkedConditionOption(section_id, `${config.key}_text`, null);
+    syncLinkedConditionOption(section_id, `${config.key}_text_mode`, null);
+  };
+
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, config.key);
+    uci.unset(UCI_PACKAGE, section_id, `${config.key}_text`);
+    uci.unset(UCI_PACKAGE, section_id, `${config.key}_text_mode`);
+    syncLinkedConditionOption(section_id, config.key, null);
+    syncLinkedConditionOption(section_id, `${config.key}_text`, null);
+    syncLinkedConditionOption(section_id, `${config.key}_text_mode`, null);
   };
 
   return o;
@@ -8995,13 +9461,26 @@ function addLocalDeviceSubnetDynamicField(section, config) {
       return values;
     }
 
-    const legacyText = uci.get(UCI_PACKAGE, section_id, `${config.key}_text`);
+    const legacyText = getSectionOrLinkedConditionOption(
+      section_id,
+      `${config.key}_text`,
+    );
     return legacyText ? main.parseValueList(legacyText) : [];
   };
   o.write = function (section_id, value) {
     writeListOption(section_id, config.key, value);
     uci.unset(UCI_PACKAGE, section_id, `${config.key}_text`);
     uci.unset(UCI_PACKAGE, section_id, `${config.key}_text_mode`);
+    syncLinkedConditionOption(section_id, `${config.key}_text`, null);
+    syncLinkedConditionOption(section_id, `${config.key}_text_mode`, null);
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, config.key);
+    uci.unset(UCI_PACKAGE, section_id, `${config.key}_text`);
+    uci.unset(UCI_PACKAGE, section_id, `${config.key}_text_mode`);
+    syncLinkedConditionOption(section_id, config.key, null);
+    syncLinkedConditionOption(section_id, `${config.key}_text`, null);
+    syncLinkedConditionOption(section_id, `${config.key}_text_mode`, null);
   };
   o.renderWidget = function (section_id, _option_index, cfgvalue) {
     return localDevices.createLocalDeviceDynamicListWidget(
@@ -9046,13 +9525,15 @@ function addTextConditionField(section, config) {
     }
 
     const textValue =
-      uci.get(UCI_PACKAGE, section_id, optionName) ||
-      uci.get(UCI_PACKAGE, section_id, legacyTextOptionName);
+      getSectionOrLinkedConditionOption(section_id, optionName) ||
+      getSectionOrLinkedConditionOption(section_id, legacyTextOptionName);
     if (textValue) {
       return valuesToText(textValue);
     }
 
-    return valuesToText(uci.get(UCI_PACKAGE, section_id, config.key));
+    return valuesToText(
+      getSectionOrLinkedConditionOption(section_id, config.key),
+    );
   };
 
   o.write = function (section_id, value) {
@@ -9060,18 +9541,41 @@ function addTextConditionField(section, config) {
 
     if (normalized.length) {
       uci.set(UCI_PACKAGE, section_id, optionName, normalized);
+      syncLinkedConditionOption(section_id, optionName, normalized);
     } else {
       uci.unset(UCI_PACKAGE, section_id, optionName);
+      syncLinkedConditionOption(section_id, optionName, null);
     }
 
     if (config.key !== optionName) {
       uci.unset(UCI_PACKAGE, section_id, config.key);
+      syncLinkedConditionOption(section_id, config.key, null);
     }
     if (legacyTextOptionName !== optionName) {
       uci.unset(UCI_PACKAGE, section_id, legacyTextOptionName);
+      syncLinkedConditionOption(section_id, legacyTextOptionName, null);
     }
     uci.unset(UCI_PACKAGE, section_id, `${config.key}_text_mode`);
+    syncLinkedConditionOption(section_id, `${config.key}_text_mode`, null);
 
+    if (typeof config.afterWrite === "function") {
+      config.afterWrite(section_id);
+    }
+  };
+
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, optionName);
+    syncLinkedConditionOption(section_id, optionName, null);
+    if (config.key !== optionName) {
+      uci.unset(UCI_PACKAGE, section_id, config.key);
+      syncLinkedConditionOption(section_id, config.key, null);
+    }
+    if (legacyTextOptionName !== optionName) {
+      uci.unset(UCI_PACKAGE, section_id, legacyTextOptionName);
+      syncLinkedConditionOption(section_id, legacyTextOptionName, null);
+    }
+    uci.unset(UCI_PACKAGE, section_id, `${config.key}_text_mode`);
+    syncLinkedConditionOption(section_id, `${config.key}_text_mode`, null);
     if (typeof config.afterWrite === "function") {
       config.afterWrite(section_id);
     }
@@ -9198,7 +9702,7 @@ function globalRuleConditionValues(sectionId, kind) {
   keys.forEach((key) => {
     splitGlobalRuleConditionValues(
       kind,
-      uci.get(UCI_PACKAGE, sectionId, key),
+      getSectionOrLinkedConditionOption(sectionId, key),
     ).forEach((value) => values.add(value));
   });
   return values;
@@ -9510,6 +10014,7 @@ function writeCustomRulesetReferences(section_id, values) {
 function writeDnsRulesetReferences(section_id, values) {
   writeListOption(section_id, "rule_set", uniqueDynamicListItems(values));
   uci.unset(UCI_PACKAGE, section_id, "rule_set_with_subnets");
+  syncLinkedConditionOption(section_id, "rule_set_with_subnets", null);
   uci.unset(UCI_PACKAGE, section_id, RULE_SET_ITEM_SETTINGS_KEY);
 }
 
@@ -9698,33 +10203,52 @@ function createSectionContent(section) {
   };
   o.width = "7rem";
 
-  // The mark the user asked for on the section row itself: one glance tells
-  // which section owns global rules, and the text stays out of the way when no
-  // claim exists.
+  // Connection type column: shows the source_type badges of all outbound_source
+  // items referenced by this section (via outbound_source_refs).  For bypass /
+  // block / dns sections the cell is blank.  Replaces the former "Global rule"
+  // column which required the user to open the modal to understand the setup.
   o = section.taboption(
     "settings",
     form.DummyValue,
-    "_global_rules",
-    _("Global rule"),
+    "_conn_type",
+    _("Connection"),
   );
   o.modalonly = false;
   o.rawhtml = true;
-  o.width = "9rem";
+  o.width = "10rem";
   o.cfgvalue = function (section_id) {
-    if (!activeGlobalRules(section_id).length) {
-      // Always something renderable: an empty cfgvalue is falsy, and a cell
-      // that only renders a non-empty value would show a placeholder in every
-      // row that has no claim.
-      return "&nbsp;";
-    }
-    return (
-      '<span class="badge" style="background:rgba(49,151,149,0.15);color:var(--teal-color, #319795);padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;border:1px solid rgba(49,151,149,0.3);">' +
-      _("Global rule enabled") +
-      "</span>"
-    );
+    const badges = getSectionConnectionTypeBadges(section_id);
+    // Return a non-empty string even when there is nothing to display so LuCI
+    // does not fall back to showing a placeholder dash in the cell.
+    return badges || "&nbsp;";
   };
   o.textvalue = function (section_id) {
-    return activeGlobalRules(section_id).length ? _("Global rule enabled") : "";
+    const action = getRuleResolvedAction(section_id);
+    const connectionActions = [
+      "connection",
+      "proxy",
+      "outbound",
+      "vpn",
+      "awg",
+      "fptn",
+      "group",
+    ];
+    if (!connectionActions.includes(action)) return "";
+    const srcRefs = normalizeOptionValues(
+      uci.get(UCI_PACKAGE, section_id, "outbound_source_refs"),
+    );
+    const seen = {};
+    const types = [];
+    srcRefs.forEach(function (id) {
+      const src = uci.get(UCI_PACKAGE, id);
+      if (!src) return;
+      const stype = (src.source_type || "subscription").toLowerCase();
+      if (!seen[stype]) {
+        seen[stype] = true;
+        types.push(stype);
+      }
+    });
+    return types.map(getSourceTypeLabel).join(", ");
   };
 
   o = section.taboption(
@@ -9832,6 +10356,85 @@ function createSectionContent(section) {
     }
     return true;
   };
+  outboundNameSourceOptions.set("group_members", o);
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "interrupt_exist_connections",
+    _("Interrupt connections"),
+    _(
+      "Interrupt existing connections when group URLTest switches the active server",
+    ),
+  );
+  o.depends("action", "group");
+  o.default = "1";
+  o.rmempty = false;
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "check_interval",
+    _("Check interval"),
+    _("Interval between URLTest latency checks (e.g. 3m, 30s)"),
+  );
+  o.depends("action", "group");
+  o.placeholder = "3m";
+  o.default = "3m";
+  o.modalonly = true;
+  o.validate = function (section_id, value) {
+    if (!value) return true;
+    return validateRequiredSingBoxDuration(value);
+  };
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "tolerance",
+    _("Tolerance (ms)"),
+    _("Latency difference threshold in milliseconds to switch server"),
+  );
+  o.depends("action", "group");
+  o.placeholder = "50";
+  o.default = "50";
+  o.datatype = "uinteger";
+  o.modalonly = true;
+  o.validate = function (section_id, value) {
+    if (!value) return true;
+    return validateUrlTestTolerance(value);
+  };
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "testing_url",
+    _("Testing URL"),
+    _("URL used to test server latency and availability"),
+  );
+  o.depends("action", "group");
+  o.placeholder = "https://www.gstatic.com/generate_204";
+  o.default = "https://www.gstatic.com/generate_204";
+  o.modalonly = true;
+  o.validate = function (section_id, value) {
+    if (!value) return true;
+    return validateUrlTestUrl(value);
+  };
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "idle_timeout",
+    _("Idle timeout"),
+    _("URLTest idle timeout (e.g. 30m)"),
+  );
+  o.depends("action", "group");
+  o.placeholder = "30m";
+  o.modalonly = true;
+  o.validate = function (section_id, value) {
+    if (!value) return true;
+    return validateOptionalSingBoxDuration(value);
+  };
 
   o = section.taboption(
     "settings",
@@ -9888,7 +10491,14 @@ function createSectionContent(section) {
 
     const refreshers = dashboardFilterChoiceRefreshers.get(section_id);
     if (refreshers) {
-      refreshers.forEach((fn) => fn());
+      refreshers.forEach((fn) => {
+        if (fn() === false) {
+          refreshers.delete(fn);
+        }
+      });
+      if (refreshers.size === 0) {
+        dashboardFilterChoiceRefreshers.delete(section_id);
+      }
     }
   };
 
@@ -11511,7 +12121,12 @@ function createSectionContent(section) {
           ? el
           : el.querySelector("input:not([type='hidden']),select,textarea"));
       if (w) {
-        w.value = str;
+        if (w.type === "checkbox") {
+          w.checked =
+            str === "1" || str === "true" || str === "on" || str === "yes";
+        } else {
+          w.value = str;
+        }
         w.dispatchEvent(new Event("input", { bubbles: true }));
         w.dispatchEvent(new Event("change", { bubbles: true }));
       }
@@ -11704,28 +12319,22 @@ function createSectionContent(section) {
           setVal("awg_reject_after_time", rja);
           setVal("awg_keepalive_timeout", kpt);
           setVal("awg_max_handshake_attempts", mha);
-          uci.set(
-            UCI_PACKAGE,
-            section_id,
-            "awg_random_trailers",
-            /^(1|true|yes|on)$/i.test(String(randomTrailers).trim())
-              ? "1"
-              : "0",
-          );
-          uci.set(
-            UCI_PACKAGE,
-            section_id,
-            "awg_disable_cookies",
-            /^(1|true|yes|on)$/i.test(String(disableCookies).trim())
-              ? "1"
-              : "0",
-          );
+          const rtVal = /^(1|true|yes|on)$/i.test(String(randomTrailers).trim())
+            ? "1"
+            : "0";
+          setVal("awg_random_trailers", rtVal);
+          const dcVal = /^(1|true|yes|on)$/i.test(String(disableCookies).trim())
+            ? "1"
+            : "0";
+          setVal("awg_disable_cookies", dcVal);
         } else {
           setVal("awg_rekey_after_time", "");
           setVal("awg_rekey_timeout", "");
           setVal("awg_reject_after_time", "");
           setVal("awg_keepalive_timeout", "");
           setVal("awg_max_handshake_attempts", "");
+          setVal("awg_random_trailers", "0");
+          setVal("awg_disable_cookies", "0");
           uci.unset(UCI_PACKAGE, section_id, "awg_rekey_after_time");
           uci.unset(UCI_PACKAGE, section_id, "awg_rekey_timeout");
           uci.unset(UCI_PACKAGE, section_id, "awg_reject_after_time");
@@ -11775,6 +12384,16 @@ function createSectionContent(section) {
     return E("div", { style: "display:contents" }, [fileInput, btn]);
   };
 
+  const validateAwgManualRequiredText = function (section_id, value) {
+    if (
+      currentSourceOptionValues(section_id, "selector_amnezia_configs").length >
+      0
+    ) {
+      return true;
+    }
+    return validateRequiredText.call(this, section_id, value);
+  };
+
   o = section.taboption(
     "awg_manual",
     form.Value,
@@ -11783,9 +12402,9 @@ function createSectionContent(section) {
   );
 
   o.modalonly = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.depends("action", "awg");
-  o.validate = validateRequiredText;
+  o.validate = validateAwgManualRequiredText;
 
   o = section.taboption(
     "awg_manual",
@@ -11794,9 +12413,9 @@ function createSectionContent(section) {
     _("Private Key"),
   );
   o.modalonly = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.depends("action", "awg");
-  o.validate = validateRequiredText;
+  o.validate = validateAwgManualRequiredText;
 
   o = section.taboption(
     "awg_manual",
@@ -11805,9 +12424,9 @@ function createSectionContent(section) {
     _("Peer Public Key"),
   );
   o.modalonly = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.depends("action", "awg");
-  o.validate = validateRequiredText;
+  o.validate = validateAwgManualRequiredText;
 
   o = section.taboption(
     "awg_manual",
@@ -11816,9 +12435,9 @@ function createSectionContent(section) {
     _("Server Address"),
   );
   o.modalonly = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.depends("action", "awg");
-  o.validate = validateRequiredText;
+  o.validate = validateAwgManualRequiredText;
 
   o = section.taboption(
     "awg_manual",
@@ -11827,10 +12446,10 @@ function createSectionContent(section) {
     _("Server Port"),
   );
   o.modalonly = true;
-  o.rmempty = false;
+  o.rmempty = true;
   o.datatype = "port";
   o.depends("action", "awg");
-  o.validate = validateRequiredText;
+  o.validate = validateAwgManualRequiredText;
 
   o = section.taboption(
     "awg_manual",
@@ -12387,6 +13006,601 @@ function createSectionContent(section) {
   o.depends("action", "masque");
   o.validate = validateRequiredText;
 
+  // ── Native Desync (tachyon-core) ──────────────────────────────────────────
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "desync_preset",
+    _("Desync Preset"),
+    _("Pre-configured DPI bypass profile for tachyon-core native desync"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.value("fake_split", _("Fake + Split (midsld, TTL=5) — Recommended"));
+  o.value("tlsrec", _("TLS Record Fragmentation (tlsrec, midsld)"));
+  o.value("disorder", _("Fake + Disorder (Out-of-order, TTL=5)"));
+  o.value("split", _("TCP Split Only (midsld)"));
+  o.value("fake", _("Fake Packet Injection Only (TTL=5)"));
+  o.value("oob", _("TCP Urgent OOB Desync (midsld)"));
+  o.value("auto", _("Auto (Fake + Split)"));
+  o.value("custom", _("Custom Parameters"));
+  o.default = "fake_split";
+  o.depends("action", "desync");
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "desync_mode",
+    _("Desync Mode"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.value("fake_split", "fake_split (Fake + Split)");
+  o.value("tlsrec", "tlsrec (TLS Record Fragmentation)");
+  o.value("disorder", "disorder (Fake + Out-of-order Split)");
+  o.value("split", "split (TCP Segment Split)");
+  o.value("fake", "fake (Fake Packet Only)");
+  o.value("oob", "oob (TCP Urgent OOB)");
+  o.default = "fake_split";
+  o.depends({ action: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_split_pos",
+    _("Split Position"),
+    _("midsld, sni, or byte offset in ClientHello (1..1400)"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "midsld";
+  o.depends({ action: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_fake_ttl",
+    _("Fake Packet TTL"),
+    _("TTL for fake TLS packets so they expire before the destination server"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "range(1,64)";
+  o.placeholder = "4";
+  o.depends({ action: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_fake_sni",
+    _("Fake SNI"),
+    _("Decoy hostname injected into fake ClientHello (e.g. www.google.com)"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "www.google.com";
+  o.depends({ action: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_repeats",
+    _("Fake Repeats"),
+    _("Number of fake TCP packets to send"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "range(1,20)";
+  o.placeholder = "2";
+  o.depends({ action: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_split_delay_ms",
+    _("Split Delay (ms)"),
+    _("Delay between split TCP segments in milliseconds"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "uinteger";
+  o.placeholder = "2";
+  o.depends({ action: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "desync_udp_fake",
+    _("UDP Fake (QUIC / Voice)"),
+    _("Send fake low-TTL UDP packets before real UDP/QUIC payload"),
+  );
+  o.modalonly = true;
+  o.default = "1";
+  o.depends({ action: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_udp_repeats",
+    _("UDP Fake Repeats"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "range(1,20)";
+  o.placeholder = "4";
+  o.depends({
+    action: "desync",
+    desync_preset: "custom",
+    desync_udp_fake: "1",
+  });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_udp_fake_ttl",
+    _("UDP Fake TTL"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "range(1,64)";
+  o.placeholder = "3";
+  o.depends({
+    action: "desync",
+    desync_preset: "custom",
+    desync_udp_fake: "1",
+  });
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "desync_opts",
+    _("Desync Strategy String (Fuzzer / CLI)"),
+    _(
+      "Optional key=value string applied by DPI Strategy Fuzzer (e.g. mode=fake+split split_pos=1 fake_ttl=4)",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "desync");
+
+  // ── ShadowTLS (tachyon-core) ──────────────────────────────────────────────
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "shadowtls_server",
+    _("Server Address"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("action", "shadowtls");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "shadowtls_server_port",
+    _("Server Port"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.datatype = "port";
+  o.placeholder = "443";
+  o.depends("action", "shadowtls");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "shadowtls_password",
+    _("Password"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.password = true;
+  o.depends("action", "shadowtls");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "shadowtls_version",
+    _("ShadowTLS Version"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.value("3", "v3");
+  o.value("2", "v2");
+  o.value("1", "v1");
+  o.default = "3";
+  o.depends("action", "shadowtls");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "shadowtls_sni",
+    _("TLS Handshake SNI"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "www.microsoft.com";
+  o.depends("action", "shadowtls");
+
+  // ── TrustTunnel (tachyon-core) ────────────────────────────────────────────
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "trusttunnel_server",
+    _("Server Address"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("action", "trusttunnel");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "trusttunnel_server_port",
+    _("Server Port"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.datatype = "port";
+  o.placeholder = "443";
+  o.depends("action", "trusttunnel");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "trusttunnel_username",
+    _("Username"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "trusttunnel");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "trusttunnel_password",
+    _("Password"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.password = true;
+  o.depends("action", "trusttunnel");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "trusttunnel_sni",
+    _("TLS SNI"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "trusttunnel");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "trusttunnel_quic",
+    _("Use QUIC (HTTP/3)"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("action", "trusttunnel");
+
+  // ── TewFai (tachyon-core) ─────────────────────────────────────────────────
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "tewfai_server",
+    _("Server Address"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("action", "tewfai");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "tewfai_server_port",
+    _("Server Port"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.datatype = "port";
+  o.placeholder = "443";
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "tewfai_uuid",
+    _("UUID / Password"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.password = true;
+  o.depends("action", "tewfai");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "tewfai_password",
+    _("Password (optional second PSK)"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.password = true;
+  o.depends("action", "tewfai");
+
+  o = section.taboption("settings", form.Value, "tewfai_sni", _("TLS SNI"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "tewfai_insecure",
+    _("Allow Insecure TLS"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "tewfai_transport",
+    _("Transport Race List"),
+    _("Transports to race (e.g. tcp, quic)"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.value("tcp", "TCP");
+  o.value("quic", "QUIC");
+  o.value("h3_datagram", "H3 Datagram");
+  o.value("h3_stream", "H3 Stream");
+  o.value("h2", "HTTP/2");
+  o.value("ws", "WebSocket");
+  o.value("raw_tls", "Raw TLS");
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "tewfai_inner_cipher",
+    _("Inner Cipher"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.value("", _("Auto (Default)"));
+  o.value("aes-256-gcm", "AES-256-GCM");
+  o.value("none", _("None"));
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "tewfai_morph_profile",
+    _("Morph Profile"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.value("", _("None (Default)"));
+  o.value("browsing", "Browsing");
+  o.value("video", "Video");
+  o.value("webrtc", "WebRTC");
+  o.value("bulk", "Bulk");
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "tewfai_max_streams",
+    _("Max Streams"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "uinteger";
+  o.placeholder = "64";
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "tewfai_pqc_enabled",
+    _("Post-Quantum Key Exchange (PQC)"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "tewfai_handover_enabled",
+    _("Roaming / Handover"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("action", "tewfai");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "tewfai_fec_enabled",
+    _("Forward Error Correction (FEC)"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("action", "tewfai");
+
+  o = section.taboption("settings", form.Value, "tewfai_mtu", _("MTU"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "uinteger";
+  o.placeholder = "1400";
+  o.depends("action", "tewfai");
+
+  // ── OpenConnect / AnyConnect (tachyon-core) ───────────────────────────────
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_server",
+    _("Server Address"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("action", "openconnect");
+  o.validate = validateRequiredText;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_server_port",
+    _("Server Port"),
+  );
+  o.modalonly = true;
+  o.rmempty = false;
+  o.datatype = "port";
+  o.placeholder = "443";
+  o.default = "443";
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "openconnect_flavor",
+    _("VPN Flavor"),
+  );
+  o.modalonly = true;
+  o.default = "anyconnect";
+  o.value("anyconnect", "Cisco AnyConnect / ocserv");
+  o.value("gp", "Palo Alto GlobalProtect");
+  o.value("pulse", "Ivanti Pulse Connect Secure");
+  o.value("fortinet", "Fortinet FortiGate SSL VPN");
+  o.value("array", "Array Networks SSL VPN");
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_username",
+    _("Username"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_password",
+    _("Password"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.password = true;
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_cookie",
+    _("Session Cookie / Pre-Auth Token"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.password = true;
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_urlpath",
+    _("Group / URL Path"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "/vpn";
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_realm",
+    _("Auth Realm"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_sni",
+    _("TLS SNI"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "openconnect_insecure",
+    _("Allow Insecure TLS"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "openconnect_server_cert_pin",
+    _("Server Certificate Pin (SHA-256)"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "openconnect_dtls",
+    _("Enable DTLS"),
+  );
+  o.modalonly = true;
+  o.default = "1";
+  o.depends("action", "openconnect");
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "openconnect_esp",
+    _("Enable ESP UDP Tunnel"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("action", "openconnect");
+
+  o = section.taboption("settings", form.Value, "openconnect_mtu", _("MTU"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.datatype = "uinteger";
+  o.placeholder = "1400";
+  o.depends("action", "openconnect");
+
   // ── OpenVPN (sing-box-extended) ───────────────────────────────────────────
 
   const parseOpenvpnConfig = (text) => {
@@ -12538,7 +13752,12 @@ function createSectionContent(section) {
           ? el
           : el.querySelector("input:not([type='hidden']),select,textarea"));
       if (w) {
-        w.value = str;
+        if (w.type === "checkbox") {
+          w.checked =
+            str === "1" || str === "true" || str === "on" || str === "yes";
+        } else {
+          w.value = str;
+        }
         w.dispatchEvent(new Event("input", { bubbles: true }));
         w.dispatchEvent(new Event("change", { bubbles: true }));
       }
@@ -12830,9 +14049,9 @@ function createSectionContent(section) {
       "vless://, vmess://, ss://, trojan://, socks4/5://, http/s://, hy2/hysteria2:// links, fptn://",
     ),
   );
-  o.depends("action", "connection");
-  o.depends("action", "fptn");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   const originalVpnUrlRender = o.render;
   o.render = function () {
@@ -12864,8 +14083,6 @@ function createSectionContent(section) {
       return validation.message;
     }
 
-    // An FPTN section dials with an fptn: / fptnb: access token and nothing
-    // else — the generator silently ignores any other link pasted here.
     if (
       uci.get(UCI_PACKAGE, section_id, "action") === "fptn" &&
       !/^fptnb?:/.test(value)
@@ -12879,6 +14096,193 @@ function createSectionContent(section) {
     refreshDashboardFilterChoiceWidgets(section_id);
   };
   outboundNameSourceOptions.set("selector_proxy_links", o);
+
+  // Modular Outbounds, Groups, Section-level Narrowing, and Balancers (#242)
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "outbound_source_refs",
+    _("Connections from Pool (in Priority Order)"),
+    _(
+      "Select any connections from the Connections Pool (Zapret2, Zapret, ByeDPI, Desync, Subscriptions, AmneziaWG, FPTN, OpenVPN, WARP, etc.). Order matters: the 2nd item is used as failover when the 1st fails.",
+    ),
+  );
+  o.modalonly = true;
+  ["connection", "proxy", "outbound", "vpn", "awg", "fptn", "group"].forEach(
+    (act) => o.depends("action", act),
+  );
+  configureLiveDynamicListChoices(o, () =>
+    (uci.sections(UCI_PACKAGE, "outbound_source") || []).map((src) => {
+      const stype = String(src.source_type || "subscription").toUpperCase();
+      return {
+        value: src[".name"],
+        label: `${src.name || src[".name"]} [${stype}] (${src[".name"]})`,
+      };
+    }),
+  );
+  outboundNameSourceOptions.set("outbound_source_refs", o);
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "balancer_refs",
+    _("Auto-Select / Balancers (URLTest / Priority)"),
+    _(
+      "Select reusable URLTest or Priority auto-selection groups from the Auto-Select tab.",
+    ),
+  );
+  o.modalonly = true;
+  ["connection", "proxy", "outbound", "vpn", "awg", "fptn", "group"].forEach(
+    (act) => o.depends("action", act),
+  );
+  configureLiveDynamicListChoices(o, () =>
+    (uci.sections(UCI_PACKAGE, "balancer") || []).map((bal) => ({
+      value: bal[".name"],
+      label: `${bal.name || bal[".name"]} [${(bal.balancer_type || "urltest").toUpperCase()}]`,
+    })),
+  );
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "outbound_group_refs",
+    _("Filtered Server Groups from Pool (Optional)"),
+    _(
+      "Select pre-filtered Outbound Groups (e.g. Unlim_RU) from the Connections Pool tab.",
+    ),
+  );
+  o.modalonly = true;
+  ["connection", "proxy", "outbound", "vpn", "awg", "fptn", "group"].forEach(
+    (act) => o.depends("action", act),
+  );
+  configureLiveDynamicListChoices(o, () =>
+    (uci.sections(UCI_PACKAGE, "outbound_group") || []).map((grp) => ({
+      value: grp[".name"],
+      label: `${grp.name || grp[".name"]} (${grp[".name"]})`,
+    })),
+  );
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "section_selection_mode",
+    _("Multi-Connection Selection Mode"),
+    _(
+      "How multiple connections or balancers in this section interact: Priority Failover switches to the next connection only if the higher-priority one fails.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "auto";
+  o.value(
+    "auto",
+    _("Automatic (Priority Failover when mixing connections / DPI + VPN)"),
+  );
+  o.value(
+    "priority_failover",
+    _("Priority Failover (2nd activates only after 1st fails)"),
+  );
+  o.value("default", _("Manual Selector on Dashboard"));
+  ["connection", "proxy", "outbound", "vpn", "awg", "fptn", "group"].forEach(
+    (act) => o.depends("action", act),
+  );
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "section_health_url",
+    _("Failover Health Check URL"),
+    _(
+      "URL probed to verify whether the primary connection (e.g. Zapret2 on YouTube) is working before failing over to the backup connection (e.g. FPTN or AmneziaWG).",
+    ),
+  );
+  o.modalonly = true;
+  o.placeholder = "https://www.gstatic.com/generate_204";
+  urlTestUrlChoices().forEach((value) => o.value(value));
+  ["connection", "proxy", "outbound", "vpn", "awg", "fptn", "group"].forEach(
+    (act) => o.depends("action", act),
+  );
+
+  o = section.taboption(
+    "settings",
+    form.ListValue,
+    "section_filter_mode",
+    _("Section Pool Narrowing Filter"),
+    _(
+      "Further narrow the selected Outbound Groups/Sources for this section (e.g. exclude |WL| or Обход) before feeding servers into Balancers.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "disabled";
+  o.value("disabled", _("Disabled (Keep full group/source pool)"));
+  o.value("exclude", _("Exclude matching servers"));
+  o.value("include", _("Include only matching servers"));
+  o.value("mixed", _("Include + Exclude (Intersection AND)"));
+  ["connection", "proxy", "outbound", "vpn", "awg", "fptn", "group"].forEach(
+    (act) => o.depends("action", act),
+  );
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "section_include_prefixes",
+    _("Section Include Prefixes"),
+  );
+  o.modalonly = true;
+  o.depends("section_filter_mode", "include");
+  o.depends("section_filter_mode", "mixed");
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "section_exclude_prefixes",
+    _("Section Exclude Prefixes"),
+  );
+  o.modalonly = true;
+  o.depends("section_filter_mode", "exclude");
+  o.depends("section_filter_mode", "mixed");
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "section_include_countries",
+    _("Section Include Country Flags (ISO)"),
+  );
+  o.modalonly = true;
+  countryChoices().forEach((choice) => o.value(choice.value, choice.label));
+  o.depends("section_filter_mode", "include");
+  o.depends("section_filter_mode", "mixed");
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "section_exclude_countries",
+    _("Section Exclude Country Flags (ISO)"),
+  );
+  o.modalonly = true;
+  countryChoices().forEach((choice) => o.value(choice.value, choice.label));
+  o.depends("section_filter_mode", "exclude");
+  o.depends("section_filter_mode", "mixed");
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "section_include_regex",
+    _("Section Include Name Regex"),
+  );
+  o.modalonly = true;
+  o.depends("section_filter_mode", "include");
+  o.depends("section_filter_mode", "mixed");
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "section_exclude_regex",
+    _("Section Exclude Name Regex"),
+    _("e.g. \\|WL\\| or Bypass"),
+  );
+  o.modalonly = true;
+  o.depends("section_filter_mode", "exclude");
+  o.depends("section_filter_mode", "mixed");
 
   addAwgModeTitle(
     "_awg_mode_import",
@@ -12938,7 +14342,36 @@ function createSectionContent(section) {
       },
     );
   };
-  o.onListChange = refreshDashboardFilterChoiceWidgets;
+  o.onListChange = function (section_id) {
+    refreshDashboardFilterChoiceWidgets(section_id);
+    if (typeof document !== "undefined") {
+      [
+        "awg_local_address",
+        "awg_private_key",
+        "awg_peer_public_key",
+        "awg_server_address",
+        "awg_server_port",
+      ].forEach((optName) => {
+        const el =
+          document.getElementById(
+            `widget.cbid.${UCI_PACKAGE}.${section_id}.${optName}`,
+          ) ||
+          document.getElementById(
+            `cbid.${UCI_PACKAGE}.${section_id}.${optName}`,
+          );
+        const input =
+          el &&
+          (/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)
+            ? el
+            : el.querySelector("input:not([type='hidden']),select,textarea"));
+        if (input) {
+          input.classList.remove("cbi-input-invalid");
+          input.dispatchEvent(new Event("keyup", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      });
+    }
+  };
   outboundNameSourceOptions.set("selector_amnezia_configs", o);
 
   o = section.taboption(
@@ -12948,8 +14381,9 @@ function createSectionContent(section) {
     _("Connection links (text)"),
     _("Paste proxy links one per line; they are added to the connection list"),
   );
-  o.depends("action", "connection");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.rows = 5;
 
@@ -12962,8 +14396,9 @@ function createSectionContent(section) {
       "Paste proxy links one per line; they form a URLTest group with automatic fastest selection",
     ),
   );
-  o.depends("action", "connection");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.rows = 5;
 
@@ -12974,8 +14409,9 @@ function createSectionContent(section) {
     _("Subscription URL"),
     _("Enter the subscription URL"),
   );
-  o.depends("action", "connection");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.childType = "subscription_url";
   o.childValueOption = "url";
@@ -13014,14 +14450,6 @@ function createSectionContent(section) {
   };
   o.validate = validateSubscriptionUrlEntry;
 
-  // On/off right in the list, next to the gear and the remove button. A
-  // subscription_url child section is named after its URL, so the value in the
-  // row is the UCI section id and the flag can be read and written directly.
-  //
-  // Returns the current state when called with no `next`, otherwise flips it and
-  // stages the change. Default is enabled: a section written before the flag
-  // existed has no `enabled` option, and treating that as "off" would silently
-  // disable every existing subscription the first time the page opened.
   o.setItemEnabled = function (value, next) {
     const itemId = `${value || ""}`;
     if (
@@ -13058,8 +14486,9 @@ function createSectionContent(section) {
       "Keep only subscription nodes whose name contains any of these keywords (empty keeps all). Case-insensitive, emoji supported.",
     ),
   );
-  o.depends("action", "connection");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.placeholder = _("Add include keyword");
 
@@ -13072,8 +14501,9 @@ function createSectionContent(section) {
       "Drop subscription nodes whose name contains any of these keywords. Case-insensitive, emoji supported.",
     ),
   );
-  o.depends("action", "connection");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.placeholder = _("Add exclude keyword");
 
@@ -13084,8 +14514,9 @@ function createSectionContent(section) {
     _("Network Interface"),
     _("Select network interface for VPN connection"),
   );
-  o.depends("action", "connection");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.placeholder = _("Select a network interface");
   o.childType = "section_interface";
@@ -13125,8 +14556,9 @@ function createSectionContent(section) {
     _("JSON outbound"),
     _("Custom outbound configurations in JSON format"),
   );
-  o.depends("action", "connection");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.addButtonLabel = _("+ Add JSON outbound");
   o.renderItemSettingsModal = showOutboundJsonSettingsModal;
@@ -13152,10 +14584,9 @@ function createSectionContent(section) {
     _("URLTest"),
     _("Server group for automatic lowest-latency selection"),
   );
-  o.depends("action", "connection");
-  o.depends("action", "fptn");
-  o.depends("action", "awg");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.addButtonLabel = _("+ Add URLTest");
   o.childType = "urltest";
@@ -13213,10 +14644,9 @@ function createSectionContent(section) {
     _("Priority"),
     _("Server group for priority failover"),
   );
-  o.depends("action", "connection");
-  o.depends("action", "fptn");
-  o.depends("action", "awg");
+  o.depends("action", "__legacy_inline__");
   o.rmempty = true;
+  o.retain = true;
   o.modalonly = true;
   o.addButtonLabel = _("+ Add priority");
   o.childType = "priority_group";
@@ -13370,6 +14800,145 @@ function createSectionContent(section) {
   o.depends("action", "zapret");
   o.depends("action", "zapret2");
   o.depends("action", "outbound");
+  o.depends("action", "group");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.DynamicList,
+    "fail_policy_urls",
+    _("Fail Policy Probe URLs"),
+    _(
+      "Optional HTTP/HTTPS URLs probed through this section's outbound/strategy (e.g. https://i.ytimg.com/generate_204). Leave empty to use the global latency test URL. Note: HTTP/HTTPS probes do not validate UDP game traffic or Discord voice.",
+    ),
+  );
+  o.placeholder = "https://www.gstatic.com/generate_204";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "fail_policy_timeout",
+    _("Fail Policy Probe Timeout (ms)"),
+    _("Timeout in milliseconds for each probe request through this section."),
+  );
+  o.datatype = "range(500,30000)";
+  o.placeholder = "3000";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "fail_policy_threshold",
+    _("Fail Policy Failure Threshold"),
+    _(
+      "Consecutive failed probes required before activating Fail-Closed or Fail-Open.",
+    ),
+  );
+  o.datatype = "range(1,20)";
+  o.placeholder = "3";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "fail_policy_recover_threshold",
+    _("Fail Policy Recovery Threshold"),
+    _(
+      "Consecutive successful probes through the original outbound/strategy required before restoring normal routing.",
+    ),
+  );
+  o.datatype = "range(1,20)";
+  o.placeholder = "2";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "fail_policy_cooldown",
+    _("Fail Policy Cooldown (s)"),
+    _(
+      "Minimum delay in seconds between route transitions to prevent flapping.",
+    ),
+  );
+  o.datatype = "range(0,86400)";
+  o.placeholder = "60";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Flag,
+    "fail_policy_check_direct",
+    _("Verify Direct Reachability Before Fail-Open"),
+    _(
+      "Before switching to Direct, verify that the probe URLs are reachable via Direct so a general internet outage does not trigger a pointless switch.",
+    ),
+  );
+  o.default = "1";
+  o.rmempty = true;
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "fail_policy_check_interval",
+    _("Fail Policy Check Interval (s)"),
+    _(
+      "Interval in seconds between failure check probes when the section is healthy (e.g. 15).",
+    ),
+  );
+  o.datatype = "range(1,3600)";
+  o.placeholder = "15";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "fail_policy_recover_interval",
+    _("Fail Policy Recovery Interval (s)"),
+    _(
+      "Interval in seconds between recovery probes when the section is in failed state (e.g. 60).",
+    ),
+  );
+  o.datatype = "range(1,3600)";
+  o.placeholder = "60";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
+  o.modalonly = true;
+
+  o = section.taboption(
+    "settings",
+    form.Value,
+    "fail_policy_expected_status",
+    _("Fail Policy Expected HTTP Status"),
+    _(
+      "Expected HTTP status code(s) for probe success (e.g. 200, 204). Leave empty for any completed request.",
+    ),
+  );
+  o.placeholder = "204";
+  o.rmempty = true;
+  o.depends("fail_policy", "block");
+  o.depends("fail_policy", "direct");
   o.modalonly = true;
 
   o = section.taboption(
@@ -13389,6 +14958,7 @@ function createSectionContent(section) {
   o.depends("action", "olcrtc");
   o.depends("action", "zapret");
   o.depends("action", "zapret2");
+  o.depends("action", "group");
   o.modalonly = true;
 
   o = section.taboption(
@@ -13405,6 +14975,7 @@ function createSectionContent(section) {
   o.depends({ action: "byedpi", mixed_proxy_enabled: "1" });
   o.depends({ action: "zapret", mixed_proxy_enabled: "1" });
   o.depends({ action: "zapret2", mixed_proxy_enabled: "1" });
+  o.depends({ action: "group", mixed_proxy_enabled: "1" });
   o.modalonly = true;
   o.validate = function (_section_id, value) {
     if (!value || value.length === 0) {
@@ -13434,6 +15005,7 @@ function createSectionContent(section) {
   o.depends({ action: "byedpi", mixed_proxy_enabled: "1" });
   o.depends({ action: "zapret", mixed_proxy_enabled: "1" });
   o.depends({ action: "zapret2", mixed_proxy_enabled: "1" });
+  o.depends({ action: "group", mixed_proxy_enabled: "1" });
   o.modalonly = true;
 
   o = section.taboption(
@@ -13470,6 +15042,11 @@ function createSectionContent(section) {
   });
   o.depends({
     action: "zapret2",
+    mixed_proxy_enabled: "1",
+    mixed_proxy_auth_enabled: "1",
+  });
+  o.depends({
+    action: "group",
     mixed_proxy_enabled: "1",
     mixed_proxy_auth_enabled: "1",
   });
@@ -13519,6 +15096,11 @@ function createSectionContent(section) {
     mixed_proxy_enabled: "1",
     mixed_proxy_auth_enabled: "1",
   });
+  o.depends({
+    action: "group",
+    mixed_proxy_enabled: "1",
+    mixed_proxy_auth_enabled: "1",
+  });
   o.modalonly = true;
   o.validate = function (_section_id, value) {
     if (!value || value.length === 0) {
@@ -13541,6 +15123,7 @@ function createSectionContent(section) {
   o.rmempty = false;
   o.depends("action", "connection");
   o.depends("action", "fptn");
+  o.depends("action", "group");
   o.modalonly = true;
   o.cfgvalue = function (section_id) {
     const value = uci.get(
@@ -13554,6 +15137,68 @@ function createSectionContent(section) {
 
     return getRuleResolvedAction(section_id) === "byedpi" ? "1" : "0";
   };
+
+  // Modular Reusable Conditions (#242)
+  o = section.taboption(
+    "conditions",
+    form.DynamicList,
+    "condition_refs",
+    _("Conditions from Pool"),
+    _(
+      "Select one or more Conditions created in the Conditions tab and choose how they work together in this section.",
+    ),
+  );
+  o.modalonly = true;
+  dependsOnRoutingAction(o);
+  o.depends("action", "dns");
+  configureLiveDynamicListChoices(o, () =>
+    (uci.sections(UCI_PACKAGE, "condition") || []).map((c) => ({
+      value: c[".name"],
+      label: `${c.name || c[".name"]} (${c[".name"]})`,
+    })),
+  );
+
+  o = section.taboption(
+    "conditions",
+    form.ListValue,
+    "condition_operator",
+    _("Conditions Combination Mode"),
+    _("How multiple selected Conditions work together inside this section."),
+  );
+  o.modalonly = true;
+  o.default = "and";
+  o.value("and", _("AND (all selected conditions must match)"));
+  o.value("or", _("OR (any selected condition matches)"));
+  o.value("not", _("NOT (invert selected conditions)"));
+  dependsOnRoutingAction(o);
+  o.depends("action", "dns");
+
+  o = section.taboption(
+    "conditions",
+    form.Value,
+    "condition_expression",
+    _("Boolean Condition Expression (Optional)"),
+    _(
+      "Optional boolean expression combining Condition IDs with AND / OR / NOT, e.g. baned_domains AND my_devices.",
+    ),
+  );
+  o.modalonly = true;
+  o.placeholder = "baned_domains AND my_devices";
+  dependsOnRoutingAction(o);
+  o.depends("action", "dns");
+
+  o = section.taboption(
+    "conditions",
+    form.Flag,
+    "match_all",
+    _("Match All Traffic (Catch-All Section)"),
+    _(
+      "Route all remaining traffic through this section without requiring specific domain/IP conditions.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  dependsOnRoutingAction(o);
 
   let geoipModeOption = section.taboption(
     "conditions",
@@ -13578,7 +15223,7 @@ function createSectionContent(section) {
   geoipModeOption.rmempty = false;
   geoipModeOption.modalonly = true;
   geoipModeOption.load = function (section_id) {
-    let mode = uci.get(UCI_PACKAGE, section_id, "geoip_mode");
+    let mode = getSectionOrLinkedConditionOption(section_id, "geoip_mode");
     if (
       mode === "exclude" ||
       mode === "include" ||
@@ -13586,10 +15231,19 @@ function createSectionContent(section) {
       mode === "include_all"
     )
       return mode;
+    let act = uci.get(UCI_PACKAGE, section_id, "action");
+    if (act === "bypass" || act === "block") return "include";
     return "exclude";
+  };
+  geoipModeOption.write = function (section_id, value) {
+    syncLinkedConditionOption(section_id, "geoip_mode", value);
+    return form.ListValue.prototype.write.apply(this, arguments);
   };
   [
     "connection",
+    "proxy",
+    "outbound",
+    "vpn",
     "awg",
     "warp",
     "anytls",
@@ -13599,6 +15253,10 @@ function createSectionContent(section) {
     "sudoku",
     "masque",
     "openvpn",
+    "openconnect",
+    "desync",
+    "shadowtls",
+    "trusttunnel",
     "zapret",
     "zapret2",
     "byedpi",
@@ -13606,6 +15264,7 @@ function createSectionContent(section) {
     "olcrtc",
     "fptn",
     "bypass",
+    "group",
   ].forEach((act) => geoipModeOption.depends("action", act));
 
   o = section.taboption(
@@ -13635,7 +15294,7 @@ function createSectionContent(section) {
   o.placeholder = _("Country code (e.g. ru, us, de)");
   o.modalonly = true;
   o.load = function (section_id) {
-    let val = uci.get(UCI_PACKAGE, section_id, "geoip_country");
+    let val = getSectionOrLinkedConditionOption(section_id, "geoip_country");
     if (!val || val === "all") return [];
     if (val === "non-ru") return ["ru"];
     if (Array.isArray(val))
@@ -13646,8 +15305,18 @@ function createSectionContent(section) {
       .filter((v) => v && v !== "all" && v !== "non-ru");
     return parts;
   };
+  o.write = function (section_id, value) {
+    writeListOption(section_id, "geoip_country", value);
+  };
+  o.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "geoip_country");
+    syncLinkedConditionOption(section_id, "geoip_country", null);
+  };
   [
     "connection",
+    "proxy",
+    "outbound",
+    "vpn",
     "awg",
     "warp",
     "anytls",
@@ -13657,6 +15326,10 @@ function createSectionContent(section) {
     "sudoku",
     "masque",
     "openvpn",
+    "openconnect",
+    "desync",
+    "shadowtls",
+    "trusttunnel",
     "zapret",
     "zapret2",
     "byedpi",
@@ -13664,9 +15337,8 @@ function createSectionContent(section) {
     "olcrtc",
     "fptn",
     "bypass",
+    "group",
   ].forEach((act) => o.depends("action", act));
-  // The country list is a fixed catalog, so a country another section claims as
-  // global simply disappears from the dropdown instead of failing on save.
   const geoipCountryChoices = (o.keylist || []).map((value, index) => ({
     value,
     label: (o.vallist && o.vallist[index]) || value,
@@ -13701,6 +15373,7 @@ function createSectionContent(section) {
         "domain_regex_text_mode",
       ].forEach((key) => {
         uci.unset(UCI_PACKAGE, section_id, key);
+        syncLinkedConditionOption(section_id, key, null);
       });
     },
   });
@@ -13747,6 +15420,7 @@ function createSectionContent(section) {
   };
   builtInRulesetOption.remove = function (section_id) {
     uci.unset(UCI_PACKAGE, section_id, "community_lists");
+    syncLinkedConditionOption(section_id, "community_lists", null);
   };
   let isProcessingBuiltIns = false;
   builtInRulesetOption.onchange = function (_ev, section_id, value) {
@@ -13793,6 +15467,10 @@ function createSectionContent(section) {
   communitySubnetsOption.default = "1";
   communitySubnetsOption.rmempty = false;
   dependsOnRoutingAction(communitySubnetsOption);
+  communitySubnetsOption.write = function (section_id, value) {
+    syncLinkedConditionOption(section_id, "community_subnets", value);
+    return form.Flag.prototype.write.apply(this, arguments);
+  };
 
   const ruleSetOption = section.taboption(
     "conditions",
@@ -13804,7 +15482,6 @@ function createSectionContent(section) {
     ),
   );
   ruleSetOption.modalonly = true;
-  // Both widgets map to rule_set, so neither inactive view may erase shared storage.
   ruleSetOption.retain = true;
   dependsOnRoutingAction(ruleSetOption);
   ruleSetOption.renderItemSettingsModal = showRuleSetSettingsModal;
@@ -13818,6 +15495,8 @@ function createSectionContent(section) {
     uci.unset(UCI_PACKAGE, section_id, "rule_set");
     uci.unset(UCI_PACKAGE, section_id, "rule_set_with_subnets");
     uci.unset(UCI_PACKAGE, section_id, RULE_SET_ITEM_SETTINGS_KEY);
+    syncLinkedConditionOption(section_id, "rule_set", null);
+    syncLinkedConditionOption(section_id, "rule_set_with_subnets", null);
   };
   ruleSetOption.validate = function (section_id, value) {
     return validateCustomRulesetReference(value);
@@ -13856,7 +15535,6 @@ function createSectionContent(section) {
     _("Add URLs or local paths to .lst lists containing domains and subnets."),
   );
   domainIpListsOption.modalonly = true;
-  // Both widgets map to domain_ip_lists, so neither inactive view may erase shared storage.
   domainIpListsOption.retain = true;
   dependsOnRoutingAction(domainIpListsOption);
   domainIpListsOption.load = function (section_id) {
@@ -13867,6 +15545,7 @@ function createSectionContent(section) {
   };
   domainIpListsOption.remove = function (section_id) {
     uci.unset(UCI_PACKAGE, section_id, "domain_ip_lists");
+    syncLinkedConditionOption(section_id, "domain_ip_lists", null);
   };
   domainIpListsOption.validate = function (_section_id, value) {
     return validatePlainListReference(value);
@@ -13892,14 +15571,12 @@ function createSectionContent(section) {
   };
   dnsDomainListsOption.remove = function (section_id) {
     uci.unset(UCI_PACKAGE, section_id, "domain_ip_lists");
+    syncLinkedConditionOption(section_id, "domain_ip_lists", null);
   };
   dnsDomainListsOption.validate = function (_section_id, value) {
     return validatePlainListReference(value);
   };
 
-  // Which of this section's own conditions become global. Declared after the
-  // condition pickers so the choices come from what this section already uses,
-  // and the guard never has to accept a value the section does not have.
   const globalRulesOption = section.taboption(
     "conditions",
     form.DynamicList,
@@ -13929,10 +15606,6 @@ function createSectionContent(section) {
           '"%s" is not part of this section - add it to its conditions first',
         ).format(claim.value);
       }
-      // Normally impossible - a condition the other section claims cannot be
-      // entered here - but a hand-edited or imported config can carry the
-      // value on both sides, and writing the claim would then strip it from
-      // the section that actually owns it.
       const owner = globalRuleClaimsByOtherSections(section_id).get(
         `${claim.kind}:${claim.value}`,
       );
@@ -13983,7 +15656,8 @@ function createSectionContent(section) {
       "Apply section rules only to the specified local IP addresses",
     ),
   });
-  dependsOnRuleConditions(sourceIpOption);
+  dependsOnRoutingAction(sourceIpOption);
+  sourceIpOption.depends("action", "dns");
 
   const fullyRoutedOption = addLocalDeviceSubnetDynamicField(section, {
     key: "fully_routed_ips",
@@ -14077,9 +15751,22 @@ function createSectionContent(section) {
   excludedProtocolOption.value("tls", _("TLS / HTTPS"));
   excludedProtocolOption.value("ssh", _("SSH"));
   excludedProtocolOption.value("rdp", _("RDP"));
+  excludedProtocolOption.value("tcp", _("TCP"));
+  excludedProtocolOption.value("udp", _("UDP"));
+  excludedProtocolOption.value("icmp", _("ICMP"));
   excludedProtocolOption.modalonly = true;
   excludedProtocolOption.rmempty = true;
   dependsOnRoutingAction(excludedProtocolOption);
+  excludedProtocolOption.load = function (section_id) {
+    return getConfigListValues(section_id, "excluded_protocol");
+  };
+  excludedProtocolOption.write = function (section_id, value) {
+    writeListOption(section_id, "excluded_protocol", value);
+  };
+  excludedProtocolOption.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "excluded_protocol");
+    syncLinkedConditionOption(section_id, "excluded_protocol", null);
+  };
 
   const protocolOption = section.taboption(
     "conditions",
@@ -14096,9 +15783,22 @@ function createSectionContent(section) {
   protocolOption.value("tls", _("TLS / HTTPS"));
   protocolOption.value("ssh", _("SSH"));
   protocolOption.value("rdp", _("RDP"));
+  protocolOption.value("tcp", _("TCP"));
+  protocolOption.value("udp", _("UDP"));
+  protocolOption.value("icmp", _("ICMP"));
   protocolOption.modalonly = true;
   protocolOption.rmempty = true;
   dependsOnRoutingAction(protocolOption);
+  protocolOption.load = function (section_id) {
+    return getConfigListValues(section_id, "protocol");
+  };
+  protocolOption.write = function (section_id, value) {
+    writeListOption(section_id, "protocol", value);
+  };
+  protocolOption.remove = function (section_id) {
+    uci.unset(UCI_PACKAGE, section_id, "protocol");
+    syncLinkedConditionOption(section_id, "protocol", null);
+  };
 
   addDashboardServerFilterOptions(section);
 
@@ -14123,7 +15823,10 @@ function loadSectionTableOptions(sectionRef) {
 
       tasks.push(
         Promise.resolve(option.load.call(option, sectionId)).then((value) => {
-          option.cfgvalue(sectionId, value);
+          option.cfgvalue(
+            sectionId,
+            value !== undefined && value !== null ? value : option.default,
+          );
         }),
       );
     }
@@ -14155,6 +15858,7 @@ const ACTION_COLORS = {
   masque: "#8e44ad",
   openvpn: "#e74c3c",
   hosts: "#2ecc71",
+  group: "#2980b9",
 };
 
 const CLOUDFLARE_SHARED_CIDRS = [
@@ -14308,8 +16012,10 @@ async function readSubnetListFile(service) {
   if (_subnetListCache[service]) return _subnetListCache[service];
 
   const paths = [
+    `/tmp/tachyon-core/rulesets/community-subnets-${service}.lst`,
     `/tmp/sing-box/rulesets/community-subnets-${service}.lst`,
     `/etc/tachyon/rulesets/community-subnets-${service}.lst`,
+    `/usr/share/tachyon/rulesets/community-subnets-${service}.lst`,
     // steer cache: decoded from .srs by steer srs-read
     `/etc/steer/lists/cache/${service}.prefixes`,
   ];
@@ -14476,36 +16182,46 @@ function detectQueryType(query) {
 }
 
 async function readRulesetFile(path) {
-  try {
-    // fs.read is the LuCI RPC file-read — requires ACL entry for /tmp/sing-box/rulesets/*
-    let content = await fs.read(path).catch(() => null);
-    if (!content) {
-      // Fallback: read via exec cat (runs as root, always has access)
-      const res = await fs.exec("/bin/cat", [path]).catch(() => null);
-      if (res && res.code === 0 && res.stdout) {
-        content = res.stdout;
-      }
-    }
-    if (!content) return null;
-    return JSON.parse(content);
-  } catch (e) {
-    console.warn("Failed to parse ruleset file JSON:", path, e);
-    return null;
+  const candidates = [path];
+  if (path.startsWith("/tmp/sing-box/rulesets/")) {
+    candidates.unshift(
+      path.replace("/tmp/sing-box/rulesets/", "/tmp/tachyon-core/rulesets/"),
+    );
+  } else if (path.startsWith("/tmp/tachyon-core/rulesets/")) {
+    candidates.push(
+      path.replace("/tmp/tachyon-core/rulesets/", "/tmp/sing-box/rulesets/"),
+    );
   }
+  for (const candidate of candidates) {
+    try {
+      let content = await fs.read(candidate).catch(() => null);
+      if (!content) {
+        const res = await fs.exec("/bin/cat", [candidate]).catch(() => null);
+        if (res && res.code === 0 && res.stdout) {
+          content = res.stdout;
+        }
+      }
+      if (!content) continue;
+      return JSON.parse(content);
+    } catch (e) {
+      console.warn("Failed to parse ruleset file JSON:", candidate, e);
+    }
+  }
+  return null;
 }
 
 async function findCachedSrsFile(secName, community) {
-  const tmpSrs = `/tmp/sing-box/rulesets/community-${community}.srs`;
-  const etcSrs = `/etc/tachyon/rulesets/community-${community}.srs`;
+  const candidates = [
+    `/tmp/tachyon-core/rulesets/community-${community}.srs`,
+    `/tmp/sing-box/rulesets/community-${community}.srs`,
+    `/etc/tachyon/rulesets/community-${community}.srs`,
+  ];
 
-  let tmpStat = await fs.stat(tmpSrs).catch(() => null);
-  if (tmpStat && tmpStat.type === "file") {
-    return tmpSrs;
-  }
-
-  let etcStat = await fs.stat(etcSrs).catch(() => null);
-  if (etcStat && etcStat.type === "file") {
-    return etcSrs;
+  for (const srsPath of candidates) {
+    const st = await fs.stat(srsPath).catch(() => null);
+    if (st && st.type === "file") {
+      return srsPath;
+    }
   }
 
   return null;
@@ -14528,16 +16244,19 @@ async function matchCommunityList(secName, community, query, type) {
       "rule-set",
       "match",
       srsPath,
-      ...(type === "ip" ? ["--ip", query] : ["--domain", query]),
+      ...(type === "ip"
+        ? ["--ip", query]
+        : ["--domain", (query || "").toLowerCase()]),
     ];
 
-    // Try /usr/bin/sing-box first
-    let res = await fs.exec("/usr/bin/sing-box", matchArgs).catch(() => null);
-    if (checkMatch(res)) return true;
-
-    // Fallback to /usr/sbin/sing-box
-    res = await fs.exec("/usr/sbin/sing-box", matchArgs).catch(() => null);
-    if (checkMatch(res)) return true;
+    for (const bin of [
+      "/usr/bin/tachyon-core",
+      "/usr/bin/sing-box",
+      "/usr/sbin/sing-box",
+    ]) {
+      const res = await fs.exec(bin, matchArgs).catch(() => null);
+      if (checkMatch(res)) return true;
+    }
   }
 
   // Steer fallback: when steer is active engine, sing-box may not be installed.
@@ -14573,6 +16292,11 @@ async function matchCommunityList(secName, community, query, type) {
   return false;
 }
 
+function isSyntheticFakeIp(ip) {
+  const s = (ip || "").trim().toLowerCase();
+  return /^198\.(18|19)\./.test(s) || /^fc[0-3][0-9a-f]:/.test(s);
+}
+
 async function resolveDomainToIps(domain) {
   domain = (domain || "").trim().toLowerCase();
   if (!domain) return [];
@@ -14584,33 +16308,246 @@ async function resolveDomainToIps(domain) {
       .catch(() => null);
     if (res && res.code === 0 && res.stdout) {
       const parsed = JSON.parse(res.stdout.trim());
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
-      }
-    }
-  } catch (e) {}
-
-  // 2. Fallback: nslookup via /usr/bin/nslookup
-  try {
-    const res = await fs.exec("/usr/bin/nslookup", [domain]).catch(() => null);
-    if (res && res.stdout) {
-      const ips = [];
-      const lines = res.stdout.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        const m = trimmed.match(/^Address\s*\d*:\s*([0-9a-fA-F:.]+)/);
-        if (m) {
-          const addr = m[1].split("#")[0].trim();
-          if (!addr.startsWith("127.") && addr !== "::1" && addr !== "") {
-            if (!ips.includes(addr)) ips.push(addr);
-          }
+      if (Array.isArray(parsed)) {
+        const filtered = parsed.filter((ip) => ip && !isSyntheticFakeIp(ip));
+        if (filtered.length > 0) {
+          return filtered;
         }
       }
-      if (ips.length > 0) return ips;
     }
   } catch (e) {}
 
+  // 2. Fallback: nslookup via /usr/bin/nslookup (local then public resolver if FakeIP)
+  for (const args of [[domain], [domain, "77.88.8.8"], [domain, "1.1.1.1"]]) {
+    try {
+      const res = await fs.exec("/usr/bin/nslookup", args).catch(() => null);
+      if (res && res.stdout) {
+        const ips = [];
+        const lines = res.stdout.split("\n");
+        let pastHeader = false;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (/^(Name:|Non-authoritative answer:)/i.test(trimmed)) {
+            pastHeader = true;
+          }
+          if (!pastHeader) continue;
+          const m = trimmed.match(/^Address\s*\d*:\s*([0-9a-fA-F:.]+)/);
+          if (m) {
+            const addr = m[1].split("#")[0].trim();
+            if (
+              !addr.startsWith("127.") &&
+              addr !== "::1" &&
+              addr !== "" &&
+              !isSyntheticFakeIp(addr)
+            ) {
+              if (!ips.includes(addr)) ips.push(addr);
+            }
+          }
+        }
+        if (ips.length > 0) return ips;
+      }
+    } catch (e) {}
+  }
+
   return [];
+}
+
+function getSectionLeafConditionIds(secName) {
+  const result = [];
+  const visited = new Set();
+  const visitCond = (condId) => {
+    if (!condId || visited.has(condId)) return;
+    visited.add(condId);
+    if (uci.get(UCI_PACKAGE, condId, "enabled") === "0") return;
+    const expr = (uci.get(UCI_PACKAGE, condId, "expression") || "").trim();
+    const members = normalizeOptionValues(
+      uci.get(UCI_PACKAGE, condId, "members"),
+    );
+    if (expr) {
+      const tokens = expr
+        .replace(/[()&|!~]/g, " ")
+        .split(/\s+/)
+        .filter(Boolean);
+      for (const tok of tokens) {
+        const up = tok.toUpperCase();
+        if (
+          up === "AND" ||
+          up === "OR" ||
+          up === "NOT" ||
+          up === "И" ||
+          up === "ИЛИ" ||
+          up === "НЕ"
+        ) {
+          continue;
+        }
+        visitCond(tok);
+      }
+    } else if (members.length > 0) {
+      for (const m of members) visitCond(m);
+    } else {
+      result.push(condId);
+    }
+  };
+
+  const secExpr = (
+    uci.get(UCI_PACKAGE, secName, "condition_expression") || ""
+  ).trim();
+  const secRefs = normalizeOptionValues(
+    uci.get(UCI_PACKAGE, secName, "condition_refs"),
+  );
+  if (secExpr) {
+    const tokens = secExpr
+      .replace(/[()&|!~]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+    for (const tok of tokens) {
+      const up = tok.toUpperCase();
+      if (
+        up === "AND" ||
+        up === "OR" ||
+        up === "NOT" ||
+        up === "И" ||
+        up === "ИЛИ" ||
+        up === "НЕ"
+      ) {
+        continue;
+      }
+      visitCond(tok);
+    }
+  } else {
+    for (const cid of secRefs) visitCond(cid);
+  }
+  return result;
+}
+
+function getSectionEffectiveOptionValues(secName, key) {
+  const out = [];
+  const seen = new Set();
+  const addItems = (items) => {
+    for (const it of items) {
+      if (it && !seen.has(it)) {
+        seen.add(it);
+        out.push(it);
+      }
+    }
+  };
+  const targets = [secName, ...getSectionLeafConditionIds(secName)];
+  for (const tid of targets) {
+    addItems(normalizeOptionValues(uci.get(UCI_PACKAGE, tid, key)));
+    const textVal = uci.get(UCI_PACKAGE, tid, `${key}_text`);
+    if (textVal) {
+      addItems(normalizeOptionValues(textVal));
+    }
+  }
+  return out;
+}
+
+function getSectionEffectiveScalar(secName, key) {
+  const direct = uci.get(UCI_PACKAGE, secName, key);
+  if (direct != null && `${direct}`.trim() !== "") {
+    return `${direct}`.trim();
+  }
+  for (const cid of getSectionLeafConditionIds(secName)) {
+    const val = uci.get(UCI_PACKAGE, cid, key);
+    if (val != null && `${val}`.trim() !== "") {
+      return `${val}`.trim();
+    }
+  }
+  return "";
+}
+
+function getSectionGeoCountries(secName) {
+  const raw = getSectionEffectiveOptionValues(secName, "geoip_country");
+  const countries = [];
+  for (let item of raw) {
+    item = (item || "").trim().toLowerCase();
+    if (!item || item === "all") continue;
+    if (item === "non-ru") {
+      if (!countries.includes("ru")) countries.push("ru");
+      continue;
+    }
+    if (/^[a-z]{2}$/.test(item) && !countries.includes(item)) {
+      countries.push(item);
+    }
+  }
+  return countries;
+}
+
+function getSectionGeoMode(secName) {
+  const mode = getSectionEffectiveScalar(secName, "geoip_mode").toLowerCase();
+  if (
+    mode === "include" ||
+    mode === "exclude" ||
+    mode === "include_all" ||
+    mode === "exclude_direct"
+  ) {
+    return mode;
+  }
+  const act = uci.get(UCI_PACKAGE, secName, "action");
+  if (act === "bypass" || act === "block") return "include";
+  return "exclude";
+}
+
+async function matchesGeoCountrySet(secName, countries, domain, ips) {
+  for (const cc of countries) {
+    if (domain) {
+      const d = domain.toLowerCase();
+      if (d === cc || d.endsWith("." + cc)) {
+        return { matched: true, source: `tld_${cc}`, pattern: domain };
+      }
+      if (
+        cc === "ru" &&
+        (d.endsWith(".su") || d.endsWith(".xn--p1ai") || d.endsWith(".рф"))
+      ) {
+        return { matched: true, source: "tld_ru", pattern: domain };
+      }
+      if (
+        await matchCommunityList(secName, `geosite_${cc}`, domain, "domain")
+      ) {
+        return { matched: true, source: `geosite_${cc}`, pattern: domain };
+      }
+      if (
+        cc === "ru" &&
+        (await matchCommunityList(secName, "russia_inside", domain, "domain"))
+      ) {
+        return { matched: true, source: "russia_inside", pattern: domain };
+      }
+    }
+    const geoService = `geoip_${cc}`;
+    const geoSubnets = await readSubnetListFile(geoService);
+    for (const ip of ips || []) {
+      if (!ip || isSyntheticFakeIp(ip)) continue;
+      const matchedCidr = matchIpInCidrs(ip, geoSubnets);
+      if (matchedCidr) {
+        return {
+          matched: true,
+          source: geoService,
+          pattern: `${matchedCidr} (IP: ${ip})`,
+          ip: ip,
+        };
+      }
+      if (await matchCommunityList(secName, geoService, ip, "ip")) {
+        return {
+          matched: true,
+          source: geoService,
+          pattern: `${ip}`,
+          ip: ip,
+        };
+      }
+      if (
+        cc === "ru" &&
+        (await matchCommunityList(secName, "russia_inside", ip, "ip"))
+      ) {
+        return {
+          matched: true,
+          source: "russia_inside",
+          pattern: `${ip}`,
+          ip: ip,
+        };
+      }
+    }
+  }
+  return { matched: false };
 }
 
 async function performTrace(query) {
@@ -14632,6 +16569,8 @@ async function performTrace(query) {
   let queryForMatching = query;
   if (type === "ip" && query.indexOf("/") !== -1) {
     queryForMatching = query.split("/")[0];
+  } else if (type === "domain") {
+    queryForMatching = queryForMatching.toLowerCase();
   }
 
   // Check DNS Detour from settings if enabled
@@ -14704,9 +16643,7 @@ async function performTrace(query) {
     const action = uci.get(UCI_PACKAGE, secName, "action") || "connection";
 
     if (type === "port") {
-      const ports = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "ports"),
-      );
+      const ports = getSectionEffectiveOptionValues(secName, "ports");
       const matchedPort = matchPort(queryForMatching, ports);
       if (matchedPort) {
         return {
@@ -14723,9 +16660,7 @@ async function performTrace(query) {
     }
 
     if (type === "ip") {
-      const ipCidr = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "ip_cidr"),
-      );
+      const ipCidr = getSectionEffectiveOptionValues(secName, "ip_cidr");
       const matchedCidr = matchIpInCidrs(queryForMatching, ipCidr);
       if (matchedCidr) {
         return {
@@ -14740,13 +16675,18 @@ async function performTrace(query) {
         };
       }
 
-      const listsRuleset = await readRulesetFile(
-        `/tmp/sing-box/rulesets/${secName}-lists-ruleset.json`,
-      );
+      const listsRuleset =
+        (await readRulesetFile(
+          `/tmp/tachyon-core/rulesets/${secName}-lists-ruleset.json`,
+        )) ||
+        (await readRulesetFile(
+          `/tmp/sing-box/rulesets/${secName}-lists-ruleset.json`,
+        ));
       const matchedListIp = matchIpInRuleset(queryForMatching, listsRuleset);
       if (matchedListIp) {
-        const domainIpLists = normalizeOptionValues(
-          uci.get(UCI_PACKAGE, secName, "domain_ip_lists"),
+        const domainIpLists = getSectionEffectiveOptionValues(
+          secName,
+          "domain_ip_lists",
         );
         return {
           matched: true,
@@ -14761,16 +16701,21 @@ async function performTrace(query) {
         };
       }
 
-      const remoteSubnetRuleset = await readRulesetFile(
-        `/tmp/sing-box/rulesets/${secName}-remote-subnet-ruleset.json`,
-      );
+      const remoteSubnetRuleset =
+        (await readRulesetFile(
+          `/tmp/tachyon-core/rulesets/${secName}-remote-subnet-ruleset.json`,
+        )) ||
+        (await readRulesetFile(
+          `/tmp/sing-box/rulesets/${secName}-remote-subnet-ruleset.json`,
+        ));
       const matchedRemoteIp = matchIpInRuleset(
         queryForMatching,
         remoteSubnetRuleset,
       );
       if (matchedRemoteIp) {
-        const domainIpLists = normalizeOptionValues(
-          uci.get(UCI_PACKAGE, secName, "domain_ip_lists"),
+        const domainIpLists = getSectionEffectiveOptionValues(
+          secName,
+          "domain_ip_lists",
         );
         return {
           matched: true,
@@ -14787,10 +16732,11 @@ async function performTrace(query) {
 
       // Check community list rulesets for matching IPs
       const communitySubnetsEnabled =
-        uci.get(UCI_PACKAGE, secName, "community_subnets") !== "0";
+        getSectionEffectiveScalar(secName, "community_subnets") !== "0";
       if (communitySubnetsEnabled) {
-        const communityLists = normalizeOptionValues(
-          uci.get(UCI_PACKAGE, secName, "community_lists"),
+        const communityLists = getSectionEffectiveOptionValues(
+          secName,
+          "community_lists",
         );
         for (const community of communityLists) {
           const subnets = await readSubnetListFile(community);
@@ -14833,23 +16779,90 @@ async function performTrace(query) {
           }
         }
       }
+
+      const geoCountries = getSectionGeoCountries(secName);
+      if (geoCountries.length > 0) {
+        const geoMode = getSectionGeoMode(secName);
+        const geoCheck = await matchesGeoCountrySet(
+          secName,
+          geoCountries,
+          null,
+          [queryForMatching],
+        );
+        const inverts = geoMode === "exclude" || geoMode === "exclude_direct";
+        if (inverts ? !geoCheck.matched : geoCheck.matched) {
+          return {
+            matched: true,
+            sectionName: secName,
+            label: label,
+            action: action,
+            ruleType: inverts
+              ? `GeoIP Exclude (!${geoCountries.join(",")})`
+              : `GeoIP Include (${geoCountries.join(",")})`,
+            pattern: geoCheck.pattern || queryForMatching,
+            matchedIp: queryForMatching,
+            priority: i + 1,
+            totalSections: totalSections,
+          };
+        } else if (geoMode === "exclude_direct" && geoCheck.matched) {
+          return {
+            matched: true,
+            sectionName: secName,
+            label: label,
+            action: "bypass",
+            ruleType: `GeoIP Exclude Direct (${geoCountries.join(",")})`,
+            pattern: geoCheck.pattern || queryForMatching,
+            matchedIp: queryForMatching,
+            priority: i + 1,
+            totalSections: totalSections,
+          };
+        } else if (geoMode === "include_all") {
+          return {
+            matched: true,
+            sectionName: secName,
+            label: label,
+            action: action,
+            ruleType: `GeoIP Include All (${geoCountries.join(",")})`,
+            pattern: queryForMatching,
+            matchedIp: queryForMatching,
+            priority: i + 1,
+            totalSections: totalSections,
+          };
+        }
+      }
+
+      if (getSectionEffectiveScalar(secName, "match_all") === "1") {
+        return {
+          matched: true,
+          sectionName: secName,
+          label: label,
+          action: action,
+          ruleType: "Match All",
+          pattern: queryForMatching,
+          matchedIp: queryForMatching,
+          priority: i + 1,
+          totalSections: totalSections,
+        };
+      }
     }
 
     if (type === "domain") {
-      const domainSuffixes = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "domain_suffix"),
+      const domainSuffixes = getSectionEffectiveOptionValues(
+        secName,
+        "domain_suffix",
       );
-      const rawDomains = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "domain"),
-      );
-      const domainKeywords = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "domain_keyword"),
+      const rawDomains = getSectionEffectiveOptionValues(secName, "domain");
+      const domainKeywords = getSectionEffectiveOptionValues(
+        secName,
+        "domain_keyword",
       ).map((k) => `keyword:${k}`);
-      const domainRegexes = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "domain_regex"),
+      const domainRegexes = getSectionEffectiveOptionValues(
+        secName,
+        "domain_regex",
       ).map((r) => `regex:${r}`);
-      const userDomains = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "user_domains"),
+      const userDomains = getSectionEffectiveOptionValues(
+        secName,
+        "user_domains",
       );
       const allUciDomains = [
         ...domainSuffixes,
@@ -14876,17 +16889,22 @@ async function performTrace(query) {
         };
       }
 
-      const listsRuleset = await readRulesetFile(
-        `/tmp/sing-box/rulesets/${secName}-lists-ruleset.json`,
-      );
+      const listsRuleset =
+        (await readRulesetFile(
+          `/tmp/tachyon-core/rulesets/${secName}-lists-ruleset.json`,
+        )) ||
+        (await readRulesetFile(
+          `/tmp/sing-box/rulesets/${secName}-lists-ruleset.json`,
+        ));
       if (listsRuleset) {
         const matchedListDomain = matchDomainInRuleset(
           queryForMatching,
           listsRuleset,
         );
         if (matchedListDomain) {
-          const domainIpLists = normalizeOptionValues(
-            uci.get(UCI_PACKAGE, secName, "domain_ip_lists"),
+          const domainIpLists = getSectionEffectiveOptionValues(
+            secName,
+            "domain_ip_lists",
           );
           return {
             matched: true,
@@ -14902,17 +16920,22 @@ async function performTrace(query) {
         }
       }
 
-      const remoteDomainRuleset = await readRulesetFile(
-        `/tmp/sing-box/rulesets/${secName}-remote-domain-ruleset.json`,
-      );
+      const remoteDomainRuleset =
+        (await readRulesetFile(
+          `/tmp/tachyon-core/rulesets/${secName}-remote-domain-ruleset.json`,
+        )) ||
+        (await readRulesetFile(
+          `/tmp/sing-box/rulesets/${secName}-remote-domain-ruleset.json`,
+        ));
       if (remoteDomainRuleset) {
         const matchedRemoteDomain = matchDomainInRuleset(
           queryForMatching,
           remoteDomainRuleset,
         );
         if (matchedRemoteDomain) {
-          const domainIpLists = normalizeOptionValues(
-            uci.get(UCI_PACKAGE, secName, "domain_ip_lists"),
+          const domainIpLists = getSectionEffectiveOptionValues(
+            secName,
+            "domain_ip_lists",
           );
           return {
             matched: true,
@@ -14929,8 +16952,9 @@ async function performTrace(query) {
       }
 
       // Check community list rulesets for matching domains
-      const communityLists = normalizeOptionValues(
-        uci.get(UCI_PACKAGE, secName, "community_lists"),
+      const communityLists = getSectionEffectiveOptionValues(
+        secName,
+        "community_lists",
       );
       for (const community of communityLists) {
         if (
@@ -14952,35 +16976,31 @@ async function performTrace(query) {
   }
 
   if (type === "domain") {
-    // No direct domain rule matched. Resolve domain to IP addresses and check IP routing rules
+    // No direct domain rule matched. Resolve domain to IP addresses and check IP / GeoIP routing rules
     const resolvedIps = await resolveDomainToIps(queryForMatching);
-    if (resolvedIps && resolvedIps.length > 0) {
-      for (let i = 0; i < sections.length; i++) {
-        const sec = sections[i];
-        const secName = sec[".name"];
-        if (uci.get(UCI_PACKAGE, secName, "enabled") === "0") continue;
+    for (let i = 0; i < sections.length; i++) {
+      const sec = sections[i];
+      const secName = sec[".name"];
+      if (uci.get(UCI_PACKAGE, secName, "enabled") === "0") continue;
 
-        const label =
-          uci.get(UCI_PACKAGE, secName, "label") ||
-          uci.get(UCI_PACKAGE, secName, "name") ||
-          secName;
-        const action = uci.get(UCI_PACKAGE, secName, "action") || "connection";
+      const label =
+        uci.get(UCI_PACKAGE, secName, "label") ||
+        uci.get(UCI_PACKAGE, secName, "name") ||
+        secName;
+      const action = uci.get(UCI_PACKAGE, secName, "action") || "connection";
 
-        const ipCidr = normalizeOptionValues(
-          uci.get(UCI_PACKAGE, secName, "ip_cidr"),
-        );
+      if (resolvedIps && resolvedIps.length > 0) {
+        const ipCidr = getSectionEffectiveOptionValues(secName, "ip_cidr");
         const listsRuleset = await readRulesetFile(
-          `/tmp/sing-box/rulesets/${secName}-lists-ruleset.json`,
+          `/tmp/tachyon-core/rulesets/${secName}-lists-ruleset.json`,
         );
         const remoteSubnetRuleset = await readRulesetFile(
-          `/tmp/sing-box/rulesets/${secName}-remote-subnet-ruleset.json`,
+          `/tmp/tachyon-core/rulesets/${secName}-remote-subnet-ruleset.json`,
         );
         const communitySubnetsEnabled =
-          uci.get(UCI_PACKAGE, secName, "community_subnets") !== "0";
+          getSectionEffectiveScalar(secName, "community_subnets") !== "0";
         const communityLists = communitySubnetsEnabled
-          ? normalizeOptionValues(
-              uci.get(UCI_PACKAGE, secName, "community_lists"),
-            )
+          ? getSectionEffectiveOptionValues(secName, "community_lists")
           : [];
 
         for (const ip of resolvedIps) {
@@ -15089,6 +17109,85 @@ async function performTrace(query) {
         }
       }
 
+      const geoCountries = getSectionGeoCountries(secName);
+      if (geoCountries.length > 0) {
+        const geoMode = getSectionGeoMode(secName);
+        const geoCheck = await matchesGeoCountrySet(
+          secName,
+          geoCountries,
+          queryForMatching,
+          resolvedIps,
+        );
+        const inverts = geoMode === "exclude" || geoMode === "exclude_direct";
+        const resolvedSuffix =
+          resolvedIps && resolvedIps.length > 0
+            ? ` (resolved: ${resolvedIps.join(", ")})`
+            : "";
+        if (inverts ? !geoCheck.matched : geoCheck.matched) {
+          return {
+            matched: true,
+            sectionName: secName,
+            label: label,
+            action: action,
+            ruleType: inverts
+              ? `GeoIP Exclude (!${geoCountries.join(",")})`
+              : `GeoIP Include (${geoCountries.join(",")})`,
+            pattern: geoCheck.pattern || `${queryForMatching}${resolvedSuffix}`,
+            resolvedDomain: queryForMatching,
+            resolvedIps: resolvedIps,
+            matchedIp: geoCheck.ip || (resolvedIps && resolvedIps[0]),
+            priority: i + 1,
+            totalSections: totalSections,
+          };
+        } else if (geoMode === "exclude_direct" && geoCheck.matched) {
+          return {
+            matched: true,
+            sectionName: secName,
+            label: label,
+            action: "bypass",
+            ruleType: `GeoIP Exclude Direct (${geoCountries.join(",")})`,
+            pattern: geoCheck.pattern || `${queryForMatching}${resolvedSuffix}`,
+            resolvedDomain: queryForMatching,
+            resolvedIps: resolvedIps,
+            matchedIp: geoCheck.ip || (resolvedIps && resolvedIps[0]),
+            priority: i + 1,
+            totalSections: totalSections,
+          };
+        } else if (geoMode === "include_all") {
+          return {
+            matched: true,
+            sectionName: secName,
+            label: label,
+            action: action,
+            ruleType: `GeoIP Include All (${geoCountries.join(",")})`,
+            pattern: `${queryForMatching}${resolvedSuffix}`,
+            resolvedDomain: queryForMatching,
+            resolvedIps: resolvedIps,
+            matchedIp: resolvedIps && resolvedIps[0],
+            priority: i + 1,
+            totalSections: totalSections,
+          };
+        }
+      }
+
+      if (getSectionEffectiveScalar(secName, "match_all") === "1") {
+        return {
+          matched: true,
+          sectionName: secName,
+          label: label,
+          action: action,
+          ruleType: "Match All",
+          pattern: queryForMatching,
+          resolvedDomain: queryForMatching,
+          resolvedIps: resolvedIps,
+          matchedIp: resolvedIps && resolvedIps[0],
+          priority: i + 1,
+          totalSections: totalSections,
+        };
+      }
+    }
+
+    if (resolvedIps && resolvedIps.length > 0) {
       return {
         matched: false,
         resolvedDomain: queryForMatching,
@@ -15367,29 +17466,55 @@ function showSectionRulesModal(section_id) {
     section_id;
 
   const getCleanList = (key) => {
-    let val = uci.get(UCI_PACKAGE, section_id, key);
-    if (!val) return [];
-    if (Array.isArray(val)) val = val.join("\n");
-    return parseCommentAwareListTokens(val).map((t) => t.value);
+    const out = [];
+    const seen = new Set();
+    const targets = [section_id, ...getSectionLeafConditionIds(section_id)];
+    for (const tid of targets) {
+      for (const k of [key, `${key}_text`]) {
+        let val = uci.get(UCI_PACKAGE, tid, k);
+        if (!val) continue;
+        if (Array.isArray(val)) val = val.join("\n");
+        for (const t of parseCommentAwareListTokens(val)) {
+          if (t.value && !seen.has(t.value)) {
+            seen.add(t.value);
+            out.push(t.value);
+          }
+        }
+      }
+    }
+    return out;
   };
 
-  const domains = getCleanList("domain");
+  const domains = [
+    ...getCleanList("domain"),
+    ...getCleanList("user_domains"),
+    ...getCleanList("domain_suffix"),
+    ...getCleanList("domain_keyword").map((k) => `keyword:${k}`),
+    ...getCleanList("domain_regex").map((r) => `regex:${r}`),
+  ].filter((v, idx, arr) => arr.indexOf(v) === idx);
   const ips = getCleanList("ip_cidr");
   const community = getCleanList("community_lists");
-  const ruleSets = getCleanList("rule_set");
+  const ruleSets = [
+    ...getCleanList("rule_set"),
+    ...getCleanList("rule_set_with_subnets"),
+  ].filter((v, idx, arr) => arr.indexOf(v) === idx);
   const domainIpLists = getCleanList("domain_ip_lists");
   const geosite = getCleanList("geosite");
   let geoipCountry = getCleanList("geoip_country");
   if (geoipCountry.length === 1 && geoipCountry[0] === "non-ru") {
     geoipCountry = ["ru"];
   }
-  const geoipMode = uci.get(UCI_PACKAGE, section_id, "geoip_mode") || "exclude";
+  const geoipMode = getSectionGeoMode(section_id);
   const geoipInverted =
     geoipMode === "exclude" || geoipMode === "exclude_direct";
   const geoip = geoipCountry.map(
     (c) => (geoipInverted ? "NOT " : "") + c.toUpperCase(),
   );
-  const sourceIp = getCleanList("source_ip_cidr");
+  const sourceIp = [
+    ...getCleanList("source_ip_cidr"),
+    ...getCleanList("source_macs"),
+    ...getCleanList("fully_routed_ips"),
+  ].filter((v, idx, arr) => arr.indexOf(v) === idx);
   const ports = getCleanList("ports");
   const dscp = getCleanList("dscp");
 
@@ -15570,6 +17695,30 @@ function cascadeDeleteSection(section_id) {
       if (sec.dns_detour_section === section_id) {
         uci.set(UCI_PACKAGE, sName, "dns_detour_section", "");
         uci.set(UCI_PACKAGE, sName, "dns_detour_enabled", "0");
+      }
+      if (
+        Array.isArray(sec.group_members) &&
+        sec.group_members.includes(section_id)
+      ) {
+        const nextMembers = sec.group_members.filter((m) => m !== section_id);
+        if (nextMembers.length > 0) {
+          uci.set(UCI_PACKAGE, sName, "group_members", nextMembers);
+        } else {
+          uci.unset(UCI_PACKAGE, sName, "group_members");
+        }
+      } else if (
+        typeof sec.group_members === "string" &&
+        sec.group_members.trim() !== ""
+      ) {
+        const parts = sec.group_members.trim().split(/\s+/);
+        if (parts.includes(section_id)) {
+          const nextMembers = parts.filter((m) => m !== section_id);
+          if (nextMembers.length > 0) {
+            uci.set(UCI_PACKAGE, sName, "group_members", nextMembers);
+          } else {
+            uci.unset(UCI_PACKAGE, sName, "group_members");
+          }
+        }
       }
     });
   } catch (_e) {}

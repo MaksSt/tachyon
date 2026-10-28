@@ -14,10 +14,19 @@ let core_binary_running = common.core_binary_running;
 let command_from_args = common.command_from_args;
 let command_output = common.command_output;
 
+function read_active_core_config() {
+    let cfg_path = uci_core.get(CONFIG_NAME, "settings", "config_path");
+    if (cfg_path && cfg_path != "") {
+        let d = fs.readfile(cfg_path);
+        if (d) return d;
+    }
+    return fs.readfile("/etc/tachyon-core/config.json") || fs.readfile("/etc/sing-box/config.json");
+}
+
 // Helper to get clash url
 function get_clash_url(endpoint) {
     let host = "127.0.0.1:9090"; // default fallback
-    let config_data = fs.readfile("/etc/tachyon-core/config.json");
+    let config_data = read_active_core_config();
     if (config_data) {
         try {
             let sb_cfg = json(config_data);
@@ -42,7 +51,7 @@ function get_clash_url(endpoint) {
 }
 
 function get_clash_secret() {
-    let config_data = fs.readfile("/etc/tachyon-core/config.json");
+    let config_data = read_active_core_config();
     if (config_data) {
         try {
             let sb_cfg = json(config_data);
@@ -127,13 +136,18 @@ function get_system_status() {
     let m = int((up_sec - (d * 86400) - (h * 3600)) / 60);
     status_obj.uptime = sprintf("%d дн. %02d:%02d", d, h, m);
 
-    // sing-box status
+    // Routing engine status
+    let engine_name = "tachyon-core";
+    try { engine_name = require("core.engine").get_active(); } catch (e) {}
+    status_obj.engine_name = engine_name;
     let sb_running = core_binary_running();
     status_obj.singbox_running = sb_running;
     status_obj.singbox = sb_running ? "🟢 running" : "🔴 stopped";
-    let sb_variant = trim(as_string(fs.readfile("/etc/tachyon/tachyon-core-variant") || ""));
-    if (sb_variant != "")
-        status_obj.singbox_variant = sb_variant;
+    if (engine_name == "sing-box") {
+        let sb_variant = trim(as_string(fs.readfile("/etc/tachyon/sing-box-variant") || fs.readfile("/etc/tachyon/tachyon-core-variant") || ""));
+        if (sb_variant != "" && sb_variant != "tachyon-core")
+            status_obj.singbox_variant = sb_variant;
+    }
 
     // zapret2 status
     let z2_installed = fs.stat("/opt/zapret2/nfq2/nfqws2") != null ||
@@ -351,10 +365,24 @@ function manage_domain_list_by_section(sec_name, domain, do_delete) {
         return { success: false, error: "Секция '" + sec_name + "' не найдена." };
     }
 
-    let option_path = CONFIG_NAME + "." + sec_name + ".domain";
+    let rendering = null;
+    try { rendering = require("service.telegram.rendering"); } catch (e) {}
+    let holders = rendering ? rendering.section_own_and_conditions(s) : [ s ];
 
     if (do_delete) {
-        if (uci_core.del_list(option_path, domain)) {
+        let deleted = false;
+        for (let h in holders) {
+            let hname = h[".name"];
+            if (!hname) continue;
+            for (let k in [ "domain", "domain_suffix", "user_domains" ]) {
+                let opt_path = CONFIG_NAME + "." + hname + "." + k;
+                for (let variant in [ domain, "domain:" + domain, "full:" + domain, "." + domain ]) {
+                    if (uci_core.del_list(opt_path, variant))
+                        deleted = true;
+                }
+            }
+        }
+        if (deleted) {
             uci_core.commit(CONFIG_NAME);
             common.command_status("/usr/bin/tachyon reload");
             return { success: true, message: "Запись <code>" + domain + "</code> удалена." };
@@ -362,18 +390,27 @@ function manage_domain_list_by_section(sec_name, domain, do_delete) {
             return { success: false, error: "Запись <code>" + domain + "</code> не найдена." };
         }
     } else {
-        let current_val = uci_core.get(option_path);
-        let exists = false;
-        if (current_val != "") {
-            for (let item in split(current_val, " ")) {
-                if (item == domain) {
-                    exists = true;
-                    break;
-                }
+        if (rendering) {
+            let existing = rendering.section_condition_values(s, "domain_suffix");
+            let existing_exact = rendering.section_condition_values(s, "domain");
+            for (let d in existing) {
+                if (d == domain) return { success: false, error: "Запись <code>" + domain + "</code> уже есть в секции." };
+            }
+            for (let d in existing_exact) {
+                if (d == domain) return { success: false, error: "Запись <code>" + domain + "</code> уже есть в секции." };
             }
         }
-        if (exists) {
-            return { success: false, error: "Запись <code>" + domain + "</code> уже есть в секции." };
+        let cond = rendering ? rendering.section_primary_atomic_condition(s) : null;
+        let target_holder = (cond && cond[".name"]) ? cond[".name"] : sec_name;
+        let target_key = cond ? "domain_suffix" : "domain";
+        let option_path = CONFIG_NAME + "." + target_holder + "." + target_key;
+
+        let current_val = uci_core.get(option_path);
+        if (current_val != "") {
+            for (let item in split(current_val, " ")) {
+                if (item == domain)
+                    return { success: false, error: "Запись <code>" + domain + "</code> уже есть в секции." };
+            }
         }
 
         if (uci_core.add_list(option_path, domain)) {
@@ -390,11 +427,18 @@ function manage_domain_list(action_type, domain, do_delete) {
     if (!c) return { success: false, error: "Не удалось инициализировать UCI" };
     c.load(CONFIG_NAME);
 
+    let connections = null;
+    try { connections = require("config.connections"); } catch (e) {}
+
     let target_section = null;
     c.foreach(CONFIG_NAME, "section", function(s) {
-        if (s.enabled == "1" && s.action == action_type) {
-            target_section = s[".name"];
-            return false;
+        if (s.enabled == "1") {
+            if (s.action == action_type || (action_type == "proxy" && s.action == "connection")) {
+                if (action_type == "proxy" && connections && !connections.is_remote_proxy_section(s))
+                    return;
+                target_section = s[".name"];
+                return false;
+            }
         }
     });
 

@@ -4,31 +4,39 @@ let fs = require("fs");
 let uci_core = require("core.uci");
 let common = require("core.common");
 let helpers = require("core.helpers");
-let connections = require("config.connections");
+let connections = null;
+function get_connections() {
+    if (connections == null) connections = require("config.connections");
+    return connections;
+}
 let events = require("core.events");
 let event_controller = require("service.event_controller");
 let smart_detect = require("service.smart_detect");
 let smart_plus = require("service.smart_detect_plus");
-let smart_probe = require("service.smart_detect_probe");
+let smart_probe = null;
+function get_smart_probe() {
+    if (smart_probe == null) smart_probe = require("service.smart_detect_probe");
+    return smart_probe;
+}
 let smart_plus_job = null;
 let smart_plus_seen = null;
 let watchdog_shutting_down = false;
 
 let reconciler = null;
-try {
-    reconciler = require("service.reconciler");
-} catch (e) {}
-
 let known_good = null;
-try {
-    known_good = require("service.known_good");
-} catch (e) {}
+function get_known_good() {
+    if (known_good == null) {
+        try { known_good = require("service.known_good"); } catch (e) {}
+    }
+    return known_good;
+}
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
 const PID_FILE = getenv("TACHYON_WATCHDOG_PID_FILE") || "/var/run/tachyon_watchdog.pid";
 const SUPERVISOR_PID_FILE = getenv("TACHYON_WATCHDOG_SUPERVISOR_PID_FILE") || "/var/run/tachyon_watchdog.supervisor.pid";
 const WATCHDOG_UC = LIB_DIR + "/service/watchdog.uc";
+const WATCHDOG_SUPERVISOR_UC = LIB_DIR + "/service/watchdog_supervisor.uc";
 // The supervisor launches this instead of WATCHDOG_UC, so tests can point it
 // at a fake worker without standing up the real daemon.
 const WORKER_UC = getenv("TACHYON_WATCHDOG_WORKER_UC") || WATCHDOG_UC;
@@ -80,6 +88,22 @@ function bg_system(cmd) {
 
 function settings() {
     return common.object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+}
+
+function active_engine_name() {
+    try {
+        return require("core.engine").get_active();
+    } catch (e) {
+        return "tachyon-core";
+    }
+}
+
+function core_init_script() {
+    try {
+        return require("core.process").core_contract().init_script;
+    } catch (e) {
+        return "/etc/init.d/tachyon-core";
+    }
 }
 
 // The empty catch is the point: every caller means "make sure this path is
@@ -288,7 +312,9 @@ function stop_runtime(worker_exit) {
         }
     }
     remove_file(PID_FILE);
-    smart_probe.cleanup();
+    let sp = smart_probe || (type(get_smart_probe) == "function" ? get_smart_probe() : null);
+    if (sp && type(sp.cleanup) == "function")
+        sp.cleanup();
     smart_plus_job = null;
 
     // Kill orphaned logread -f processes. These accumulate when watchdog is
@@ -328,14 +354,17 @@ function smart_detect_get_proxy_sections() {
     if (!sections || length(sections) == 0) return [];
     let connections = require("config.connections");
     let secs = [];
+    let dpi_secs = [];
     for (let s in sections) {
         if (s.enabled != "1") continue;
         let act = as_string(s.action || "");
-        if (connections.is_remote_proxy_action(act)) {
+        if ((connections.is_remote_proxy_section ? connections.is_remote_proxy_section(s) : connections.is_remote_proxy_action(act)) || act == "group") {
             push(secs, s[".name"]);
+        } else if (connections.is_remote_proxy_action(act)) {
+            push(dpi_secs, s[".name"]);
         }
     }
-    return secs;
+    return length(secs) > 0 ? secs : dpi_secs;
 }
 
 // Extract a candidate domain from a sing-box log line. Returns null when the
@@ -350,6 +379,32 @@ function smart_detect_extract_domain(line) {
 // looks like. The direct probe reports that as a "dns" failure and the verdict
 // decides against the proxy leg instead.
 
+let smart_plus_reload_pending = false;
+
+function section_linked_condition_domains(c, sec) {
+    let out = [];
+    if (type(sec) != "object") return out;
+    let conns = type(get_connections) == "function" ? get_connections() : null;
+    if (conns && type(conns.set_item_sections_from_cursor) == "function") {
+        try { conns.set_item_sections_from_cursor(c, CONFIG_NAME); } catch (e) {}
+    }
+    let conds = (conns && type(conns.section_leaf_conditions) == "function")
+        ? conns.section_leaf_conditions(sec) : [];
+    for (let cond in conds) {
+        for (let k in [ "user_domains", "user_domains_text", "domain", "domain_text", "domain_suffix", "domain_suffix_text" ]) {
+            let v = cond[k];
+            if (!v) continue;
+            let arr = type(v) == "array" ? v : split(as_string(v), /[\r\n, \t]+/);
+            for (let item in arr) {
+                let d = trim(replace(as_string(item), /^(full:|domain:|\*?\.)/, ""));
+                if (d != "" && substr(d, 0, 1) != "#" && substr(d, 0, 2) != "//")
+                    push(out, d);
+            }
+        }
+    }
+    return out;
+}
+
 function smart_detect_add_domain(sec_name, domain) {
     let c = uci_core.cursor();
     if (!c) return false;
@@ -363,6 +418,9 @@ function smart_detect_add_domain(sec_name, domain) {
     for (let d in existing) {
         if (trim(as_string(d)) == domain) return true;
     }
+    for (let cd in section_linked_condition_domains(c, sec)) {
+        if (cd == domain) return true;
+    }
     c.list_add(CONFIG_NAME, sec_name, "user_domains", domain);
     c.commit(CONFIG_NAME);
     command_status("/usr/bin/tachyon reload > /dev/null 2>&1");
@@ -374,7 +432,6 @@ function smart_detect_add_domain(sec_name, domain) {
 // confirmed N domains restarted sing-box N times, and every restart drops live
 // connections on the router. Returns what was actually written, so the caller
 // only reports domains that really landed.
-let smart_plus_reload_pending = false;
 function smart_detect_apply_plus_domains(entries) {
     let c = uci_core.cursor();
     if (!c || !length(entries)) return [];
@@ -404,6 +461,10 @@ function smart_detect_apply_plus_domains(entries) {
         let already = false;
         for (let d in values)
             if (smart_plus.normalize_domain(d) == entry.domain) already = true;
+        if (!already) {
+            for (let cd in section_linked_condition_domains(c, sec))
+                if (smart_plus.normalize_domain(cd) == entry.domain) already = true;
+        }
         if (!already) {
             push(values, entry.domain);
             push(added, entry);
@@ -475,6 +536,11 @@ function smart_detect_apply_domains(entries) {
         for (let d in existing) {
             if (trim(as_string(d)) == domain) already = true;
         }
+        if (!already) {
+            for (let cd in section_linked_condition_domains(c, sec)) {
+                if (cd == domain) already = true;
+            }
+        }
         if (already) continue;
         // Group per section so list_add never runs twice on the same section
         // between commits.
@@ -523,32 +589,25 @@ function start_runtime() {
         return 0;
     }
 
-    // Spawn the supervisor, not the worker. The old spawn launched the worker
-    // detached with stdout and stderr both going to /dev/null and left nobody
-    // reaping it: on firmware where the ucode uloop event loop segfaults, the
-    // worker died seconds after start, nothing logged the death (the exec'd
-    // process has no shell left to print "Segmentation fault") and the
-    // watchdog stayed dead until the next manual start. The supervisor's pid
-    // lands in SUPERVISOR_PID_FILE; the worker's own pid still goes to
-    // PID_FILE, which every status surface reads.
+    // Spawn the lightweight supervisor, not the worker. (Legacy reference: WATCHDOG_UC, "supervise")
+    // On firmware where the ucode uloop event loop segfaults, the worker died
+    // seconds after start, nothing logged the death (the exec'd process has no
+    // shell left to print "Segmentation fault") and the watchdog stayed dead
+    // until the next manual start. The supervisor's pid lands in
+    // SUPERVISOR_PID_FILE; the worker's own pid still goes to PID_FILE, which
+    // every status surface reads.
+    let sup_script = fs.stat(WATCHDOG_SUPERVISOR_UC) != null ? WATCHDOG_SUPERVISOR_UC : WATCHDOG_UC;
     let command = common.background_command_with_pid(
-        command_from_args([ "ucode", "-L", LIB_DIR, WATCHDOG_UC, "supervise" ]),
+        command_from_args([ "ucode", "-L", LIB_DIR, sup_script, "supervise" ]),
         ">/dev/null", ">" + shell_quote(SUPERVISOR_PID_FILE));
     return command_status(command);
 }
 
-// Keep the worker alive. Polls the pid file the worker spawn writes, logs
-// every death with how long the worker lasted, and respawns after a flat
-// delay. Two consecutive early deaths (shorter than WORKER_STABLE_SECONDS)
-// flip the respawn into TACHYON_WATCHDOG_LEGACY=1, which makes the worker
-// take the polling branch that never touches uloop - the fallback for
-// firmware where uloop.run() itself crashes. The legacy choice is sticky for
-// the lifetime of the supervisor: it is re-evaluated on the next start, which
-// is also when a ucode upgrade that fixed the crash gets picked up.
-//
-// The supervisor has no SIGTERM handler on purpose: stop_runtime() kills it
-// first and then the worker, so a handler could only race the shutdown.
+// Keep the worker alive. Delegates to service/watchdog_supervisor.uc when available.
 function supervise() {
+    try {
+        return require("service.watchdog_supervisor").supervise();
+    } catch (e) {}
     log_message("Watchdog supervisor started", "info");
 
     let early_deaths = 0;
@@ -645,20 +704,12 @@ function run_zero_rtt_prefetching() {
     if (length(domain_list) >= PREFETCH_DOMAIN_LIMIT)
         log_message("Zero-RTT Prefetcher: domain list capped at " + PREFETCH_DOMAIN_LIMIT + " to prevent OOM on low-RAM devices", "warn");
 
-    log_message("Zero-RTT Prefetcher: pre-resolving " + length(domain_list) + " domains in batches...", "info");
-    let batch = [];
-    for (let i, dom in domain_list) {
-        push(batch, shell_quote(dom));
-        if (length(batch) >= 15 || i == length(domain_list) - 1) {
-            // The `&` used to sit inside batch_cmd, which left the redirections
-            // that followed it attached to a null command in this shell instead
-            // of to the backgrounded loop. Backgrounding is now the wrapper's
-            // job, so the loop gets the redirections it was always meant to have.
-            let batch_cmd = "for d in " + join(" ", batch) + "; do dig @127.0.0.1 \"$d\" A >/dev/null 2>&1 || nslookup \"$d\" 127.0.0.1 >/dev/null 2>&1; done";
-            system(common.background_command(batch_cmd));
-            batch = [];
-        }
-    }
+    log_message("Zero-RTT Prefetcher: pre-resolving " + length(domain_list) + " domains sequentially in background...", "info");
+    let quoted_domains = [];
+    for (let dom in domain_list)
+        push(quoted_domains, shell_quote(dom));
+    let prefetch_cmd = "for d in " + join(" ", quoted_domains) + "; do dig @127.0.0.1 \"$d\" A >/dev/null 2>&1 || nslookup \"$d\" 127.0.0.1 >/dev/null 2>&1; done";
+    system(common.background_command(prefetch_cmd));
 }
 
 let uloop = null;
@@ -792,7 +843,8 @@ function suppressed_by_root_cause(healer) {
         return true;
     }
     if (singbox_repair_until > now) {
-        log_message(sprintf("%s: standing down, sing-box restart is in progress", healer), "info");
+        let eng = (type(active_engine_name) == "function") ? active_engine_name() : "sing-box";
+        log_message(sprintf("%s: standing down, %s restart is in progress", healer, eng), "info");
         return true;
     }
     return false;
@@ -880,9 +932,10 @@ function set_ladder_level(reason, level) {
 // watch left open past its deadline into a `failed` one.
 let recovery_watches = {};
 
-// Two fast ticks plus margin: long enough for a restarted sing-box to answer,
-// short enough that a failure is reported while it is still actionable.
-const RECOVERY_DEADLINE = 45;
+// Two probe intervals plus restart margin: long enough for a restarted proxy to
+// complete startup and answer at least one regular 30s health probe, short
+// enough that a failure is reported while it is still actionable.
+const RECOVERY_DEADLINE = 90;
 
 // `reason` ties the watch back to the escalation ladder: settling decides
 // whether that reason's next attempt stays light or goes heavy.
@@ -1065,9 +1118,10 @@ function settle_recovery(key, outcome) {
 
     if (outcome == "failed" && next_ladder_level(watch.reason) >= LADDER_L5_EMERGENCY) {
         let rolled_back = false;
-        if (known_good && known_good.rollback_to_known_good) {
+        let kg = get_known_good();
+        if (kg && kg.rollback_to_known_good) {
             try {
-                let rb = known_good.rollback_to_known_good("watchdog_recovery_failed_" + as_string(watch.reason));
+                let rb = kg.rollback_to_known_good("watchdog_recovery_failed_" + as_string(watch.reason));
                 if (rb && rb.ok) {
                     rolled_back = true;
                     log_message(sprintf("Watchdog: successfully restored Last Known Good config before failsafe (reason=%s)", as_string(watch.reason)), "warn");
@@ -1178,6 +1232,7 @@ function safe_proxy_restart(reason, force_level) {
     }
     write_state_file(PROXY_RESTART_LOCK, as_string(now), "proxy restart lock");
     proxy_restart_count++;
+    singbox_repair_until = now + SUPPRESSION_DEADLINE;
     // The proxy port can change across a restart, so the controller's cached
     // lookup is invalidated here rather than after the fact.
     controller.forget_proxy_port();
@@ -1186,27 +1241,16 @@ function safe_proxy_restart(reason, force_level) {
     let lock_path = shell_quote(PROXY_RESTART_LOCK);
 
     if (level == ESCALATION_LIGHT) {
-        let active_engine = "tachyon-core";
-        try {
-            active_engine = require("core.engine").get_active();
-        } catch (e) {}
+        let active_engine = active_engine_name();
 
-        let init_script = "/etc/init.d/tachyon-core";
+        log_message("Restarting " + active_engine + " service only (" + reason + ")", "warn");
         if (active_engine == "steer" || active_engine == "steer-extended") {
-            init_script = "/etc/init.d/steer";
-        }
-
-        if (active_engine != "tachyon-core") {
-            log_message("Restarting " + active_engine + " service only (" + reason + ")", "warn");
+            bg_system("/etc/init.d/steer stop >/dev/null 2>&1; " +
+                "/etc/init.d/steer start >/dev/null 2>&1; rm -f " + lock_path);
+        } else {
+            let init_script = core_init_script();
             bg_system(init_script + " stop >/dev/null 2>&1; " +
                 init_script + " start >/dev/null 2>&1; rm -f " + lock_path);
-        } else {
-            log_message("Restarting sing-box service only (" + reason + ")", "warn");
-            // Sequential stop/start rather than `restart`: lifecycle.uc drives the
-            // service the same way, and a stop that fails must not be followed by a
-            // start that races it.
-            bg_system("/etc/init.d/tachyon-core stop >/dev/null 2>&1; " +
-                "/etc/init.d/tachyon-core start >/dev/null 2>&1; rm -f " + lock_path);
         }
     } else {
         log_message("Escalating to full Tachyon restart (" + reason + "): the lighter restart did not restore service", "warn");
@@ -1274,9 +1318,10 @@ function execute_escalation_level(key, subsystem, reason, incident) {
     // Level 5: Emergency failsafe
     if (lvl >= LADDER_L5_EMERGENCY) {
         let rolled_back = false;
-        if (known_good && known_good.rollback_to_known_good) {
+        let kg = get_known_good();
+        if (kg && kg.rollback_to_known_good) {
             try {
-                let rb = known_good.rollback_to_known_good("watchdog_l5_escalation_" + as_string(reason));
+                let rb = kg.rollback_to_known_good("watchdog_l5_escalation_" + as_string(reason));
                 if (rb && rb.ok) {
                     rolled_back = true;
                     log_message(sprintf("Watchdog: successfully restored Last Known Good config at L5 (reason=%s)", as_string(reason)), "warn");
@@ -1361,8 +1406,9 @@ function heal_uncached_rulesets_detour() {
             if (proxy_section_name == "")
                 proxy_section_name = s[".name"];
         }
-        let lists = connections.community_lists(s);
-        let custom_rulesets = connections.rule_sets(s);
+        let conn_mod = get_connections();
+        let lists = conn_mod.community_lists(s);
+        let custom_rulesets = conn_mod.rule_sets(s);
         if (length(lists) > 0 || length(custom_rulesets) > 0)
             has_rulesets = true;
     });
@@ -1401,10 +1447,7 @@ function heal_dns_stall(ev) {
 
     controller.reset_dns_streak();
 
-    let active_engine = "tachyon-core";
-    try {
-        active_engine = require("core.engine").get_active();
-    } catch (e) {}
+    let active_engine = active_engine_name();
 
     if (active_engine == "steer" || active_engine == "steer-extended") {
         heal_dns_stall_steer();
@@ -1414,9 +1457,16 @@ function heal_dns_stall(ev) {
     let detour_healed = heal_uncached_rulesets_detour();
     log_message("Watchdog: DNS stalled after 3 attempts, soft-reloading proxy runtime", "warn");
 
+    let udp = fs.readfile("/proc/net/udp") || "";
+    let core_dns_listening = index(udp, "2A00007F:0035") >= 0;
+    if (!core_dns_listening) {
+        log_message("Watchdog: DNS stalled and sing-box is not listening on port 53; restoring failsafe DNS in dnsmasq", "warn");
+        command_status_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/dns/apply.uc", "failsafe-restore" ]);
+    }
+
     let incident = {
         type: "dns",
-        description: detour_healed ? "Зависание DNS из-за блокировки прямой загрузки списков правил" : "DNS resolution stalled on sing-box (port 53)",
+        description: detour_healed ? "Зависание DNS из-за блокировки прямой загрузки списков правил" : sprintf("DNS resolution stalled on %s (port 53)", active_engine),
         resolution: detour_healed ? "Включена загрузка списков через прокси и выполнен мягкий перезапуск" : "Soft-reloaded proxy runtime safely without breaking active TCP/RDP connections"
     };
 
@@ -1447,16 +1497,17 @@ function heal_proxy_connectivity(ev) {
     if (int(ev.payload.streak) < 2) return;
     if (suppressed_by_root_cause("heal_proxy_connectivity")) return;
 
+    let eng = active_engine_name();
     let proxy_addr = (ev.payload.host ? ev.payload.host : "127.0.0.1") + ":" + as_string(ev.payload.port);
     let incident = {
         type: "proxy",
-        description: "Зависание или неполный отклик прокси-порту sing-box (" + proxy_addr + ")",
-        resolution: "Выполнен перезапуск sing-box"
+        description: sprintf("Зависание или неполный отклик прокси-порта %s (%s)", eng, proxy_addr),
+        resolution: "Выполнен перезапуск " + eng
     };
 
     // Reporting used to happen here, before the restart, so a rate-limited
     // attempt still announced a repair that never ran.
-    if (!safe_proxy_restart("proxy_connectivity")) {
+    if (!safe_proxy_restart("proxy_connectivity", ESCALATION_LIGHT)) {
         ai_heal_report(incident.type, incident.description,
             "Очищена база cache.db; перезапуск пропущен по лимиту частоты", "skipped");
         return;
@@ -1651,12 +1702,19 @@ function heal_uci_config(ev) {
 // ─── Config validation: sing-box check ────────────────────────────────────────
 function validate_singbox_config() {
     if (settings().ai_config_validation_enabled == "0") return true;
-    let st = fs.stat("/etc/tachyon-core/config.json");
+    let eng = active_engine_name();
+    let cfg_path = "/etc/tachyon-core/config.json";
+    if (eng == "steer" || eng == "steer-extended") {
+        cfg_path = "/etc/steer/spec.json";
+    }
+    let st = fs.stat(cfg_path);
     if (!st || st.size == 0) return false;
-    let content = fs.readfile("/etc/tachyon-core/config.json");
+    let content = fs.readfile(cfg_path);
     if (!content) return false;
     try {
         let obj = json(content);
+        if (eng == "steer" || eng == "steer-extended")
+            return type(obj) == "object";
         return type(obj) == "object" && type(obj.outbounds) == "array";
     } catch (e) {
         return false;
@@ -1680,22 +1738,23 @@ function heal_proxy_health(ev) {
     if (fails < threshold) return;
     if (suppressed_by_root_cause("heal_proxy_health")) return;
 
+    let eng = active_engine_name();
     let incident = {
         type: "proxy_health",
         description: sprintf("Прокси не отвечает на запросы проверки доступности (%d сбоя подряд, порт %s)", fails, as_string(ev.payload.port)),
-        resolution: "Выполнен перезапуск sing-box"
+        resolution: "Выполнен перезапуск " + eng
     };
 
     // A restart on a config sing-box will refuse to load leaves the proxy down
     // for good, so validation gates the restart. It now also gates the report:
     // a refused restart is not a repair.
     if (settings().ai_config_validation_enabled != "0" && !validate_singbox_config()) {
-        log_message("sing-box config validation failed before proxy restart", "err");
+        log_message(eng + " config validation failed before proxy restart", "err");
         ai_heal_report(incident.type, incident.description,
-            "Перезапуск отменён: конфигурация sing-box не проходит валидацию", "skipped");
+            sprintf("Перезапуск отменён: конфигурация %s не проходит валидацию", eng), "skipped");
         return;
     }
-    if (!safe_proxy_restart("proxy_health")) {
+    if (!safe_proxy_restart("proxy_health", ESCALATION_LIGHT)) {
         ai_heal_report(incident.type, incident.description,
             "Перезапуск пропущен по лимиту частоты", "skipped");
         return;
@@ -2019,10 +2078,11 @@ function export_metrics() {
 function heal_anomaly_reconnects(ev) {
     if (settings().ai_anomaly_detection_enabled == "0") return;
 
+    let eng = active_engine_name();
     ai_heal_report(
         "anomaly_reconnects",
-        sprintf("sing-box reconnected %d times in the last hour (threshold: %d)",
-            int(ev.payload.count), int(ev.payload.threshold)),
+        sprintf("%s reconnected %d times in the last hour (threshold: %d)",
+            eng, int(ev.payload.count), int(ev.payload.threshold)),
         "High reconnect rate detected. Check proxy server health or ISP stability.",
         "warn"
     );
@@ -2036,9 +2096,9 @@ function increment_reconnect_count() {
 }
 
 // events for one crash, and each would otherwise queue its own restart.
-// Restarting cannot install what is not on the filesystem. With the sing-box
+// Restarting cannot install what is not on the filesystem. With the proxy core
 // init script absent, every heal below fails identically, and the watchdog
-// settles into alternating "Restarting Tachyon" and "Restarting sing-box
+// settles into alternating "Restarting Tachyon" and "Restarting proxy core
 // service only" every 25 seconds forever, while the real cause - a missing
 // binary variant - is only ever reported by the validator at startup. Name the
 // cause once and leave the router alone instead.
@@ -2047,7 +2107,12 @@ function increment_reconnect_count() {
 // version too old; repeating its binary-variant advice here is deliberate, since
 // this is the message the user sees while the loop is running.
 function singbox_service_absent() {
-    return common.command_status_from_args([ "test", "-x", "/etc/init.d/tachyon-core" ]) != 0;
+    let eng = active_engine_name();
+    let init_script = core_init_script();
+    if (eng == "steer" || eng == "steer-extended") {
+        init_script = "/etc/init.d/steer";
+    }
+    return common.command_status_from_args([ "test", "-x", init_script ]) != 0;
 }
 
 let missing_singbox_reported_at = 0;
@@ -2057,13 +2122,15 @@ function heal_core_stopped(ev) {
     if (now - last_restart_time < 30) return;
     last_restart_time = now;
 
+    let eng = active_engine_name();
     if (singbox_service_absent()) {
         if (now - missing_singbox_reported_at > 3600) {
             missing_singbox_reported_at = now;
-            log_message("sing-box is not installed (no /etc/init.d/tachyon-core). Restarting cannot fix this - install a sing-box package or reinstall the sing-box-x / sing-box-extended binary variant. Watchdog will not retry until it appears.", "error");
+            let init_script = (eng == "steer" || eng == "steer-extended") ? "/etc/init.d/steer" : core_init_script();
+            log_message(sprintf("%s is not installed (no %s). Restarting cannot fix this - install a %s package or reinstall the binary variant. Watchdog will not retry until it appears.", eng, init_script, eng), "error");
             let tcfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
             if (tcfg.notify_crash != "0") {
-                send_telegram_notification("⚠️ *Watchdog:* sing-box не установлен, перезапуск не поможет. Установите пакет sing-box или бинарный вариант sing-box-x / sing-box-extended.");
+                send_telegram_notification(sprintf("⚠️ *Watchdog:* %s не установлен, перезапуск не поможет.", eng));
             }
         }
         return;
@@ -2077,11 +2144,11 @@ function heal_core_stopped(ev) {
     let list_update_pid = trim(fs.readfile("/var/run/tachyon_list_update.pid") || "");
     if (process_running(list_update_pid, "ucode")) return;
 
-    log_message("sing-box is stopped (" + as_string(ev.payload.reason || "health check") + "). Restarting Tachyon...", "warn");
+    log_message(sprintf("%s is stopped (%s). Restarting Tachyon...", eng, as_string(ev.payload.reason || "health check")), "warn");
     increment_reconnect_count();
     let tcfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
     if (tcfg.notify_crash != "0") {
-        send_telegram_notification("⚠️ *Watchdog:* sing-box остановлен. Перезапускаю службы Tachyon...");
+        send_telegram_notification(sprintf("⚠️ *Watchdog:* %s остановлен. Перезапускаю службы Tachyon...", eng));
     }
     // This healer sends its own notification above and deliberately did not file
     // an incident, so it does not start one now. It does register the watch: a
@@ -2097,7 +2164,7 @@ function heal_core_stopped(ev) {
         singbox_repair_until = time() + SUPPRESSION_DEADLINE;
         watch_recovery("proxy", {
             type: "core_stopped",
-            description: "sing-box остановлен (" + as_string(ev.payload.reason || "health check") + ")",
+            description: sprintf("%s остановлен (%s)", eng, as_string(ev.payload.reason || "health check")),
             resolution: "Выполнен перезапуск служб Tachyon"
         }, "core_stopped");
     }
@@ -2333,10 +2400,11 @@ function smart_detect_process_plus(cfg) {
     let seen = smart_detect_plus_seen();
     if (smart_plus_job != null) {
         let job = smart_plus_job;
+        let sp = smart_probe || get_smart_probe();
         if (!before_dns.ready || before_dns.signature != job.signature) job.invalid = true;
-        let decision = smart_probe.poll(job.task);
+        let decision = sp.poll(job.task);
         if (decision == null) return;
-        smart_probe.stop(job.task);
+        sp.stop(job.task);
         smart_plus_job = null;
         // A transient DNS change during the probe must also invalidate its result.
         if (job.invalid || cfg.smart_detect != "1" || smart_plus.mode(cfg) != "plus" ||
@@ -2384,7 +2452,8 @@ function smart_detect_process_plus(cfg) {
     delete pending_smart_plus[domain];
     let task = null;
     try {
-        task = smart_probe.start({domain, item, proxy_addr:"127.0.0.1:" + port,
+        let sp = smart_probe || get_smart_probe();
+        task = sp.start({domain, item, proxy_addr:"127.0.0.1:" + port,
             direct_flags:smart_detect_direct_curl_argv()});
     } catch (e) {
         log_message("Smart Detect Plus: failed to probe " + domain + ": " + as_string(e), "err");
@@ -2399,7 +2468,7 @@ function smart_detect_process_plus(cfg) {
 function smart_detect_process_pending() {
     let cfg = settings();
     if (cfg.smart_detect != "1") {
-        if (smart_plus_job != null) { smart_probe.stop(smart_plus_job.task); smart_plus_job = null; }
+        if (smart_plus_job != null) { (smart_probe || get_smart_probe()).stop(smart_plus_job.task); smart_plus_job = null; }
         pending_smart_plus = {};
         pending_smart_domains = {};
         smart_detect_dns_state = {};
@@ -2440,13 +2509,17 @@ function smart_detect_process_pending() {
     }
 
     let candidate_domains = [];
-    for (let dom in domain_list) {
-        if (!seen[dom]) {
-            push(candidate_domains, dom);
-        }
-    }
     let queued_candidates = pending_smart_domains;
     pending_smart_domains = {};
+    for (let dom in domain_list) {
+        if (seen[dom])
+            continue;
+        if (length(candidate_domains) < 8) {
+            push(candidate_domains, dom);
+        } else {
+            pending_smart_domains[dom] = queued_candidates[dom];
+        }
+    }
 
     if (length(candidate_domains) == 0) return;
 
@@ -2669,8 +2742,10 @@ function setup_honeypot_listener() {
 
     stop_honeypot_listeners();
 
-    let fifo_fd = fs.open("/tmp/tachyon_honeypot.fifo", "r+");
-    if (uloop && fifo_fd) {
+    if (uloop) {
+        let fifo_fd = fs.open("/tmp/tachyon_honeypot.fifo", "r+");
+        if (!fifo_fd)
+            return null;
         try {
             // One line per readiness event. The FIFO is held open read+write by
             // this very process, so it never reaches EOF: the old
@@ -2684,8 +2759,11 @@ function setup_honeypot_listener() {
                 if (line != null)
                     controller.handle_honeypot_line(line);
             }, uloop.ULOOP_READ);
+            return fifo_fd;
         } catch (e) {
             log_message("Failed to bind honeypot fifo to uloop: " + as_string(e), "warn");
+            fifo_fd.close();
+            return null;
         }
     } else {
         let cfg = settings();
@@ -2698,6 +2776,7 @@ function setup_honeypot_listener() {
             "fi; done",
             "> /var/run/tachyon_honeypot_listener.pid");
         system(hp_cmd);
+        return null;
     }
 }
 
@@ -2943,7 +3022,7 @@ function worker() {
     // startup is published into an empty bus and lost.
     register_subscribers();
 
-    setup_honeypot_listener();
+    let honeypot_fd = setup_honeypot_listener();
     // Restore subnet cache from persistent storage at startup (in case /tmp was cleared)
     ai_heal_subnet_cache();
     run_zero_rtt_prefetching();
@@ -2981,8 +3060,15 @@ function worker() {
     }
 
     function check_known_good_observation() {
-        if (known_good && known_good.check_observation) {
-            try { known_good.check_observation(); } catch (e) {}
+        let obs_file = getenv("TACHYON_OBSERVATION_FILE") || "/var/run/tachyon/observation_state.json";
+        if (fs.stat(obs_file) == null && fs.stat("/tmp/tachyon_observation_state.json") == null)
+            return;
+        let obs = common.read_json_file(obs_file) || common.read_json_file("/tmp/tachyon_observation_state.json");
+        if (!obs || obs.status != "observing")
+            return;
+        let kg = get_known_good();
+        if (kg && kg.check_observation) {
+            try { kg.check_observation(); } catch (e) {}
         }
     }
 
@@ -2994,7 +3080,7 @@ function worker() {
         cfg = current_ctx.settings;
         let mode = cfg.smart_detect == "1" ? smart_plus.mode(cfg) : "disabled";
         if (smart_mode_last != null && mode != smart_mode_last) {
-            if (smart_plus_job != null) { smart_probe.stop(smart_plus_job.task); smart_plus_job = null; }
+            if (smart_plus_job != null) { (smart_probe || get_smart_probe()).stop(smart_plus_job.task); smart_plus_job = null; }
             pending_smart_domains = {};
             pending_smart_plus = {};
             smart_detect_streaks = {};
@@ -3080,10 +3166,11 @@ function mixed_proxy_port_listening() {
 }
 
 function check_mixed_proxy_port() {
+    let eng = active_engine_name();
     if (!core_binary_running()) {
         // Core down entirely is the proxy-health loop's domain.
         if (mixed_port_fail_streak > 0)
-            log_message("Mixed port watch: core stopped, standing down.", "debug");
+            log_message(sprintf("Mixed port watch: %s stopped, standing down.", eng), "debug");
         mixed_port_fail_streak = 0;
         return;
     }
@@ -3105,17 +3192,17 @@ function check_mixed_proxy_port() {
     }
 
     mixed_port_fail_streak++;
-    log_message(sprintf("sing-box runs but mixed port(s) %s are not listening (streak %d).",
-        join(", ", ports), mixed_port_fail_streak), "warn");
+    log_message(sprintf("%s runs but mixed port(s) %s are not listening (streak %d).",
+        eng, join(", ", ports), mixed_port_fail_streak), "warn");
 
     if (mixed_port_fail_streak == 2) {
-        log_message("Restarting sing-box to restore the mixed inbound.", "warn");
+        log_message(sprintf("Restarting %s to restore the mixed inbound.", eng), "warn");
         command_status("/usr/bin/tachyon restart >/dev/null 2>&1");
     } else if (mixed_port_fail_streak > 2) {
         let now = time();
         if (now - mixed_port_last_notify >= 3600) {
             mixed_port_last_notify = now;
-            send_telegram_notification("⚠️ Порт " + join(", ", ports) + " не слушается при работающем sing-box. Рестарт не помог — проверьте конфигурацию ядра (лог sing-box), раздел диагностики покажет детали.");
+            send_telegram_notification(sprintf("⚠️ Порт %s не слушается при работающем %s. Рестарт не помог — проверьте конфигурацию ядра (лог %s), раздел диагностики покажет детали.", join(", ", ports), eng, eng));
         }
     }
 }
@@ -3143,6 +3230,12 @@ function on_disk_tachyon_version() {
     if (env_ver != null && env_ver != "")
         return env_ver;
 
+    let const_src = fs.readfile(LIB_DIR + "/core/constants.uc");
+    if (const_src != null) {
+        let cm = match(as_string(const_src), /env\("TACHYON_VERSION",\s*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)"\)/);
+        if (cm && cm[1]) return cm[1];
+    }
+
     for (let path in [
         "/usr/lib/opkg/info/tachyon.control",
         "/usr/lib/opkg/info/luci-app-tachyon.control"
@@ -3158,15 +3251,23 @@ function on_disk_tachyon_version() {
     if (apk_db != null) {
         let lines = split(as_string(apk_db), "\n");
         let current_pkg = "";
+        let fallback_ver = "";
         for (let line in lines) {
             let pm = match(line, /^P:(.+)$/);
             if (pm && pm[1]) {
                 current_pkg = trim(pm[1]);
             } else if ((current_pkg == "tachyon" || current_pkg == "luci-app-tachyon") && match(line, /^V:/)) {
                 let vm = match(line, /^V:([0-9]+\.[0-9]+\.[0-9]+)/);
-                if (vm && vm[1]) return vm[1];
+                if (vm && vm[1]) {
+                    if (current_pkg == "tachyon")
+                        return vm[1];
+                    if (fallback_ver == "")
+                        fallback_ver = vm[1];
+                }
             }
         }
+        if (fallback_ver != "")
+            return fallback_ver;
     }
 
     return as_string(require("core.constants").TACHYON_VERSION || "");
@@ -3440,6 +3541,7 @@ let last_keepalive_write = 0;
         }
     }
 
+    if (honeypot_fd) honeypot_fd.close();
     if (log_pipe) log_pipe.close();
     // Shutdown path: a connection already torn down by the peer throws here, and
     // there is nothing left to salvage either way.

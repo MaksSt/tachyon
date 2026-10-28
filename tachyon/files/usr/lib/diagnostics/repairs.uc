@@ -54,6 +54,13 @@ function active_engine_is_steer() {
     return name == "steer" || name == "steer-extended";
 }
 
+function is_tachyon_core_active() {
+    if (active_engine_is_steer())
+        return false;
+    let marker = trim(as_string(fs.readfile("/etc/tachyon/tachyon-core-variant") || fs.readfile("/etc/tachyon/sing-box-variant") || ""));
+    return marker == "tachyon-core";
+}
+
 function uci_backup_save() {
     try {
         let data = fs.readfile(TACHYON_CONFIG);
@@ -103,6 +110,7 @@ function apply_quick_fix(codes_str) {
     let codes = split(replace(codes_str, /[ \[\]"]/g, ""), ",");
     let results = [];
     let all_ok = true;
+    let core_label = is_tachyon_core_active() ? "tachyon-core" : "sing-box";
 
     for (let c in codes) {
         c = trim(c);
@@ -119,7 +127,7 @@ function apply_quick_fix(codes_str) {
             } else {
                 let rc = command_status("/usr/bin/tachyon restore_dnsmasq 2>/dev/null; /etc/init.d/tachyon-core restart >/dev/null 2>&1");
                 status = (rc == 0);
-                msg = status ? "sing-box restarted" : "sing-box restart failed (exit " + rc + ")";
+                msg = status ? (core_label + " restarted") : (core_label + " restart failed (exit " + rc + ")");
             }
         } else if (c == "rebuild_rules") {
             let rc = command_status("/etc/init.d/tachyon reload >/dev/null 2>&1");
@@ -157,7 +165,7 @@ function apply_quick_fix(codes_str) {
             } else {
                 let rc = command_status("/etc/init.d/tachyon-core restart >/dev/null 2>&1");
                 status = (rc == 0);
-                msg = status ? "sing-box DNS restarted" : "sing-box DNS restart failed (exit " + rc + ")";
+                msg = status ? (core_label + " DNS restarted") : (core_label + " DNS restart failed (exit " + rc + ")");
             }
         } else if (c == "fix_uci_config") {
             status = uci_backup_restore();
@@ -203,7 +211,7 @@ function apply_quick_fix(codes_str) {
         } else if (c == "optimize_memory") {
             let rc = command_status("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; rm -rf /tmp/tachyon-core/*.tmp 2>/dev/null; /etc/init.d/tachyon-core restart >/dev/null 2>&1");
             status = (rc == 0);
-            msg = status ? "Memory caches flushed and sing-box restarted" : "Memory optimization failed (exit " + rc + ")";
+            msg = status ? ("Memory caches flushed and " + core_label + " restarted") : ("Memory optimization failed (exit " + rc + ")");
         } else if (c == "switch_to_doh") {
             let rc = command_status("uci set tachyon.settings.dns_type='doh'; uci commit tachyon; /etc/init.d/tachyon reload >/dev/null 2>&1");
             status = (rc == 0);

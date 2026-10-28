@@ -1534,7 +1534,15 @@ function cache_component_update_check_result(value, notify_update) {
         (as_string(previous.status) != cached.status ||
             as_string(previous.latest_version) != cached.latest_version ||
             previous_build_key != build_key)) {
-        log_message("[component-update] " + component + " " + cached.latest_version +
+        let notify_component = component;
+        if (component == "sing_box") {
+            let marker = trim(read_file(SB_VARIANT_STATE_FILE));
+            if (marker == "" && getenv("SB_VARIANT_STATE_FILE") == null)
+                marker = trim(read_file("/etc/tachyon/sing-box-variant"));
+            if (marker == "tachyon-core")
+                notify_component = "tachyon-core";
+        }
+        log_message("[component-update] " + notify_component + " " + cached.latest_version +
             (cached.status == "outdated_same_release" && build_key != "" ? " (build " + build_key + ")" : ""), "info");
     }
 
@@ -2061,7 +2069,7 @@ function component_action_log(job_id, offset) {
 function automatic_component_check_names() {
     let result = [ "tachyon" ];
 
-    if (fs.stat("/usr/bin/tachyon-core") != null)
+    if (fs.stat("/usr/bin/tachyon-core") != null || fs.stat("/usr/bin/sing-box") != null)
         push(result, "sing_box");
     if (module_success([ LIB_DIR + "/providers/zapret/runtime.uc", "installed" ]))
         push(result, "zapret");
@@ -3393,6 +3401,17 @@ function write_current_reload_state_clean() {
     ]);
 }
 
+function config_has_local_rulesets(config_path) {
+    let cfg = common.read_json_file(config_path);
+    if (type(cfg) != "object" || type(cfg.route) != "object" || type(cfg.route.rule_set) != "array")
+        return false;
+    for (let rs in cfg.route.rule_set) {
+        if (type(rs) == "object" && as_string(rs.type || "") == "local" && trim(as_string(rs.path || "")) != "")
+            return true;
+    }
+    return false;
+}
+
 function reload_singbox_after_list_update() {
     let sing_box_pid = trim(module_output([ LIB_DIR + "/service/state.uc", "tachyon-core-service-runtime-pid" ]));
     if (sing_box_pid == "" || int(sing_box_pid) <= 0)
@@ -3402,8 +3421,12 @@ function reload_singbox_after_list_update() {
     if (!singbox_runtime_success([ "init-config", "0", "1", "1" ]))
         return false;
     let sing_box_config_hash_after = file_md5(sing_box_config_path);
-    if (sing_box_config_hash_before != sing_box_config_hash_after) {
-        log_message("Rulesets updated on disk; reloading sing-box with new configuration", "info");
+    let has_local_rulesets = config_has_local_rulesets(sing_box_config_path);
+    if (sing_box_config_hash_before != sing_box_config_hash_after || has_local_rulesets) {
+        if (sing_box_config_hash_before != sing_box_config_hash_after)
+            log_message("Rulesets updated on disk; reloading sing-box with new configuration", "info");
+        else
+            log_message("Local rulesets refreshed on disk; reloading core runtime to apply updated rules", "info");
         module_success([ DNS_FAILOVER_UC, "stop-runtime" ]);
         module_success([ PRIORITY_UC, "stop-runtime" ]);
         let ok = service_state_success([
@@ -3455,6 +3478,19 @@ function list_update_steer_catalog(settings) {
 }
 
 function list_update() {
+    // When spawned by start_main() while start_impl() is still finalizing DNS,
+    // reload-state, and system-info warmup, wait for startup to finish and
+    // settle so list downloads and nft compilation do not contend with postinst
+    // or the first LuCI load.
+    if (fs.stat("/var/run/tachyon/starting") != null) {
+        let wait_ticks = 0;
+        while (fs.stat("/var/run/tachyon/starting") != null && wait_ticks < 20) {
+            command_success_from_args([ "sleep", "1" ]);
+            wait_ticks++;
+        }
+        command_success_from_args([ "sleep", "5" ]);
+    }
+
     log_message("Starting lists update", "info");
     if (!list_update_pid_begin())
         exit(0);

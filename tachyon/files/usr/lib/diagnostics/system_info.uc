@@ -28,7 +28,9 @@ const RT_TABLE_NAME = getenv("RT_TABLE_NAME") || constants.RT_TABLE_NAME || "tac
 const NFT_TABLE_NAME = getenv("NFT_TABLE_NAME") || constants.NFT_TABLE_NAME || "TachyonTable";
 const NFT_FAKEIP_MARK = getenv("NFT_FAKEIP_MARK") || constants.NFT_FAKEIP_MARK || "0x04000000";
 const SB_VARIANT_STATE_FILE = getenv("SB_VARIANT_STATE_FILE") || constants.SB_VARIANT_STATE_FILE || "/etc/tachyon/tachyon-core-variant";
+const SB_LEGACY_VARIANT_STATE_FILE = "/etc/tachyon/sing-box-variant";
 const SING_BOX_BIN_PATH = getenv("TACHYON_DIAGNOSTICS_SING_BOX_BIN_PATH") || "/usr/bin/tachyon-core";
+const SING_BOX_LEGACY_BIN_PATH = "/usr/bin/sing-box";
 const CLOUDFLARE_OCTETS = getenv("CLOUDFLARE_OCTETS") || constants.CLOUDFLARE_OCTETS || "8.47 162.159 188.114";
 const RUNTIME_STABLE_MIN_AGE = getenv("TACHYON_RUNTIME_STABLE_MIN_AGE") || "2";
 
@@ -189,18 +191,36 @@ function check_logs() {
     return 0;
 }
 
+function is_tachyon_core_selected() {
+    if (active_engine_is_steer())
+        return false;
+    let marker = first_line_value(SB_VARIANT_STATE_FILE);
+    if (marker == "" && getenv("SB_VARIANT_STATE_FILE") == null)
+        marker = first_line_value(SB_LEGACY_VARIANT_STATE_FILE);
+    if (marker == "tachyon-core")
+        return true;
+    if (marker == "extended" || marker == "extended-compressed" || marker == "lx" || marker == "tiny" || marker == "stable")
+        return false;
+    return module_success(SINGBOX_RUNTIME_UC, [ "is-foreign-core", "" ]);
+}
+
 function check_sing_box_logs() {
     if (!command_exists("logread")) {
         nolog("Error: logread command not found");
         return 1;
     }
+    let is_core = is_tachyon_core_selected();
+    let needle = is_core ? "tachyon-core" : "sing-box";
     // Use bounded_command to prevent logread from hanging and leaking a zombie process.
     let cmd = common.bounded_command("logread -l " + LOGREAD_LINE_LIMIT + " 2>/dev/null", "5");
-    let rendered = status_capture([ "matching-log-tail", "sing-box", "100" ], command_output(cmd));
+    let raw_logs = command_output(cmd);
+    let rendered = status_capture([ "matching-log-tail", needle, "100" ], raw_logs);
+    if (rendered.output == "" && is_core)
+        rendered = status_capture([ "matching-log-tail", "sing-box", "100" ], raw_logs);
     if (rendered.output != "")
         print(rendered.output);
     else
-        print("No matching logs found in system journal (needle: sing-box)\n");
+        print("No matching logs found in system journal (needle: " + needle + ")\n");
     return 0;
 }
 
@@ -214,7 +234,8 @@ function tachyon_logs_fixture() {
 function show_sing_box_config(visibility) {
     visibility = as_string(visibility || "masked");
     let sing_box_config_path = option(settings(), "config_path", "");
-    nolog("Current sing-box configuration:");
+    let core_label = is_tachyon_core_selected() ? "tachyon-core" : "sing-box";
+    nolog("Current " + core_label + " configuration:");
     if (!file_exists(sing_box_config_path)) {
         nolog("Configuration file not found");
         return 1;
@@ -650,7 +671,9 @@ function get_system_info() {
 }
 
 function get_server_capabilities() {
-    if (!file_executable(SING_BOX_BIN_PATH)) {
+    let bin_ok = file_executable(SING_BOX_BIN_PATH) ||
+        (getenv("TACHYON_DIAGNOSTICS_SING_BOX_BIN_PATH") == null && file_executable(SING_BOX_LEGACY_BIN_PATH));
+    if (!bin_ok) {
         write_json({
             sing_box_extended: 0,
             sing_box_tiny: 0,
@@ -820,12 +843,19 @@ function section_safe(section) {
 
 function get_outbound_metadata(section) {
     subscription_cache([ "ensure-runtime-dirs" ]);
-    if (!section_safe(section))
+    let sec_str = trim(as_string(section));
+    if (sec_str == "" || sec_str == "all") {
+        let result = subscription_cache([ "get-outbound-metadata", SECTION_CACHE_DIR, "all", "" ]);
+        if (result.status != 0)
+            result = subscription_cache([ "empty-outbound-metadata" ]);
+        return print_subscription_result(result, "");
+    }
+    if (!section_safe(sec_str))
         return print_subscription_result(subscription_cache([ "empty-outbound-metadata" ]), "");
-    let metadata_path = replace(module_output(SUBSCRIPTION_CACHE_UC, [ "outbound-metadata-path", section ]), /[\r\n]+$/g, "");
+    let metadata_path = replace(module_output(SUBSCRIPTION_CACHE_UC, [ "outbound-metadata-path", sec_str ]), /[\r\n]+$/g, "");
     if (metadata_path == "")
         return print_subscription_result(subscription_cache([ "empty-outbound-metadata" ]), "");
-    let result = subscription_cache([ "get-outbound-metadata", SECTION_CACHE_DIR, section, metadata_path ]);
+    let result = subscription_cache([ "get-outbound-metadata", SECTION_CACHE_DIR, sec_str, metadata_path ]);
     if (result.status != 0)
         result = subscription_cache([ "empty-outbound-metadata" ]);
     return print_subscription_result(result, "");

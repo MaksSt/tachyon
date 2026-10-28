@@ -189,8 +189,8 @@ const normalize = functionBody(
 if (!normalize.includes("singBoxTachyonCore,")) {
   fail("normalizeServerCapabilities must expose singBoxTachyonCore");
 }
-if (!normalize.includes("singBoxXhttp: singBoxExtended || singBoxTachyonCore,")) {
-  fail("XHTTP must be offered to tachyon-core as well as to the extended fork");
+if (!normalize.includes("singBoxXhttp: singBoxTachyonCore,")) {
+  fail("server-side XHTTP must only be offered on tachyon-core (sing-box-lx/extended only have client-side xhttp)");
 }
 if (!normalize.includes("singBoxExtended,")) {
   fail("normalizeServerCapabilities must keep singBoxExtended as its own flag");
@@ -233,6 +233,15 @@ if (!serverSource.includes("populateTransportValues(o, singBoxXhttp);")) {
 }
 if (serverSource.includes("populateTransportValues(o, singBoxExtended);")) {
   fail("stale transport gate on singBoxExtended found");
+}
+if (!tachyonSource.includes('"require view.tachyon.local_devices as localDevices";')) {
+  fail("tachyon.js must pre-declare view.tachyon.local_devices to avoid a 3rd L.require HTTP wave");
+}
+if (!tachyonSource.includes('"require view.tachyon.dns_speed_test as dnsSpeedTest";')) {
+  fail("tachyon.js must pre-declare view.tachyon.dns_speed_test to avoid a 3rd L.require HTTP wave");
+}
+if (!tachyonSource.includes("preloadedUiCapabilitiesResponsePromise =")) {
+  fail("tachyon.js EntryPoint.load() must preload UI capabilities in parallel with uci.load");
 }
 NODE
 

@@ -799,6 +799,14 @@ function public_host_flags(public_host, public_host_ips, wan_ip, wan_public) {
     print(resolved, " ", public_ip, " ", matches_wan, "\n");
 }
 
+function core_netstat_owner_is_daemon(owner) {
+    let names = require("core.process").core_contract().comm_names;
+    for (let name in names)
+        if (str_endswith(owner, "/" + name))
+            return true;
+    return false;
+}
+
 function netstat_server_port_conflict_owner_list(data, listen, port, proto) {
     let owners = [];
     let line_number = 0;
@@ -822,7 +830,7 @@ function netstat_server_port_conflict_owner_list(data, listen, port, proto) {
         if (owner == "" || owner == "-" || owner == "LISTEN")
             owner = "unknown";
         // Our own core (however the binary is named) is not a conflict.
-        if (!str_endswith(owner, "/sing-box") && !str_endswith(owner, "/tachyon-core"))
+        if (!core_netstat_owner_is_daemon(owner))
             push(owners, owner);
     }
 
@@ -1031,7 +1039,7 @@ function inbound_runtime_ok(protocol, runtime_exists, runtime_type, runtime_list
     if (protocol == "json_inbound")
         return 1;
 
-    if (runtime_type != expected_type)
+    if (runtime_type != expected_type && !(protocol == "mtproto" && (runtime_type == "mtproto" || runtime_type == "mtproxy")))
         return 0;
 
     // An endpoint-schema AWG (lx / tachyon-core) carries no listen field -
@@ -1072,6 +1080,10 @@ function write_inbound_item_json(args) {
         runtime_type = expected_type;
     }
 
+    let runtime_ok_flag = inbound_runtime_ok(protocol, runtime_exists, runtime_type, runtime_listen, runtime_port_text, expected_type, listen, listen_port);
+    let raw_listening = number_value(args[12]);
+    let effective_listening = (runtime_ok_flag == 1 || raw_listening < 0) ? raw_listening : 0;
+
     write_json({
         section,
         label,
@@ -1088,8 +1100,8 @@ function write_inbound_item_json(args) {
         runtime_type,
         runtime_listen,
         runtime_port: number_value(runtime_port_text),
-        runtime_ok: inbound_runtime_ok(protocol, runtime_exists, runtime_type, runtime_listen, runtime_port_text, expected_type, listen, listen_port),
-        listening: number_value(args[12]),
+        runtime_ok: runtime_ok_flag,
+        listening: effective_listening,
         firewall_required: number_value(args[13]),
         firewall_open: number_value(args[14]),
         port_conflict: number_value(args[15]),
@@ -1386,12 +1398,16 @@ function render_global_system_info() {
     let openwrt_version = object_value(value, "openwrt_version") || "unknown";
     let device_model = object_value(value, "device_model") || "unknown";
 
+    let is_core = flag_is_one(value.sing_box_tachyon_core);
     let sing_box_core = sing_box_core_label(value) || "regular";
-    print_line("Sing-box core: " + sing_box_core);
+    if (is_core)
+        print_line("Proxy core: Tachyon Core");
+    else
+        print_line("Sing-box core: " + sing_box_core);
 
     print_line("\ud83d\udd73\ufe0f Tachyon:   " + tachyon_version);
     print_line("\ud83d\udd73\ufe0f LuCI App:      " + luci_app_version);
-    print_line("\ud83d\udce6 Sing-box:      " + format_sing_box_version(value, sing_box_version));
+    print_line("\ud83d\udce6 " + (is_core ? "Tachyon Core:  " : "Sing-box:      ") + format_sing_box_version(value, sing_box_version));
     if (flag_is_one(value.zapret_installed))
         print_line("\ud83e\uddf5 Zapret:        " + zapret_version);
     if (flag_is_one(value.zapret2_installed))
@@ -1407,9 +1423,9 @@ function render_global_fakeip_check() {
     let fakeip_address = object_value(value, "IP");
 
     if (flag_is_true(value.fakeip))
-        print_line("\u2705 Sing-box FakeIP DNS works: " + fakeip_address);
+        print_line("\u2705 FakeIP DNS works: " + fakeip_address);
     else
-        print_line("\u274c Sing-box FakeIP DNS does NOT work");
+        print_line("\u274c FakeIP DNS does NOT work");
 }
 
 function render_global_dns_check(dont_touch_dhcp) {
@@ -1476,15 +1492,32 @@ function global_nft_other_mark_exists() {
 // carrying a mark Tachyon does not own belong in this list.
 const TACHYON_OWN_MARKS = [
     getenv("NFT_FAKEIP_MARK") || "0x04000000",
-    getenv("NFT_OUTBOUND_MARK") || "0x08000000"
+    getenv("NFT_OUTBOUND_MARK") || "0x08000000",
+    getenv("ZAPRET_DESYNC_MARK") || "0x40000000",
+    getenv("ZAPRET_DESYNC_MARK_POSTNAT") || "0x20000000",
+    getenv("ZAPRET2_DESYNC_MARK") || "0x40000000",
+    getenv("ZAPRET2_DESYNC_MARK_POSTNAT") || "0x20000000",
+    getenv("ZAPRET_ROUTE_MARK_BASE") || "0x01000000",
+    getenv("ZAPRET2_ROUTE_MARK_BASE") || "0x02000000"
 ];
 
 function mark_line_is_ours(line) {
     let seen = false;
+    line = replace(line, /comment "[^"]*"/g, "");
+    line = replace(line, /@[a-z0-9]+,[0-9]+,[0-9]+(\s*&\s*0x[0-9a-fA-F]+)?(\s*(==|!=))?\s*0x[0-9a-fA-F]+/g, "");
+    let mark_idx = index(line, "mark set");
+    if (mark_idx < 0)
+        mark_idx = index(line, "meta mark");
+    if (mark_idx < 0)
+        mark_idx = index(line, "ct mark");
+    if (mark_idx >= 0)
+        line = substr(line, mark_idx);
     for (let token in match(line, /0x[0-9a-fA-F]+/g) || []) {
-        seen = true;
         // A capture-less /g match yields [whole-match] per element.
         let value = lc(as_string(token[0]));
+        if (int(value, 0) == 0)
+            continue;
+        seen = true;
         let ours = false;
         for (let mark in TACHYON_OWN_MARKS) {
             if (lc(as_string(mark)) == value) {
@@ -1504,7 +1537,8 @@ function nft_ruleset_other_mark_lines(table_name) {
 
     for (let line in split(read_stdin(), "\n")) {
         line = as_string(line);
-        if (index(line, "table inet " + table_name) >= 0) {
+        if (index(line, "table inet " + table_name) >= 0 ||
+            match(line, /^table (inet|ip|ip6) (zapret|zapret2|tachyon_tailscale)\b/) != null) {
             in_tachyon_table = true;
             continue;
         }

@@ -296,10 +296,10 @@ cat >"$WORK_DIR/provider-rules.json" <<'JSON'
 {
   "section": [
     { ".name": "direct", "enabled": "1", "action": "bypass" },
-    { ".name": "zapret_one", "enabled": "1", "action": "zapret" },
-    { ".name": "zapret_disabled", "enabled": "0", "action": "zapret" },
-    { ".name": "zapret_two", "enabled": "1", "action": "zapret" },
-    { ".name": "zapret2_one", "enabled": "1", "action": "zapret2" }
+    { ".name": "zapret_one", "enabled": "1", "action": "zapret", "domain_suffix": [ "example.org" ] },
+    { ".name": "zapret_disabled", "enabled": "0", "action": "zapret", "domain_suffix": [ "example.org" ] },
+    { ".name": "zapret_two", "enabled": "1", "action": "zapret", "domain_suffix": [ "example.com" ] },
+    { ".name": "zapret2_one", "enabled": "1", "action": "zapret2", "domain_suffix": [ "example.net" ] }
   ]
 }
 JSON
@@ -657,7 +657,7 @@ if grep -Fq $'mangle\tiifname\t@tachyon_interfaces\tip\tsaddr\t192.168.1.53' "$N
   fail "DNS action should not create fully routed mangle rules"
 fi
 assert_contains "$NFT_LOG" $'nft\tadd\telement\tinet\tTachyonTable\ttachyon_dns_sources\t{ 192.168.1.53/32 }' "DNS action populates dns sources set"
-if [ "$(grep -F $'ip\tsaddr\t192.168.1.20/32' "$NFT_LOG" | wc -l | tr -d ' ')" != "4" ]; then
+if [ "$(grep -F $'ip\tsaddr\t192.168.1.20/32' "$NFT_LOG" | wc -l | tr -d ' ')" != "5" ]; then
   fail "duplicate fully routed source should insert exactly one tcp/udp/local rule set"
 fi
 

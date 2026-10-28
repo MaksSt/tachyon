@@ -51,12 +51,13 @@ const JOB_HEARTBEAT_INTERVAL = int(getenv("TACHYON_JOB_HEARTBEAT_INTERVAL") || "
 function pkg_list_update_command(proxy_address) {
     if (proxy_address == null)
         proxy_address = service_proxy_address();
-    let cmd = is_apk() ? "apk update </dev/null" : "opkg update </dev/null";
+    let direct_cmd = is_apk() ? "apk update </dev/null" : "opkg update </dev/null";
     if (as_string(proxy_address) != "") {
         let p = "http://" + proxy_address;
-        cmd = command_env({ http_proxy: p, https_proxy: p, HTTP_PROXY: p, HTTPS_PROXY: p }) + " " + cmd;
+        let proxied_cmd = command_env({ http_proxy: p, https_proxy: p, HTTP_PROXY: p, HTTPS_PROXY: p }) + " " + direct_cmd;
+        return "(" + proxied_cmd + " || " + direct_cmd + ")";
     }
-    return cmd;
+    return direct_cmd;
 }
 
 function pkg_install_name_command(package_name, proxy_address) {
@@ -226,28 +227,8 @@ function pkg_tx_update_index(proxy_address) {
 function pkg_tx_install_files(files, force_reinstall) {
     sanitize_apk_world();
     update_job_phase("package_transaction", "Installing package files");
-    let args = [];
-    let timeout = PKG_TX_INSTALL_TIMEOUT;
-    if (is_apk()) {
-        push(args, "apk", "add", "--allow-untrusted", "--force-overwrite", "--force-missing-repositories");
-        if (force_reinstall)
-            push(args, "--force-reinstall");
-        for (let f in files)
-            push(args, f);
-    } else {
-        push(args, "opkg", "install", "--force-overwrite", "--force-downgrade", "--force-depends");
-        if (force_reinstall)
-            push(args, "--force-reinstall");
-        for (let f in files)
-            push(args, f);
-    }
-    let proxy = service_proxy_address();
-    let cmd = command_from_args(args) + " </dev/null";
-    if (as_string(proxy) != "") {
-        let p = "http://" + proxy;
-        cmd = command_env({ http_proxy: p, https_proxy: p, HTTP_PROXY: p, HTTPS_PROXY: p }) + " " + cmd;
-    }
-    return pkg_tx_run_with_lock("Installing packages", cmd, timeout);
+    let cmd = pkg_install_files_command(files, force_reinstall);
+    return pkg_tx_run_with_lock("Installing packages", cmd, PKG_TX_INSTALL_TIMEOUT);
 }
 
 // force_reinstall matters only for opkg: installing an .ipk whose version equals
@@ -322,8 +303,8 @@ function ensure_sing_box_dependencies() {
     }
 
     if (length(missing) > 0) {
-        updates_log("Installing missing dependencies for sing-box: " + join(", ", missing));
-        run_logged("Updating package lists for sing-box dependencies", pkg_list_update_command(), 30);
+        updates_log("Installing missing dependencies for tachyon-core: " + join(", ", missing));
+        run_logged("Updating package lists for tachyon-core dependencies", pkg_list_update_command(), 30);
 
         for (let kmod in missing) {
             if (!run_logged("Installing dependency " + kmod, pkg_install_name_command(kmod), 60)) {

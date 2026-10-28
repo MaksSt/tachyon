@@ -190,6 +190,7 @@ define Package/tachyon/postrm
 
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 [ "$$1" = "upgrade" ] && exit 0
+[ -x /usr/bin/tachyon ] && exit 0
 if [ "$$1" != "remove" ] && [ "$$1" != "purge" ]; then
 	exit 0
 fi
@@ -237,6 +238,8 @@ define Package/tachyon/install
 	# AI Agent API CGI handler (executable shell wrapper for uhttpd)
 	$(INSTALL_DIR) $(1)/usr/lib/cgi-bin
 	$(INSTALL_BIN) ./files/usr/lib/cgi-bin/tachyon-agent $(1)/usr/lib/cgi-bin/tachyon-agent
+	$(INSTALL_DIR) $(1)/www/cgi-bin
+	$(INSTALL_BIN) ./files/www/cgi-bin/tachyon-sub $(1)/www/cgi-bin/tachyon-sub
 	# The /www/cgi-bin symlink is NOT created here: it is published at service
 	# start only when agent_api_token is set (issue #76). The handler itself
 	# is always installed, so enabling the gateway needs no reinstall.

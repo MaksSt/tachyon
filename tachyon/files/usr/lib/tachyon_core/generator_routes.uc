@@ -6,6 +6,8 @@ let helpers = require("core.helpers");
 let core_ip = require("core.ip");
 let core_url = require("core.url");
 let runtime_constants = require("tachyon_core.constants");
+let variant_state = require("tachyon_core.variant_state");
+let runtime_country = require("tachyon_core.country");
 let runtime_dns = require("tachyon_core.dns");
 let runtime_route = require("tachyon_core.route");
 let runtime_rulesets = require("tachyon_core.rulesets");
@@ -32,6 +34,10 @@ const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 let runtime_ruleset_folder = getenv("TACHYON_RULESET_FOLDER") || "/usr/share/tachyon/rulesets";
 
 let ctx = {};
+let section_leaf_tags = {};
+let section_group_map = {};
+let section_state_map = {};
+let active_group_tags = {};
 
 function settings_update_interval() {
     let settings = ctx.runtime_settings();
@@ -49,6 +55,10 @@ function remote_ruleset_update_interval() {
 
 function init(c) {
     ctx = c;
+    section_leaf_tags = {};
+    section_group_map = {};
+    section_state_map = {};
+    active_group_tags = {};
 }
 
 function valid_section_name(name) {
@@ -252,9 +262,26 @@ function format_outbound_type_label(protocol, transport) {
     else if (p == "shadowsocks" || p == "ss") norm_proto = "Shadowsocks";
     else if (p == "trojan") norm_proto = "Trojan";
     else if (p == "wireguard" || p == "wg") norm_proto = "WireGuard";
+    else if (p == "amneziawg" || p == "awg") norm_proto = "AmneziaWG";
     else if (p == "hysteria2" || p == "hy2") norm_proto = "Hysteria2";
     else if (p == "hysteria") norm_proto = "Hysteria";
     else if (p == "tuic") norm_proto = "TUIC";
+    else if (p == "anytls") norm_proto = "AnyTLS";
+    else if (p == "naive") norm_proto = "NaiveProxy";
+    else if (p == "mieru") norm_proto = "Mieru";
+    else if (p == "snell") norm_proto = "Snell";
+    else if (p == "sudoku") norm_proto = "Sudoku";
+    else if (p == "masque") norm_proto = "MASQUE";
+    else if (p == "openvpn") norm_proto = "OpenVPN";
+    else if (p == "openconnect") norm_proto = "OpenConnect";
+    else if (p == "tewfai") norm_proto = "Tewfai";
+    else if (p == "trusttunnel") norm_proto = "TrustTunnel";
+    else if (p == "mtproto" || p == "mtproxy") norm_proto = "MTProto";
+    else if (p == "shadowtls") norm_proto = "ShadowTLS";
+    else if (p == "fptn") norm_proto = "FPTN";
+    else if (p == "desync") norm_proto = "Desync";
+    else if (p == "chain") norm_proto = "Chain";
+    else if (p == "tailscale") norm_proto = "Tailscale";
     else if (p == "socks" || p == "socks5") norm_proto = "SOCKS5";
     else if (p == "http") norm_proto = "HTTP";
     else if (p == "direct") norm_proto = "Direct";
@@ -504,7 +531,203 @@ function filter_candidate_outbounds(filter_mode, urltest_candidate_tags, names, 
     return visible_outbounds;
 }
 
+function tag_prefix_filter_matches(tag, names, metadata, prefixes) {
+    prefixes = array_or_empty(prefixes);
+    if (length(prefixes) == 0)
+        return false;
+    let stored_prefix = lc(trim(as_string(object_or_empty(object_or_empty(metadata).prefixes)[tag] || "")));
+    let stored_source = lc(trim(as_string(object_or_empty(object_or_empty(metadata).sources)[tag] || "")));
+    let display = lc(trim(tag_display_name(tag, names)));
+    let raw_tag = lc(trim(as_string(tag)));
+    for (let p in prefixes) {
+        let pl = lc(trim(as_string(p)));
+        if (pl == "")
+            continue;
+        let bare = replace(pl, /^\[|\]$/g, "");
+        if (bare == "")
+            continue;
+        if (stored_prefix != "" && (stored_prefix == bare || stored_prefix == pl))
+            return true;
+        if (stored_source != "" && (stored_source == bare || stored_source == pl))
+            return true;
+        if (substr(bare, 0, 4) == "sub:" || substr(bare, 0, 4) == "src_")
+            continue;
+        if (index(display, "[" + bare + "]") == 0 ||
+            index(display, bare + " ") == 0 ||
+            index(display, bare + "-") == 0 ||
+            index(display, bare + "_") == 0 ||
+            display == bare ||
+            index(raw_tag, bare) == 0)
+            return true;
+    }
+    return false;
+}
+
+function country_metadata_for_method(detect_method, state) {
+    let names = object_or_empty(object_or_empty(state.outboundMetadata).names);
+    let from_flags = runtime_urltest.countries_from_flag_names(names);
+    if (detect_method == "flag_emoji")
+        return from_flags;
+    let metadata = object_or_empty(object_or_empty(state.outboundMetadata).countries);
+    let result = {};
+    for (let t, c in from_flags)
+        result[t] = c;
+    for (let t, c in metadata)
+        if (c != "")
+            result[t] = c;
+    return result;
+}
+
+// Multi-criteria group filter where non-empty include categories (prefix, country,
+// name/regex, proxy_parameters) intersect via AND, while exclude categories subtract via OR.
+function filter_tags_by_group_spec(candidate_tags, spec, state) {
+    if (spec == null || type(spec) != "object")
+        return unique_string_array(candidate_tags);
+    let mode = as_string(spec.mode || "disabled");
+    let all_tags = unique_string_array(candidate_tags);
+    let hidden_tags = object_or_empty(state ? state.hiddenOutboundTags : null);
+    if (mode == "" || mode == "disabled") {
+        if (length(keys(hidden_tags)) > 0) {
+            let vis = [];
+            for (let t in all_tags)
+                if (!hidden_tags[t])
+                    push(vis, t);
+            if (length(vis) > 0)
+                return vis;
+        }
+        return all_tags;
+    }
+
+    let metadata = object_or_empty(state ? state.outboundMetadata : null);
+    let names = object_or_empty(metadata.names);
+    let countries = country_metadata_for_method(as_string(spec.country_mode || "flag_emoji"), state || {});
+
+    let inc_prefixes = array_or_empty(spec.include_prefixes);
+    let inc_countries = runtime_urltest.normalized_country_list(spec.include_countries);
+    let inc_names = array_or_empty(spec.include_outbounds);
+    let inc_regex = array_or_empty(spec.include_regex);
+    let inc_regex_set = regex_match_set(all_tags, names, inc_regex);
+    let inc_params = spec.include_proxy_parameters == true && (
+        length(array_or_empty(spec.include_protocols)) > 0 ||
+        length(array_or_empty(spec.include_transports)) > 0 ||
+        length(array_or_empty(spec.include_securities)) > 0 ||
+        length(array_or_empty(spec.include_ports)) > 0
+    );
+
+    let has_inc_prefix = length(inc_prefixes) > 0;
+    let has_inc_country = length(inc_countries) > 0;
+    let has_inc_name_regex = length(inc_names) > 0 || length(inc_regex) > 0;
+    let any_inc_category = has_inc_prefix || has_inc_country || has_inc_name_regex || inc_params;
+
+    if (!has_inc_name_regex && length(keys(hidden_tags)) > 0) {
+        let vis = [];
+        for (let t in all_tags)
+            if (!hidden_tags[t])
+                push(vis, t);
+        if (length(vis) > 0)
+            all_tags = vis;
+    }
+
+    let exc_prefixes = array_or_empty(spec.exclude_prefixes);
+    let exc_countries = runtime_urltest.normalized_country_list(spec.exclude_countries);
+    let exc_names = array_or_empty(spec.exclude_outbounds);
+    let exc_regex = array_or_empty(spec.exclude_regex);
+    let exc_regex_set = regex_match_set(all_tags, names, exc_regex);
+    let exc_params = spec.exclude_proxy_parameters == true && (
+        length(array_or_empty(spec.exclude_protocols)) > 0 ||
+        length(array_or_empty(spec.exclude_transports)) > 0 ||
+        length(array_or_empty(spec.exclude_securities)) > 0 ||
+        length(array_or_empty(spec.exclude_ports)) > 0
+    );
+
+    let result = [];
+    let seen_type_counts = {};
+    for (let t in all_tags) {
+        let name_with_type = tag_display_name_with_type(t, names, metadata);
+        seen_type_counts[name_with_type] = (seen_type_counts[name_with_type] || 0) + 1;
+        let count = seen_type_counts[name_with_type];
+        let name_with_type_indexed = count > 1 ? (name_with_type + " (#" + count + ")") : name_with_type;
+
+        if (mode == "include" || mode == "mixed") {
+            if (!any_inc_category)
+                continue;
+            if (has_inc_prefix && !tag_prefix_filter_matches(t, names, metadata, inc_prefixes))
+                continue;
+            if (has_inc_country && !tag_country_filter_matches(t, countries, inc_countries))
+                continue;
+            if (has_inc_name_regex && !tag_name_filter_matches(t, names, inc_names, inc_regex_set, metadata, name_with_type_indexed))
+                continue;
+            if (inc_params && !proxy_parameter_filter_matches_all(
+                t, metadata, spec.include_protocols, spec.include_transports, spec.include_securities, spec.include_ports
+            ))
+                continue;
+        }
+
+        if (mode == "exclude" || mode == "mixed") {
+            let is_excluded = false;
+            if (length(exc_prefixes) > 0 && tag_prefix_filter_matches(t, names, metadata, exc_prefixes))
+                is_excluded = true;
+            if (!is_excluded && length(exc_countries) > 0 && tag_country_filter_matches(t, countries, exc_countries))
+                is_excluded = true;
+            if (!is_excluded && (length(exc_names) > 0 || length(exc_regex) > 0) &&
+                tag_name_filter_matches(t, names, exc_names, exc_regex_set, metadata, name_with_type_indexed))
+                is_excluded = true;
+            if (!is_excluded && exc_params && proxy_parameter_filter_matches_any(
+                t, metadata, spec.exclude_protocols, spec.exclude_transports, spec.exclude_securities, spec.exclude_ports
+            ))
+                is_excluded = true;
+            if (is_excluded)
+                continue;
+        }
+
+        push(result, t);
+    }
+    return result;
+}
+
 function urltest_filtered_outbounds(section, urltest_id, urltest_candidate_tags, state) {
+    let grefs = type(connections.urltest_group_refs) == "function"
+        ? connections.urltest_group_refs(section, urltest_id)
+        : [];
+    if (length(grefs) > 0) {
+        let union_cand = [];
+        for (let grp_id in grefs) {
+            let gspec = connections.outbound_group_filter_spec(grp_id, section);
+            if (gspec == null)
+                continue;
+            for (let t in filter_tags_by_group_spec(urltest_candidate_tags, gspec, state))
+                push(union_cand, t);
+        }
+        if (length(union_cand) > 0)
+            urltest_candidate_tags = unique_string_array(union_cand);
+    }
+    let inc_prefixes = connections.urltest_include_prefixes(section, urltest_id);
+    let exc_prefixes = connections.urltest_exclude_prefixes(section, urltest_id);
+    if (length(inc_prefixes) > 0 || length(exc_prefixes) > 0) {
+        return filter_tags_by_group_spec(urltest_candidate_tags, {
+            mode: connections.urltest_filter_mode(section, urltest_id),
+            country_mode: connections.urltest_detect_server_country(section, urltest_id),
+            include_prefixes: inc_prefixes,
+            include_countries: connections.urltest_include_countries(section, urltest_id),
+            include_outbounds: connections.urltest_include_outbounds(section, urltest_id),
+            include_regex: connections.urltest_include_regex(section, urltest_id),
+            include_proxy_parameters: connections.urltest_include_proxy_parameters(section, urltest_id),
+            include_protocols: connections.urltest_include_protocols(section, urltest_id),
+            include_transports: connections.urltest_include_transports(section, urltest_id),
+            include_securities: connections.urltest_include_securities(section, urltest_id),
+            include_ports: connections.urltest_include_ports(section, urltest_id),
+            exclude_prefixes: exc_prefixes,
+            exclude_countries: connections.urltest_exclude_countries(section, urltest_id),
+            exclude_outbounds: connections.urltest_exclude_outbounds(section, urltest_id),
+            exclude_regex: connections.urltest_exclude_regex(section, urltest_id),
+            exclude_proxy_parameters: connections.urltest_exclude_proxy_parameters(section, urltest_id),
+            exclude_protocols: connections.urltest_exclude_protocols(section, urltest_id),
+            exclude_transports: connections.urltest_exclude_transports(section, urltest_id),
+            exclude_securities: connections.urltest_exclude_securities(section, urltest_id),
+            exclude_ports: connections.urltest_exclude_ports(section, urltest_id)
+        }, state);
+    }
+
     return filter_candidate_outbounds(
         connections.urltest_filter_mode(section, urltest_id),
         urltest_candidate_tags,
@@ -552,6 +775,41 @@ function priority_level_country_metadata(group_id, level_id, state) {
 function priority_level_filtered_outbounds(group_id, level_id, urltest_candidate_tags, state) {
     if (connections.priority_level_direct(group_id, level_id))
         return [ runtime_constants.DIRECT_OUTBOUND_TAG ];
+
+    let inc_prefixes = connections.priority_level_include_prefixes(group_id, level_id);
+    let exc_prefixes = connections.priority_level_exclude_prefixes(group_id, level_id);
+    let child_obj = connections.priority_level_items(group_id);
+    let from_outbound_group = false;
+    for (let it in child_obj) {
+        if (as_string(it[".name"] || "") == as_string(level_id) && it.outbound_group_ref != null) {
+            from_outbound_group = true;
+            break;
+        }
+    }
+    if (from_outbound_group || length(inc_prefixes) > 0 || length(exc_prefixes) > 0) {
+        return filter_tags_by_group_spec(urltest_candidate_tags, {
+            mode: connections.priority_level_filter_mode(group_id, level_id),
+            country_mode: connections.priority_level_detect_server_country(group_id, level_id),
+            include_prefixes: inc_prefixes,
+            include_countries: connections.priority_level_include_countries(group_id, level_id),
+            include_outbounds: connections.priority_level_include_outbounds(group_id, level_id),
+            include_regex: connections.priority_level_include_regex(group_id, level_id),
+            include_proxy_parameters: connections.priority_level_include_proxy_parameters(group_id, level_id),
+            include_protocols: connections.priority_level_include_protocols(group_id, level_id),
+            include_transports: connections.priority_level_include_transports(group_id, level_id),
+            include_securities: connections.priority_level_include_securities(group_id, level_id),
+            include_ports: connections.priority_level_include_ports(group_id, level_id),
+            exclude_prefixes: exc_prefixes,
+            exclude_countries: connections.priority_level_exclude_countries(group_id, level_id),
+            exclude_outbounds: connections.priority_level_exclude_outbounds(group_id, level_id),
+            exclude_regex: connections.priority_level_exclude_regex(group_id, level_id),
+            exclude_proxy_parameters: connections.priority_level_exclude_proxy_parameters(group_id, level_id),
+            exclude_protocols: connections.priority_level_exclude_protocols(group_id, level_id),
+            exclude_transports: connections.priority_level_exclude_transports(group_id, level_id),
+            exclude_securities: connections.priority_level_exclude_securities(group_id, level_id),
+            exclude_ports: connections.priority_level_exclude_ports(group_id, level_id)
+        }, state);
+    }
 
     return filter_candidate_outbounds(
         connections.priority_level_filter_mode(group_id, level_id),
@@ -702,27 +960,32 @@ function priority_outbound_tag(section_name, group_id) {
 // leaves. add_proxy_selector records each section's leaf candidates; the
 // post-pass add_group_urltest_outbounds builds the urltest and fills
 // section_group_map, which route generation reads.
-let section_leaf_tags = {};
-let section_group_map = {};
-
 function remember_section_leaf_tags(name, tags) {
     section_leaf_tags[name] = tags;
 }
 
 function find_outbound_by_tag(config, want) {
-    for (let outbound in config.outbounds)
+    for (let outbound in array_or_empty(config.outbounds))
         if (as_string(outbound.tag) == want)
             return outbound;
+    for (let endpoint in array_or_empty(config.endpoints))
+        if (as_string(endpoint.tag) == want)
+            return endpoint;
     return null;
 }
 
-// urltest tag of the group this section belongs to, or "" when the section is
+// urltest tag of the group this section belongs to (or the group's own urltest
+// tag when the section itself has action 'group'), or "" when the section is
 // not a group member (or its group produced no urltest).
 function group_outbound_tag_for_section(section) {
+    if (type(section) != "object")
+        return "";
+    if (option(section, "action", "") == "group")
+        return as_string(active_group_tags[section[".name"]] || "");
     let group_name = as_string(section_group_map[section[".name"]]);
     if (group_name == "")
         return "";
-    return urltest_outbound_tag(group_name, "urltest");
+    return as_string(active_group_tags[group_name] || urltest_outbound_tag(group_name, "urltest"));
 }
 
 function group_member_action_supported(action) {
@@ -731,8 +994,8 @@ function group_member_action_supported(action) {
         return false;
     return connections.is_connections_action(action) ||
         action == "awg" || action == "warp" ||
-        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" ||
-        action == "sudoku" || action == "masque" || action == "openvpn" || action == "fptn";
+        action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
+        action == "masque" || action == "openvpn" || action == "fptn";
 }
 
 // Union of the member sections' leaf outbound tags. Sections that went through
@@ -745,7 +1008,7 @@ function group_member_leaf_tags(members, config) {
         if (ctx.deferred_sections && ctx.deferred_sections[name])
             continue;
         let recorded = section_leaf_tags[name];
-        if (type(recorded) == "array" && length(recorded) > 0) {
+        if (type(recorded) == "array") {
             for (let candidate in recorded)
                 push(tags, candidate);
             continue;
@@ -759,12 +1022,10 @@ function group_member_leaf_tags(members, config) {
 }
 
 function is_extended_variant_detected() {
-    let sb_variant_file = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
-    let sb_variant_val = trim(fs.readfile(sb_variant_file) || "");
+    let sb_variant_val = variant_state.read_variant_marker();
     if (sb_variant_val == "extended" || sb_variant_val == "extended-compressed")
         return true;
-    let sb_version_file = getenv("SB_VERSION_STATE_FILE") || "/etc/tachyon/tachyon-core-version";
-    let sb_version_val = trim(fs.readfile(sb_version_file) || "");
+    let sb_version_val = variant_state.read_version_state();
     return index(sb_version_val, "extended") >= 0;
 }
 
@@ -810,45 +1071,75 @@ function add_urltest_outbound(config, section, urltest_id, urltest_candidate_tag
     };
 }
 
-// Post-pass: after every section has generated its outbounds, build one flat
-// urltest per group section over the union of member leaves and record the
-// member -> group mapping used to repoint route rules. Deferred (quarantined)
-// members contribute no leaves; a group with no live members is not emitted.
-function add_group_urltest_outbounds(config, sections) {
-    for (let section in sections) {
-        if (option(section, "action", "") != "group")
-            continue;
-        let group_name = section[".name"];
-        if (ctx.deferred_sections && ctx.deferred_sections[group_name])
-            continue;
+function routed_dns_server_tag(section_name) {
+    return runtime_constants.tag(section_name, "routed-dns-server");
+}
 
-        let wanted = {};
-        for (let member_name in list_option(section, "group_members"))
-            wanted[trim(as_string(member_name))] = true;
+function add_routed_dns_server_for_section(config, section) {
+    if (!connections.routed_dns_enabled(section))
+        return;
+    let section_name = section[".name"];
+    let action = option(section, "action", "");
+    let servers = connections.routed_dns_servers(section);
+    let dns_type = connections.routed_dns_type(section);
+    let tag_name = routed_dns_server_tag(section_name);
+    let detour = action == "bypass" ? null : (group_outbound_tag_for_section(section) || outbound_tag(section_name));
 
-        let members = [];
-        for (let candidate in sections)
-            if (wanted[candidate[".name"]])
-                push(members, candidate);
+    for (let i = 0; i < length(servers); i++) {
+        let s_val = servers[i];
+        // The rule references the un-indexed tag, so the first server has to
+        // carry it however many are configured — with a single server this is
+        // the same tag as before, with several the rest get -2, -3, …
+        let server_tag = i == 0
+            ? tag_name
+            : runtime_constants.tag(section_name, "routed-dns-server-" + (i + 1));
+        let server = runtime_dns.server_from_options(
+            server_tag,
+            dns_type,
+            s_val,
+            detour
+        );
+        if (server.unsupported)
+            ctx.runtime_generate_unsupported(server.unsupported);
+        push(config.dns.servers, server);
+    }
+}
 
-        let tags = group_member_leaf_tags(members, config);
-        if (length(tags) == 0) {
-            warn("Section group " + group_name + " has no member servers available, the group is not generated\n");
-            continue;
+function merge_member_state_into_group(group_state, member, config) {
+    let name = member[".name"];
+    let member_state = section_state_map[name];
+    if (type(member_state) == "object") {
+        let recorded = section_leaf_tags[name];
+        let allowed = (type(recorded) == "array") ? object_keys_set(recorded) : null;
+        for (let k, v in object_or_empty(member_state.links)) {
+            if (!allowed || allowed[k])
+                group_state.links[k] = v;
         }
-
-        let state = runtime_subscription.new_section_state(group_name);
-        let result = add_urltest_outbound(config, section, "urltest", tags, state);
-        if (result.tag == "")
-            continue;
-        for (let member in members) {
-            let name = member[".name"];
-            if (section_group_map[name] != null)
-                warn("Rule " + name + " belongs to several section groups; " +
-                    as_string(section_group_map[name]) + " wins, " + group_name + " is ignored\n");
-            else
-                section_group_map[name] = group_name;
+        for (let k, v in object_or_empty(member_state.servers)) {
+            if (!allowed || allowed[k])
+                group_state.servers[k] = v;
         }
+        for (let item in array_or_empty(member_state.subscriptionMetadata))
+            push(group_state.subscriptionMetadata, item);
+        let member_meta = object_or_empty(member_state.outboundMetadata);
+        for (let field in [ "names", "countries", "protocols", "transports", "securities", "prefixes", "ports", "details", "sources" ]) {
+            if (!group_state.outboundMetadata[field])
+                group_state.outboundMetadata[field] = {};
+            for (let k, v in object_or_empty(member_meta[field])) {
+                if (!allowed || allowed[k])
+                    group_state.outboundMetadata[field][k] = v;
+            }
+        }
+        return;
+    }
+
+    let own_tag = outbound_tag(name);
+    let outbound = find_outbound_by_tag(config, own_tag);
+    if (outbound != null && ctx.outbounds.urltest_leaf_candidate_outbound(outbound)) {
+        let display_name = trim(option(member, "label", option(member, "name", "")));
+        if (display_name == "")
+            display_name = name;
+        runtime_subscription.remember_outbound_metadata(group_state, own_tag, display_name, outbound);
     }
 }
 
@@ -898,6 +1189,119 @@ function add_priority_group_outbound(config, section, group_id, urltest_candidat
     };
 }
 
+// Post-pass: after every section has generated its outbounds, build one flat
+// urltest per group section over the union of member leaves and record the
+// member -> group mapping used to repoint route rules. Deferred (quarantined)
+// members contribute no leaves; a group with no live members is not emitted.
+function add_group_urltest_outbounds(config, sections) {
+    for (let section in sections) {
+        if (option(section, "action", "") != "group")
+            continue;
+        let group_name = section[".name"];
+        if (ctx.deferred_sections && ctx.deferred_sections[group_name])
+            continue;
+        ctx.current_section = group_name;
+
+        let wanted = {};
+        for (let member_name in list_option(section, "group_members"))
+            wanted[trim(as_string(member_name))] = true;
+
+        let members = [];
+        for (let candidate in sections)
+            if (wanted[candidate[".name"]])
+                push(members, candidate);
+
+        let tags = group_member_leaf_tags(members, config);
+        if (length(tags) == 0) {
+            warn("Section group " + group_name + " has no member servers available, the group is not generated\n");
+            continue;
+        }
+
+        let state = runtime_subscription.new_section_state(group_name);
+        for (let member in members)
+            merge_member_state_into_group(state, member, config);
+
+        if (section_needs_country_is(section)) {
+            let previous_state = read_json_file(runtime_subscription.section_cache_path(group_name));
+            state.outboundMetadata.countries = runtime_country.detect(
+                state.servers,
+                previous_state,
+                option(ctx.runtime_settings(), "bootstrap_dns_server", "77.88.8.8")
+            );
+        }
+        if (section_has_direct_priority_level(section))
+            state.outboundMetadata.names[runtime_constants.DIRECT_OUTBOUND_TAG] = "Direct";
+
+        let configured_urltests = connections.urltests(section);
+        let urltest_ids = length(configured_urltests) > 0 ? configured_urltests : [ "urltest" ];
+        let urltest_tags = [];
+        let priority_tags = [];
+        let leaf_outbounds = [];
+
+        for (let urltest_id in urltest_ids) {
+            let result = add_urltest_outbound(config, section, urltest_id, tags, state);
+            if (result.tag == "")
+                continue;
+            push(urltest_tags, result.tag);
+            for (let t in result.outbounds)
+                push(leaf_outbounds, t);
+        }
+
+        for (let group_id in connections.priority_groups(section)) {
+            let priority = add_priority_group_outbound(config, section, group_id, tags, state);
+            if (priority.tag == "")
+                continue;
+            push(priority_tags, priority.tag);
+            for (let t in priority.outbounds)
+                push(leaf_outbounds, t);
+        }
+
+        if (length(urltest_tags) == 0 && length(priority_tags) == 0)
+            continue;
+
+        let selector_tag = outbound_tag(group_name);
+        let merged_leaves = unique_string_array(length(leaf_outbounds) > 0 ? leaf_outbounds : tags);
+        let selector_outbounds = [];
+        for (let t in merged_leaves)
+            push(selector_outbounds, t);
+        for (let t in urltest_tags)
+            push(selector_outbounds, t);
+        for (let t in priority_tags)
+            push(selector_outbounds, t);
+        let selector_default = length(urltest_tags) > 0 ? urltest_tags[0] : priority_tags[0];
+        let persistent_selector_file = getenv("TACHYON_PERSISTENT_SELECTOR_STATE_FILE") || "/etc/tachyon/selector_state.json";
+        let saved_selector_state = read_json_file(persistent_selector_file);
+        if (type(saved_selector_state) == "object" && as_string(saved_selector_state[selector_tag]) != "") {
+            let saved_target = as_string(saved_selector_state[selector_tag]);
+            if (index(selector_outbounds, saved_target) >= 0)
+                selector_default = saved_target;
+        }
+        push(config.outbounds, {
+            type: "selector",
+            tag: selector_tag,
+            outbounds: selector_outbounds,
+            default: selector_default,
+            interrupt_exist_connections: connections.urltest_interrupt_exist_connections(section, "urltest")
+        });
+
+        state.urltestCandidateTags = unique_string_array(tags);
+        if (!getenv("SB_PREFLIGHT_BINARY") && !ctx.atomic_write_json_file(runtime_subscription.section_cache_path(group_name), state))
+            ctx.runtime_generate_unsupported("failed to write section cache for " + group_name);
+
+        active_group_tags[group_name] = selector_tag;
+        for (let member in members) {
+            let name = member[".name"];
+            if (section_group_map[name] != null)
+                warn("Rule " + name + " belongs to several section groups; " +
+                    as_string(section_group_map[name]) + " wins, " + group_name + " is ignored\n");
+            else
+                section_group_map[name] = group_name;
+        }
+        add_routed_dns_server_for_section(config, section);
+    }
+    ctx.current_section = null;
+}
+
 function is_mieru_detour(config, tag, depth) {
     depth = int(depth || 0);
     if (depth > 5 || tag == null || tag == "")
@@ -929,6 +1333,13 @@ function is_valid_detour(config, tag) {
             if (out.routing_mark != null)
                 return false;
             if (out.type == "mieru" || is_mieru_detour(config, tag, 0))
+                return false;
+            return true;
+        }
+    }
+    for (let ep in array_or_empty(config.endpoints)) {
+        if (type(ep) == "object" && ep.tag == tag) {
+            if (ep.routing_mark != null)
                 return false;
             return true;
         }
@@ -990,6 +1401,7 @@ function section_excluded_candidate_tags(section, candidate_tags, state) {
     let exclude_protocols = connections.dashboard_exclude_protocols(section);
     let exclude_transports = connections.dashboard_exclude_transports(section);
     let exclude_securities = connections.dashboard_exclude_securities(section);
+    let exclude_ports = connections.dashboard_exclude_ports(section);
 
     let has_exclude_criteria = length(exclude_names) > 0 ||
         length(exclude_regex) > 0 ||
@@ -997,7 +1409,8 @@ function section_excluded_candidate_tags(section, candidate_tags, state) {
         (exclude_proxy_parameters && (
             length(exclude_protocols) > 0 ||
             length(exclude_transports) > 0 ||
-            length(exclude_securities) > 0
+            length(exclude_securities) > 0 ||
+            length(exclude_ports) > 0
         ));
 
     if (!has_exclude_criteria)
@@ -1016,13 +1429,44 @@ function section_excluded_candidate_tags(section, candidate_tags, state) {
         exclude_protocols,
         exclude_transports,
         exclude_securities,
-        []
+        exclude_ports
     );
 }
 
 function add_proxy_selector(config, section, selector_tags, urltest_candidate_tags, state, text_urltest_tag) {
     let section_name = section[".name"];
-    remember_section_leaf_tags(section_name, urltest_candidate_tags);
+    if (type(state) == "object")
+        section_state_map[section_name] = state;
+
+    let group_refs = connections.section_outbound_group_refs(section);
+    if (length(group_refs) > 0) {
+        let union_selector = [];
+        let union_cand = [];
+        for (let grp_id in group_refs) {
+            let gspec = connections.outbound_group_filter_spec(grp_id, section);
+            if (gspec == null)
+                continue;
+            for (let t in filter_tags_by_group_spec(selector_tags, gspec, state))
+                push(union_selector, t);
+            for (let t in filter_tags_by_group_spec(urltest_candidate_tags, gspec, state))
+                push(union_cand, t);
+        }
+        if (length(union_selector) > 0)
+            selector_tags = unique_string_array(union_selector);
+        if (length(union_cand) > 0)
+            urltest_candidate_tags = unique_string_array(union_cand);
+    }
+
+    let sec_pool_spec = connections.section_pool_filter_spec(section);
+    if (sec_pool_spec != null) {
+        let narrowed_sel = filter_tags_by_group_spec(selector_tags, sec_pool_spec, state);
+        let narrowed_cand = filter_tags_by_group_spec(urltest_candidate_tags, sec_pool_spec, state);
+        if (length(narrowed_sel) > 0 || sec_pool_spec.mode == "exclude")
+            selector_tags = narrowed_sel;
+        if (length(narrowed_cand) > 0 || sec_pool_spec.mode == "exclude")
+            urltest_candidate_tags = narrowed_cand;
+    }
+
     let selector_tag = outbound_tag(section_name);
     let selector_outbounds = selector_tags;
     let selector_default = selector_tags[0];
@@ -1084,6 +1528,79 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
             "falling back to all available subscription servers\n");
         filtered_outbounds = selector_tags;
     }
+
+    let effective_leaf_tags = group_candidate_tags;
+    if ((mode == "include" || mode == "exclude" || mode == "mixed") && length(filtered_outbounds) > 0) {
+        let allowed_set = object_keys_set(filtered_outbounds);
+        let narrowed = [];
+        for (let t in group_candidate_tags) {
+            if (allowed_set[t])
+                push(narrowed, t);
+        }
+        if (length(narrowed) > 0 || mode == "exclude")
+            effective_leaf_tags = narrowed;
+    }
+    remember_section_leaf_tags(section_name, effective_leaf_tags);
+
+    let sec_source_refs = connections.section_outbound_source_refs(section);
+    let sel_mode = lc(trim(option(section, "section_selection_mode", "auto")));
+    let meta_sources = object_or_empty(object_or_empty(state.outboundMetadata).sources);
+    let sub_urls = connections.subscription_urls(section);
+    let source_level_entries = [];
+    let has_dpi_source = false;
+    let first_is_dpi = false;
+
+    if (length(sec_source_refs) > 0 && length(filtered_outbounds) > 0) {
+        let ordered_filtered = [];
+        let seen_ordered = {};
+        for (let s_idx = 0; s_idx < length(sec_source_refs); s_idx++) {
+            let src_id = sec_source_refs[s_idx];
+            let src = connections.outbound_source_section(src_id);
+            let stype = src != null ? option(src, "source_type", "") : "";
+            let is_dpi = connections.is_dpi_or_desync_source_type && connections.is_dpi_or_desync_source_type(stype);
+            if (is_dpi) {
+                has_dpi_source = true;
+                if (s_idx == 0)
+                    first_is_dpi = true;
+            }
+            let src_url = src != null ? trim(option(src, "url", "")) : "";
+            let sub_marker = "";
+            if (src_url != "") {
+                for (let u_idx = 0; u_idx < length(sub_urls); u_idx++) {
+                    if (trim(as_string(sub_urls[u_idx])) == src_url) {
+                        sub_marker = "sub:" + (u_idx + 1);
+                        break;
+                    }
+                }
+            }
+            let this_src_tags = [];
+            for (let t in filtered_outbounds) {
+                let m_src = as_string(meta_sources[t] || "");
+                if (m_src == src_id || (sub_marker != "" && m_src == sub_marker)) {
+                    push(this_src_tags, t);
+                    if (!seen_ordered[t]) {
+                        seen_ordered[t] = true;
+                        push(ordered_filtered, t);
+                    }
+                }
+            }
+            if (length(this_src_tags) > 0) {
+                push(source_level_entries, {
+                    id: src_id,
+                    displayName: src != null ? (option(src, "name", src_id) || src_id) : src_id,
+                    outbounds: this_src_tags
+                });
+            }
+        }
+        for (let t in filtered_outbounds) {
+            if (!seen_ordered[t]) {
+                seen_ordered[t] = true;
+                push(ordered_filtered, t);
+            }
+        }
+        filtered_outbounds = ordered_filtered;
+    }
+
     selector_outbounds = filtered_outbounds;
     selector_default = selector_outbounds[0];
     if (length(urltest_tags) > 0 || length(priority_tags) > 0) {
@@ -1091,7 +1608,53 @@ function add_proxy_selector(config, section, selector_tags, urltest_candidate_ta
             push(selector_outbounds, tag);
         for (let tag in priority_tags)
             push(selector_outbounds, tag);
-        selector_default = length(urltest_tags) > 0 ? urltest_tags[0] : priority_tags[0];
+        if (!first_is_dpi && sel_mode != "priority_failover")
+            selector_default = length(urltest_tags) > 0 ? urltest_tags[0] : priority_tags[0];
+    }
+
+    if (sel_mode == "priority_failover" || (sel_mode != "default" && has_dpi_source)) {
+        let auto_levels = [];
+        let lvl_order = 1;
+        for (let entry in source_level_entries) {
+            push(auto_levels, {
+                id: entry.id,
+                displayName: entry.displayName,
+                order: lvl_order++,
+                direct: false,
+                outbounds: entry.outbounds
+            });
+        }
+        for (let ut_tag in urltest_tags) {
+            push(auto_levels, {
+                id: ut_tag,
+                displayName: ut_tag,
+                order: lvl_order++,
+                direct: false,
+                outbounds: [ ut_tag ]
+            });
+        }
+        if (length(auto_levels) >= 2) {
+            let h_url = trim(option(section, "section_health_url", "https://www.gstatic.com/generate_204"));
+            if (h_url == "")
+                h_url = "https://www.gstatic.com/generate_204";
+            runtime_subscription.remember_priority_group(state, selector_tag, {
+                id: section_name + "_failover",
+                tag: selector_tag,
+                section: section_name,
+                displayName: option(section, "label", section_name) || section_name,
+                health_url: h_url,
+                active_check_interval: "5s",
+                check_timeout: "2s",
+                recovery_check_interval: "15s",
+                pick_fastest: true,
+                switch_to_faster_same_priority: true,
+                fastest_check_interval: "3m",
+                interrupt_exist_connections: true,
+                pin_dashboard: false,
+                outbounds: selector_outbounds,
+                levels: auto_levels
+            });
+        }
     }
 
     if (length(selector_outbounds) == 0) {
@@ -1729,10 +2292,6 @@ function add_fakeip_query_type(rule, server_tag, ipv4_only) {
     return rule;
 }
 
-function routed_dns_server_tag(section_name) {
-    return runtime_constants.tag(section_name, "routed-dns-server");
-}
-
 function single_or_array(values) {
     return length(values) == 1 ? values[0] : values;
 }
@@ -1747,7 +2306,14 @@ function dns_action_detour_tag(section) {
     if (!bool_option(section, "dns_detour_enabled", false))
         return "";
     let target_section = option(section, "dns_detour_section", "");
-    return target_section == "" ? "" : outbound_tag(target_section);
+    if (target_section == "")
+        return "";
+    if (as_string(active_group_tags[target_section] || "") != "")
+        return as_string(active_group_tags[target_section]);
+    let group_name = as_string(section_group_map[target_section] || "");
+    if (group_name != "")
+        return as_string(active_group_tags[group_name] || urltest_outbound_tag(group_name, "urltest"));
+    return outbound_tag(target_section);
 }
 
 function section_dns_servers(section) {
@@ -1785,36 +2351,6 @@ function add_dns_server_for_section(config, section) {
     return server_tags;
 }
 
-function add_routed_dns_server_for_section(config, section) {
-    if (!connections.routed_dns_enabled(section))
-        return;
-    let section_name = section[".name"];
-    let action = option(section, "action", "");
-    let servers = connections.routed_dns_servers(section);
-    let dns_type = connections.routed_dns_type(section);
-    let tag_name = routed_dns_server_tag(section_name);
-    let detour = action == "bypass" ? null : outbound_tag(section_name);
-
-    for (let i = 0; i < length(servers); i++) {
-        let s_val = servers[i];
-        // The rule references the un-indexed tag, so the first server has to
-        // carry it however many are configured — with a single server this is
-        // the same tag as before, with several the rest get -2, -3, …
-        let server_tag = i == 0
-            ? tag_name
-            : runtime_constants.tag(section_name, "routed-dns-server-" + (i + 1));
-        let server = runtime_dns.server_from_options(
-            server_tag,
-            dns_type,
-            s_val,
-            detour
-        );
-        if (server.unsupported)
-            ctx.runtime_generate_unsupported(server.unsupported);
-        push(config.dns.servers, server);
-    }
-}
-
 function source_dns_inbound_matcher() {
     return [ runtime_constants.SOURCE_DNS_INBOUND_TAG ];
 }
@@ -1827,7 +2363,7 @@ function add_source_dns_matchers(rule, source_ip_cidr) {
     rule.source_ip_cidr = single_or_array(source_ip_cidr);
 }
 
-function add_dns_action_rules_for_section(config, section) {
+function add_dns_action_rules_for_clause(config, section) {
     let domains = domain_conditions(section);
     let domain = domains.domain;
     let domain_suffix = domains.domain_suffix;
@@ -1896,17 +2432,26 @@ function add_dns_action_rules_for_section(config, section) {
         push_dns_matcher_rule(config, dns_rule);
     }
     if (has_inline_domains) {
-        let dns_rule = {
-            action: "route",
-            server: server_tag,
-            rewrite_ttl
-        };
-        add_domain_array(dns_rule, "domain", domain);
-        add_domain_array(dns_rule, "domain_suffix", domain_suffix);
-        add_domain_array(dns_rule, "domain_keyword", domain_keyword);
-        add_domain_array(dns_rule, "domain_regex", domain_regex);
-        add_source_dns_matchers(dns_rule, source_ip_cidr);
-        push_dns_matcher_rule(config, dns_rule);
+        let domain_matchers = [
+            [ "domain", domain ],
+            [ "domain_suffix", domain_suffix ],
+            [ "domain_keyword", domain_keyword ],
+            [ "domain_regex", domain_regex ]
+        ];
+        for (let dm in domain_matchers) {
+            let key = dm[0];
+            let values = dm[1];
+            if (length(values) == 0)
+                continue;
+            let dns_rule = {
+                action: "route",
+                server: server_tag,
+                rewrite_ttl
+            };
+            add_domain_array(dns_rule, key, values);
+            add_source_dns_matchers(dns_rule, source_ip_cidr);
+            push_dns_matcher_rule(config, dns_rule);
+        }
     }
 
     let is_1_14 = ctx.is_sb_1_14_plus && ctx.is_sb_1_14_plus();
@@ -1961,6 +2506,11 @@ function add_dns_action_rules_for_section(config, section) {
 
     if (!has_inline_domains && length(query_rule_set_tags) == 0 && length(response_rule_set_tags) == 0 && length(fully_routed_ips) == 0)
         ctx.runtime_generate_unsupported("DNS action '" + section_name + "' has no domain matchers");
+}
+
+function add_dns_action_rules_for_section(config, section) {
+    for (let clause in connections.section_effective_clauses(section))
+        add_dns_action_rules_for_clause(config, clause);
 }
 
 function normalize_port_number_value(value) {
@@ -2190,10 +2740,91 @@ function apply_excluded_source_ips(rule, excluded_cidrs) {
     return logical_rule;
 }
 
+function apply_inverted_subrules(rule, inv_subrules) {
+    if (!rule)
+        return rule;
+    delete rule.__inv_subrules;
+    if (!inv_subrules || length(inv_subrules) == 0)
+        return rule;
+
+    if (rule.type == "logical" && rule.mode == "and" && type(rule.rules) == "array") {
+        let cloned = {};
+        for (let k, v in rule) {
+            if (k == "rules") {
+                cloned.rules = [];
+                for (let r in v) {
+                    if (r && length(keys(r)) > 0)
+                        push(cloned.rules, r);
+                }
+                for (let sub in inv_subrules)
+                    push(cloned.rules, sub);
+            } else {
+                cloned[k] = v;
+            }
+        }
+        return cloned;
+    }
+
+    let match_part = {};
+    for (let k, v in rule) {
+        if (!ACTION_KEYS[k] && substr(k, 0, 2) != "__")
+            match_part[k] = v;
+    }
+
+    let rules_list = [];
+    if (length(keys(match_part)) > 0)
+        push(rules_list, match_part);
+    for (let sub in inv_subrules)
+        push(rules_list, sub);
+
+    let logical_rule = {
+        type: "logical",
+        mode: "and",
+        rules: rules_list
+    };
+    for (let k, v in rule) {
+        if (ACTION_KEYS[k] || substr(k, 0, 2) == "__")
+            logical_rule[k] = v;
+    }
+    return logical_rule;
+}
+
+function push_section_dns_matcher_rule(config, section, rule, excluded_cidrs, domain_rule_set_tags) {
+    let action = option(section, "action", "");
+    let routed_tag = runtime_constants.tag(section[".name"], "routed-dns-server");
+    if ((action == "zapret" || action == "zapret2" || action == "byedpi") &&
+        connections.routed_dns_enabled(section) && rule.server == routed_tag &&
+        !connections.geoip_country_mode_is_closed(section) &&
+        !rule.match_response && (rule.rule_set == null || length(domain_rule_set_tags) > 0)) {
+        // Domain-only traffic enters TPROXY through FakeIP. Returning the
+        // routed resolver's real address here lets it bypass the DPI output.
+        // The route's resolve action still uses this resolver and its detour.
+        // Closed GeoIP modes skip that resolve and need real DNS addresses
+        // to decide the destination country before choosing an outbound.
+        let fakeip_rule = {};
+        for (let key, value in rule)
+            fakeip_rule[key] = value;
+        // In the legacy branch the fallback combines domain and mixed sets.
+        // Only domain-only sets may produce FakeIP: an IP-only match loses
+        // its real destination and cannot match the subsequent DPI route.
+        if (rule.rule_set != null)
+            fakeip_rule.rule_set = single_or_array(domain_rule_set_tags);
+        fakeip_rule.server = runtime_constants.FAKEIP_DNS_SERVER_TAG;
+        add_fakeip_query_type(fakeip_rule, fakeip_rule.server, section_is_ipv4_only_dpi(section));
+        push_dns_matcher_rule(config, apply_excluded_source_ips(fakeip_rule, excluded_cidrs));
+    }
+    // Retain routed DNS for other query types and non-domain rulesets.
+    push_dns_matcher_rule(config, apply_excluded_source_ips(rule, excluded_cidrs));
+}
+
 function push_section_route_rule(config, rule, target_outbound, excluded_cidrs, geo_tags, country_mode) {
+    let inv_subrules = rule ? rule.__inv_subrules : null;
+    if (rule)
+        delete rule.__inv_subrules;
     let apply_filters = function(r) {
         let filtered = apply_section_geoip_filter(r, geo_tags, country_mode);
-        return apply_excluded_source_ips(filtered, excluded_cidrs);
+        filtered = apply_excluded_source_ips(filtered, excluded_cidrs);
+        return apply_inverted_subrules(filtered, inv_subrules);
     };
 
     if (target_outbound && !outbound_supports_udp(config, target_outbound)) {
@@ -2211,7 +2842,12 @@ function push_section_route_rule(config, rule, target_outbound, excluded_cidrs, 
         for (let k, v in rule)
             udp_rule[k] = v;
         delete udp_rule.outbound;
-        udp_rule.action = "reject";
+        if (rule.source_ip_cidr && !rule.domain && !rule.ip_cidr && !rule.rule_set) {
+            udp_rule.action = "route";
+            udp_rule.outbound = runtime_constants.DIRECT_OUTBOUND_TAG;
+        } else {
+            udp_rule.action = "reject";
+        }
         udp_rule.network = "udp";
         push_route_matcher_rule(config, apply_filters(udp_rule));
 
@@ -2258,6 +2894,19 @@ function add_fully_routed_ips_rule(config, section) {
         route_rule.outbound = target.outbound;
     route_rule.source_ip_cidr = single_or_array(source_ip_cidr);
     push_section_route_rule(config, route_rule, target.outbound);
+
+    let routed_dns = connections.routed_dns_enabled(section);
+    if (routed_dns) {
+        let server_tag = runtime_constants.tag(section[".name"], "routed-dns-server");
+        let rewrite_ttl = int_option(ctx.runtime_settings(), "dns_rewrite_ttl", "60");
+        let dns_rule = {
+            action: "route",
+            server: server_tag,
+            rewrite_ttl
+        };
+        add_source_dns_matchers(dns_rule, source_ip_cidr);
+        push_dns_matcher_rule(config, dns_rule);
+    }
 }
 
 function add_excluded_ips_rule(config, section) {
@@ -2351,22 +3000,70 @@ function load_community_subnet_cidrs(community, filter_mode) {
     return [];
 }
 
-function add_combined_route_for_section(config, section) {
+function build_inverted_subrules(config, section_name, inverted_conditions) {
+    let subs = [];
+    for (let neg in array_or_empty(inverted_conditions)) {
+        if (type(neg) != "object")
+            continue;
+        let sub = { invert: true };
+        let ndom = domain_conditions(neg);
+        add_domain_array(sub, "domain", ndom.domain);
+        add_domain_array(sub, "domain_suffix", ndom.domain_suffix);
+        add_domain_array(sub, "domain_keyword", ndom.domain_keyword);
+        add_domain_array(sub, "domain_regex", ndom.domain_regex);
+        let nip = core_ip.normalize_to_cidrs(legacy_condition_values(neg, "ip_cidr"));
+        if (length(nip) > 0)
+            sub.ip_cidr = single_or_array(nip);
+        let nsrc_raw = [];
+        for (let v in legacy_condition_values(neg, "source_ip_cidr")) push(nsrc_raw, v);
+        for (let m in list_option(neg, "source_macs")) push(nsrc_raw, m);
+        let nsrc = core_ip.normalize_to_cidrs(nsrc_raw);
+        if (length(nsrc) > 0)
+            sub.source_ip_cidr = single_or_array(nsrc);
+        add_port_matchers(sub, neg);
+        add_protocol_matchers(sub, neg);
+        let nrs = [];
+        for (let comm in list_option(neg, "community_lists")) {
+            let ens = ensure_community_ruleset(config, section_name, as_string(comm));
+            if (ens && ens.tag)
+                push(nrs, ens.tag);
+        }
+        for (let rset in list_option(neg, "rule_set")) {
+            let ens = ensure_custom_ruleset(config, as_string(rset));
+            if (ens && ens.tag)
+                push(nrs, ens.tag);
+        }
+        for (let rset_sub in list_option(neg, "rule_set_with_subnets")) {
+            let ens = ensure_custom_ruleset(config, as_string(rset_sub));
+            if (ens && ens.tag)
+                push(nrs, ens.tag);
+        }
+        if (length(nrs) > 0)
+            sub.rule_set = single_or_array(nrs);
+        if (length(keys(sub)) > 1)
+            push(subs, sub);
+    }
+    return subs;
+}
+
+function add_combined_route_for_clause(config, section) {
     let domains = domain_conditions(section);
     let domain = domains.domain;
     let domain_suffix = domains.domain_suffix;
     let domain_keyword = domains.domain_keyword;
     let domain_regex = domains.domain_regex;
-    let ip_cidr = legacy_condition_values(section, "ip_cidr");
+    let ip_cidr = core_ip.normalize_to_cidrs(legacy_condition_values(section, "ip_cidr"));
     let source_ip_cidr = core_ip.normalize_to_cidrs(legacy_condition_values(section, "source_ip_cidr"));
     let excluded_cidrs = core_ip.normalize_to_cidrs(list_option(section, "excluded_ips"));
     let rule_set_tags = [];
     let dns_query_rule_set_tags = [];
     let dns_response_rule_set_tags = [];
+    // The query-side tags that also match addresses. A set like that may not
+    // produce FakeIP: the match would lose the real destination and could not
+    // match the DPI rule afterwards.
+    let dns_non_domain_query_tags = [];
     let section_name = section[".name"];
-
-    add_excluded_protocol_rule(config, section);
-    add_fully_routed_ips_rule(config, section);
+    let inv_subrules = build_inverted_subrules(config, section_name, section.__inverted_conditions);
 
 
     let include_community_subnets = bool_option(section, "community_subnets", true);
@@ -2375,9 +3072,11 @@ function add_combined_route_for_section(config, section) {
         let service = as_string(community);
         let ensured = ensure_community_ruleset(config, section_name, service);
         push(rule_set_tags, ensured.tag);
-        if (ensured.kind == "domains" || service == "discord")
+        if (ensured.kind == "domains" || service == "discord") {
             push(dns_query_rule_set_tags, ensured.tag);
-        else if (ensured.kind == "mixed")
+            if (ensured.kind != "domains")
+                push(dns_non_domain_query_tags, ensured.tag);
+        } else if (ensured.kind == "mixed")
             push(dns_response_rule_set_tags, ensured.tag);
 
         if (include_community_subnets) {
@@ -2395,9 +3094,11 @@ function add_combined_route_for_section(config, section) {
         if (ensured == null)
             continue;
         push(rule_set_tags, ensured.tag);
-        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord")
+        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord") {
             push(dns_query_rule_set_tags, ensured.tag);
-        else if (ensured.kind == "mixed")
+            if (ensured.kind != "domains")
+                push(dns_non_domain_query_tags, ensured.tag);
+        } else if (ensured.kind == "mixed")
             push(dns_response_rule_set_tags, ensured.tag);
     }
     for (let reference in connections.rule_sets_with_subnets(section)) {
@@ -2406,9 +3107,11 @@ function add_combined_route_for_section(config, section) {
         if (ensured == null)
             continue;
         push(rule_set_tags, ensured.tag);
-        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord")
+        if (ensured.kind == "domains" || ref_str == "discord" || ref_str == "community-discord") {
             push(dns_query_rule_set_tags, ensured.tag);
-        else if (ensured.kind == "mixed")
+            if (ensured.kind != "domains")
+                push(dns_non_domain_query_tags, ensured.tag);
+        } else if (ensured.kind == "mixed")
             push(dns_response_rule_set_tags, ensured.tag);
     }
     add_domain_ip_list_ruleset(
@@ -2427,27 +3130,46 @@ function add_combined_route_for_section(config, section) {
     if (target.unsupported)
         ctx.runtime_generate_unsupported(target.unsupported);
 
-    let country_list = connections.geoip_country_list(section);
-    let country_mode = connections.geoip_country_mode(section);
-    let geo_tags = [];
-    if ((target.outbound || target.action) && length(country_list) > 0) {
-        for (let cc in country_list) {
-            let ip_ruleset = ensure_community_ruleset(config, section_name, "geoip_" + cc);
-            if (ip_ruleset && ip_ruleset.tag)
-                push(geo_tags, ip_ruleset.tag);
-
-            if (cc == "ru") {
-                let site_ruleset = ensure_community_ruleset(config, section_name, "geosite_ru");
-                if (site_ruleset && site_ruleset.tag)
-                    push(geo_tags, site_ruleset.tag);
-            }
-        }
-    }
-
     let has_domain = length(domain) > 0 || length(domain_suffix) > 0 ||
         length(domain_keyword) > 0 || length(domain_regex) > 0;
     let has_ruleset = length(rule_set_tags) > 0;
     let has_ip_cidr = length(ip_cidr) > 0;
+
+    let country_list = connections.geoip_country_list(section);
+    let country_mode = connections.geoip_country_mode(section);
+    if (option(section, "action", "") == "bypass" &&
+        country_mode == "exclude" &&
+        !has_domain && !has_ruleset && !has_ip_cidr &&
+        length(discord_cf_subnets) == 0 &&
+        length(source_ip_cidr) == 0 &&
+        !bool_option(section, "match_all", false)) {
+        country_mode = "include";
+    }
+    let bypass_geo_only = option(section, "action", "") == "bypass" &&
+        !has_domain && !has_ruleset && !has_ip_cidr &&
+        length(discord_cf_subnets) == 0 &&
+        !geoip_mode_inverts(country_mode) &&
+        length(country_list) > 0;
+    let geo_tags = [];
+    if ((target.outbound || target.action) && length(country_list) > 0) {
+        for (let cc in country_list) {
+            let ip_ruleset = ensure_community_ruleset(config, section_name, "geoip_" + cc);
+            if (ip_ruleset && ip_ruleset.tag) {
+                push(geo_tags, ip_ruleset.tag);
+                if (bypass_geo_only && index(dns_response_rule_set_tags, ip_ruleset.tag) < 0)
+                    push(dns_response_rule_set_tags, ip_ruleset.tag);
+            }
+
+            if (cc == "ru") {
+                let site_ruleset = ensure_community_ruleset(config, section_name, "geosite_ru");
+                if (site_ruleset && site_ruleset.tag) {
+                    push(geo_tags, site_ruleset.tag);
+                    if (bypass_geo_only && index(dns_query_rule_set_tags, site_ruleset.tag) < 0)
+                        push(dns_query_rule_set_tags, site_ruleset.tag);
+                }
+            }
+        }
+    }
 
     let create_section_route_rule = function() {
         let r = {
@@ -2458,6 +3180,8 @@ function add_combined_route_for_section(config, section) {
             r.outbound = target.outbound;
         if (length(source_ip_cidr) > 0)
             r.source_ip_cidr = single_or_array(source_ip_cidr);
+        if (length(inv_subrules) > 0)
+            r.__inv_subrules = inv_subrules;
         add_port_matchers(r, section);
         add_dscp_matchers(r, section);
         add_protocol_matchers(r, section);
@@ -2540,7 +3264,8 @@ function add_combined_route_for_section(config, section) {
             let fallback_rule = create_section_route_rule();
             let has_any_matcher = fallback_rule.source_ip_cidr != null ||
                 fallback_rule.port != null || fallback_rule.port_range != null ||
-                fallback_rule.protocol != null;
+                fallback_rule.protocol != null ||
+                (fallback_rule.__inv_subrules != null && length(fallback_rule.__inv_subrules) > 0);
             if (has_any_matcher)
                 push_section_route_rule(config, fallback_rule, target.outbound, excluded_cidrs);
         }
@@ -2549,38 +3274,77 @@ function add_combined_route_for_section(config, section) {
     if (closed_geo && length(geo_tags) > 0)
         push_section_geoip_remainder(config, create_section_route_rule(), target, excluded_cidrs, geo_tags, country_mode);
 
+    if (bypass_geo_only) {
+        let cctld_map = {
+            ru: [ "ru", "su", "xn--p1ai" ],
+            ua: [ "ua", "xn--j1amh" ],
+            by: [ "by", "xn--90ais" ],
+            kz: [ "kz", "xn--80ao21a" ]
+        };
+        let cctlds = [];
+        for (let cc in country_list) {
+            cc = lc(trim(as_string(cc)));
+            if (match(cc, /^[a-z]{2}$/) == null)
+                continue;
+            for (let tld in (cctld_map[cc] || [ cc ])) {
+                if (index(cctlds, tld) < 0)
+                    push(cctlds, tld);
+                if (index(domain_suffix, tld) < 0)
+                    push(domain_suffix, tld);
+            }
+        }
+        if (length(cctlds) > 0) {
+            let cctld_rule = create_section_route_rule();
+            add_domain_array(cctld_rule, "domain_suffix", cctlds);
+            push_section_route_rule(config, cctld_rule, target.outbound, excluded_cidrs, null, country_mode);
+        }
+    }
+
     let rewrite_ttl = int_option(ctx.runtime_settings(), "dns_rewrite_ttl", "60");
     let dns_server_tag = section_dns_server(section);
     let ipv4_only_dpi = section_is_ipv4_only_dpi(section) &&
         dns_server_tag == runtime_constants.FAKEIP_DNS_SERVER_TAG;
     if (length(domain) > 0 || length(domain_suffix) > 0 || length(domain_keyword) > 0 || length(domain_regex) > 0) {
-        let dns_rule = {
-            action: "route",
-            server: dns_server_tag,
-            rewrite_ttl
-        };
-        add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
-        add_domain_array(dns_rule, "domain", domain);
-        add_domain_array(dns_rule, "domain_suffix", domain_suffix);
-        add_domain_array(dns_rule, "domain_keyword", domain_keyword);
-        add_domain_array(dns_rule, "domain_regex", domain_regex);
-        add_source_dns_matchers(dns_rule, source_ip_cidr);
-        push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
-        if (ipv4_only_dpi) {
-            let aaaa_rule = {
+        let domain_matchers = [
+            [ "domain", domain ],
+            [ "domain_suffix", domain_suffix ],
+            [ "domain_keyword", domain_keyword ],
+            [ "domain_regex", domain_regex ]
+        ];
+        for (let dm in domain_matchers) {
+            let key = dm[0];
+            let values = dm[1];
+            if (length(values) == 0)
+                continue;
+            let dns_rule = {
                 action: "route",
-                server: runtime_constants.DNS_SERVER_TAG,
-                rewrite_ttl,
-                query_type: [ "AAAA" ]
+                server: dns_server_tag,
+                rewrite_ttl
             };
-            add_domain_array(aaaa_rule, "domain", domain);
-            add_domain_array(aaaa_rule, "domain_suffix", domain_suffix);
-            add_domain_array(aaaa_rule, "domain_keyword", domain_keyword);
-            add_domain_array(aaaa_rule, "domain_regex", domain_regex);
-            add_source_dns_matchers(aaaa_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
+            add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
+            add_domain_array(dns_rule, key, values);
+            add_source_dns_matchers(dns_rule, source_ip_cidr);
+            push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs);
+            if (ipv4_only_dpi) {
+                let aaaa_rule = {
+                    action: "route",
+                    server: runtime_constants.DNS_SERVER_TAG,
+                    rewrite_ttl,
+                    query_type: [ "AAAA" ]
+                };
+                add_domain_array(aaaa_rule, key, values);
+                add_source_dns_matchers(aaaa_rule, source_ip_cidr);
+                push_dns_matcher_rule(config, apply_excluded_source_ips(aaaa_rule, excluded_cidrs));
+            }
         }
     }
+    // The tags that match domains only. A set that also matches addresses may
+    // not produce FakeIP: the match would lose the real destination and could
+    // not match the DPI rule afterwards.
+    let domain_only_dns_tags = [];
+    for (let tag in dns_query_rule_set_tags)
+        if (index(dns_non_domain_query_tags, tag) < 0)
+            push(domain_only_dns_tags, tag);
     let is_1_14 = ctx.is_sb_1_14_plus && ctx.is_sb_1_14_plus();
     if (is_1_14) {
         if (length(dns_query_rule_set_tags) > 0) {
@@ -2592,7 +3356,7 @@ function add_combined_route_for_section(config, section) {
             };
             add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
             add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
+            push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs, domain_only_dns_tags);
             if (ipv4_only_dpi) {
                 let aaaa_rule = {
                     action: "route",
@@ -2621,7 +3385,7 @@ function add_combined_route_for_section(config, section) {
                 match_response: true
             };
             add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
+            push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs);
         }
     }
     else {
@@ -2640,7 +3404,7 @@ function add_combined_route_for_section(config, section) {
             };
             add_fakeip_query_type(dns_rule, dns_server_tag, ipv4_only_dpi);
             add_source_dns_matchers(dns_rule, source_ip_cidr);
-            push_dns_matcher_rule(config, apply_excluded_source_ips(dns_rule, excluded_cidrs));
+            push_section_dns_matcher_rule(config, section, dns_rule, excluded_cidrs, domain_only_dns_tags);
             if (ipv4_only_dpi) {
                 let aaaa_rule = {
                     action: "route",
@@ -2654,6 +3418,13 @@ function add_combined_route_for_section(config, section) {
             }
         }
     }
+}
+
+function add_combined_route_for_section(config, section) {
+    add_excluded_protocol_rule(config, section);
+    add_fully_routed_ips_rule(config, section);
+    for (let clause in connections.section_effective_clauses(section))
+        add_combined_route_for_clause(config, clause);
 }
 
 function unsupported_matcher_key(section) {
@@ -2700,6 +3471,22 @@ function add_outbound_for_section(config, section, taken, sections) {
         ctx.outbounds.add_masque_outbound(config, section);
     else if (action == "openvpn")
         ctx.outbounds.add_openvpn_endpoint(config, section);
+    else if (action == "openconnect")
+        ctx.outbounds.add_openconnect_outbound(config, section);
+    else if (action == "tewfai")
+        ctx.outbounds.add_tewfai_outbound(config, section);
+    else if (action == "trusttunnel")
+        ctx.outbounds.add_trusttunnel_outbound(config, section);
+    else if (action == "mtproto")
+        ctx.outbounds.add_mtproto_outbound(config, section);
+    else if (action == "shadowtls")
+        ctx.outbounds.add_shadowtls_outbound(config, section);
+    else if (action == "desync")
+        ctx.outbounds.add_desync_outbound(config, section);
+    else if (action == "chain")
+        ctx.outbounds.add_chain_outbound(config, section);
+    else if (action == "tailscale")
+        ctx.outbounds.add_tailscale_client_endpoint(config, section);
     else if (action == "zapret")
         ctx.outbounds.add_zapret_outbound(config, section, sections);
     else if (action == "zapret2")
@@ -2743,11 +3530,17 @@ function reserve_section_outbound_tags(sections, taken) {
             action == "awg" || action == "warp" || action == "byedpi" || action == "zapret" || action == "zapret2" ||
             action == "wdtt" || action == "olcrtc" || action == "fptn" ||
             action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
-            action == "masque" || action == "openvpn")
+            action == "masque" || action == "openvpn" || action == "openconnect" ||
+            action == "tewfai" || action == "trusttunnel" || action == "mtproto" || action == "shadowtls" ||
+            action == "desync" || action == "chain" || action == "tailscale")
             taken[outbound_tag(section[".name"])] = true;
 
         if (action == "group") {
             taken[urltest_outbound_tag(section[".name"], "urltest")] = true;
+            for (let urltest_id in connections.urltests(section))
+                taken[urltest_outbound_tag(section[".name"], urltest_id)] = true;
+            for (let group_id in connections.priority_groups(section))
+                taken[priority_outbound_tag(section[".name"], group_id)] = true;
             continue;
         }
 
@@ -2762,6 +3555,8 @@ function reserve_section_outbound_tags(sections, taken) {
 }
 
 function add_route_for_section(config, section) {
+    if (ctx.quarantined_sections && ctx.quarantined_sections[section[".name"]])
+        return;
     let override = section_fail_policy_override_target(section);
     if (ctx.deferred_sections && ctx.deferred_sections[section[".name"]] && override == null)
         return;
@@ -2772,8 +3567,11 @@ function add_route_for_section(config, section) {
         /* hosts-only action — entries are consumed globally via combined cache */
     }
     else if (action == "group") {
-        /* group container — members keep their own rules, repointed at the
-           group urltest; the group itself matches no traffic */
+        // Members keep their own rules repointed at the group urltest; if the
+        // group section itself also has matchers configured, route them through
+        // the group urltest too.
+        if (group_outbound_tag_for_section(section) != "" || override != null)
+            add_combined_route_for_section(config, section);
     }
     else
         add_combined_route_for_section(config, section);
@@ -2789,7 +3587,9 @@ function failover_candidate(sections) {
             action == "awg" || action == "warp" || action == "byedpi" || action == "zapret" || action == "zapret2" ||
             action == "wdtt" || action == "olcrtc" ||
             action == "anytls" || action == "snell" || action == "mieru" || action == "naive" || action == "sudoku" ||
-            action == "masque" || action == "openvpn") {
+            action == "masque" || action == "openvpn" || action == "openconnect" ||
+            action == "tewfai" || action == "trusttunnel" || action == "mtproto" || action == "shadowtls" ||
+            action == "desync" || action == "chain" || action == "tailscale") {
             push(result, section);
         }
     }
@@ -2819,12 +3619,21 @@ function failover_default_name(candidates) {
 
 const FAILOVER_GROUP_TAG = "tachyon-failover";
 
+function section_by_name(sections, name) {
+    name = as_string(name);
+    for (let section in sections)
+        if (as_string(section[".name"]) == name)
+            return section;
+    return null;
+}
+
 function add_service_route_rules(config, sections) {
     let settings = object_or_empty(ctx.uci_cursor().get_all(CONFIG_NAME, "settings"));
     if (bool_option(settings, "dns_detour_enabled", false)) {
         let detour_section = option(settings, "dns_detour_section", "");
         if (detour_section != "" && !(ctx.deferred_sections && ctx.deferred_sections[detour_section])) {
-            let detour_target = outbound_tag(detour_section);
+            let detour_sec_obj = section_by_name(sections, detour_section);
+            let detour_target = (detour_sec_obj && group_outbound_tag_for_section(detour_sec_obj)) || outbound_tag(detour_section);
             let dns_servers = list_option(settings, "dns_server");
             if (length(dns_servers) == 0) {
                 let single_dns = option(settings, "dns_server", "");
@@ -2881,7 +3690,7 @@ function add_service_route_rules(config, sections) {
     let candidates = failover_candidate(sections);
     let proxy_candidates = [];
     for (let section in candidates) {
-        if (connections.is_remote_proxy_action(option(section, "action", "")))
+        if (connections.is_remote_proxy_section ? connections.is_remote_proxy_section(section) : connections.is_remote_proxy_action(option(section, "action", "")))
             push(proxy_candidates, section);
     }
     let target_candidates = length(proxy_candidates) > 0 ? proxy_candidates : candidates;
@@ -2900,11 +3709,12 @@ function add_service_route_rules(config, sections) {
             let member_tags = [];
             for (let section in target_candidates)
                 push(member_tags, outbound_tag(section[".name"]));
+            let def_name = failover_default_name(target_candidates);
             push(config.outbounds, {
                 type: "selector",
                 tag: FAILOVER_GROUP_TAG,
                 outbounds: member_tags,
-                default: outbound_tag(failover_default_name(target_candidates)),
+                default: outbound_tag(def_name),
                 interrupt_exist_connections: true
             });
             catchall_target = FAILOVER_GROUP_TAG;
@@ -2916,11 +3726,59 @@ function add_service_route_rules(config, sections) {
             domain: runtime_constants.CHECK_PROXY_IP_DOMAIN
         }, catchall_target);
     }
+
     push(config.route.rules, {
         action: "route-options",
         domain: runtime_constants.FAKEIP_TEST_DOMAIN,
         override_port: 8443
     });
+}
+
+function add_full_tunnel_route_rule(config, sections) {
+    let settings = object_or_empty(ctx.uci_cursor().get_all(CONFIG_NAME, "settings"));
+    let is_full_tunnel = option(settings, "routing_strategy", option(settings, "global_routing_mode", "split")) == "full_tunnel";
+    if (!is_full_tunnel)
+        return;
+
+    let def_tunnel_name = trim(option(settings, "default_tunnel_section", ""));
+    let full_tunnel_target = "";
+    if (def_tunnel_name != "" && !(ctx.deferred_sections && ctx.deferred_sections[def_tunnel_name])) {
+        let def_sec = section_by_name(sections, def_tunnel_name);
+        if (def_sec != null && section_enabled(def_sec))
+            full_tunnel_target = group_outbound_tag_for_section(def_sec) || outbound_tag(def_tunnel_name);
+    }
+    if (full_tunnel_target == "" || !is_valid_detour(config, full_tunnel_target)) {
+        full_tunnel_target = "";
+        let fallback_dpi_target = "";
+        for (let section in sections) {
+            if (!section_enabled(section))
+                continue;
+            if (ctx.deferred_sections && ctx.deferred_sections[section[".name"]])
+                continue;
+            let action = option(section, "action", "");
+            if (connections.is_connections_action(action) || action == "awg" || action == "fptn" || action == "group") {
+                let cand_tag = group_outbound_tag_for_section(section) || outbound_tag(section[".name"]);
+                if (is_valid_detour(config, cand_tag)) {
+                    if (connections.is_dpi_or_desync_only_section && connections.is_dpi_or_desync_only_section(section)) {
+                        if (fallback_dpi_target == "")
+                            fallback_dpi_target = cand_tag;
+                    } else {
+                        full_tunnel_target = cand_tag;
+                        break;
+                    }
+                }
+            }
+        }
+        if (full_tunnel_target == "" && fallback_dpi_target != "")
+            full_tunnel_target = fallback_dpi_target;
+    }
+    if (full_tunnel_target != "" && is_valid_detour(config, full_tunnel_target)) {
+        push_section_route_rule(config, {
+            action: "route",
+            inbound: tproxy_inbound_matcher(),
+            outbound: full_tunnel_target
+        }, full_tunnel_target);
+    }
 }
 
 function enabled_sections() {
@@ -2935,28 +3793,64 @@ function enabled_sections() {
 function enabled_servers() {
     let result = [];
     ctx.uci_cursor().foreach(CONFIG_NAME, "server", function(section) {
-        if (section_enabled(section))
+        if (section_enabled(section) && !(ctx.deferred_sections && ctx.deferred_sections[section[".name"]]))
             push(result, section);
     });
     return result;
 }
 
-function section_by_name(sections, name) {
-    name = as_string(name);
-    for (let section in sections)
-        if (as_string(section[".name"]) == name)
-            return section;
-    return null;
+function has_outbound_tag(config, tag_name) {
+    if (type(config) != "object" || type(config.outbounds) != "array")
+        return false;
+    for (let item in config.outbounds) {
+        if (type(item) == "object" && as_string(item.tag) == as_string(tag_name))
+            return true;
+    }
+    return false;
+}
+
+function ensure_dnsmasq_dns_server(config) {
+    if (type(config) != "object" || type(config.dns) != "object")
+        return;
+    if (type(config.dns.servers) != "array")
+        config.dns.servers = [];
+    for (let s in config.dns.servers) {
+        if (type(s) == "object" && as_string(s.tag) == runtime_constants.DNSMASQ_DNS_SERVER_TAG)
+            return;
+    }
+    push(config.dns.servers, {
+        type: "udp",
+        tag: runtime_constants.DNSMASQ_DNS_SERVER_TAG,
+        server: "127.0.0.1",
+        server_port: 53
+    });
 }
 
 function add_server_routes(config, servers, sections) {
+    let has_lo_direct = has_outbound_tag(config, runtime_constants.LO_DIRECT_OUTBOUND_TAG);
+    let has_lan_direct = has_outbound_tag(config, runtime_constants.LAN_DIRECT_OUTBOUND_TAG);
+    let lan_cidrs = type(config.__lan_interface_cidrs) == "array" ? config.__lan_interface_cidrs : [];
     for (let server in servers) {
+        ctx.current_section = server[".name"];
         // Native-mode Tailscale runs outside sing-box: no inbound, no rules.
         if (runtime_servers.is_native_tailscale(server))
             continue;
         runtime_servers.add_sniff_rule(config, server);
 
-        let inbound = runtime_constants.server_inbound_tag(server[".name"]);
+        let base_inbound = runtime_constants.server_inbound_tag(server[".name"]);
+        let inbound = base_inbound;
+        if (option(server, "protocol", "vless") == "shadowtls" &&
+            variant_state.is_tachyon_core() &&
+            trim(as_string(option(server, "shadowtls_detour", ""))) == "") {
+            push(config.route.rules, {
+                action: "route",
+                inbound: base_inbound,
+                outbound: has_lo_direct ? runtime_constants.LO_DIRECT_OUTBOUND_TAG : runtime_constants.DIRECT_OUTBOUND_TAG,
+                override_address: "127.0.0.1",
+                override_port: runtime_servers.shadowtls_inner_port(server)
+            });
+            inbound = base_inbound + "-inner";
+        }
 
         let isolate_lan = bool_option(server, "isolate_lan_for_users", false) || bool_option(server, "block_private_for_users", false);
         let isolated_users = list_option(server, "isolated_users");
@@ -2989,6 +3883,31 @@ function add_server_routes(config, servers, sections) {
         });
 
         if (!isolate_lan) {
+            ensure_dnsmasq_dns_server(config);
+            if (type(config.dns) == "object" && type(config.dns.rules) == "array") {
+                unshift(config.dns.rules, {
+                    action: "route",
+                    inbound: inbound,
+                    domain_suffix: [ "lan", "local", "internal", "home.arpa", "localdomain" ],
+                    server: runtime_constants.DNSMASQ_DNS_SERVER_TAG
+                });
+            }
+            if (has_lo_direct) {
+                push(config.route.rules, {
+                    action: "route",
+                    inbound: inbound,
+                    ip_cidr: core_ip.ipv6_supported() ? [ "127.0.0.0/8", "::1/128" ] : [ "127.0.0.0/8" ],
+                    outbound: runtime_constants.LO_DIRECT_OUTBOUND_TAG
+                });
+            }
+            if (has_lan_direct && length(lan_cidrs) > 0) {
+                push(config.route.rules, {
+                    action: "route",
+                    inbound: inbound,
+                    ip_cidr: lan_cidrs,
+                    outbound: runtime_constants.LAN_DIRECT_OUTBOUND_TAG
+                });
+            }
             push(config.route.rules, {
                 action: "route",
                 inbound: inbound,
@@ -3030,8 +3949,8 @@ function add_server_routes(config, servers, sections) {
         else if (routing_mode == "section") {
             let routing_section_name = option(server, "routing_section", "");
             let routing_section = section_by_name(sections, routing_section_name);
-            if (routing_section == null)
-                ctx.runtime_generate_unsupported("server references missing routing section " + routing_section_name);
+            if (routing_section == null || (ctx.deferred_sections && ctx.deferred_sections[routing_section_name]))
+                ctx.runtime_generate_unsupported("server references missing or quarantined routing section " + routing_section_name);
             let action = option(routing_section, "action", "");
             if (action == "bypass" || action == "block")
                 ctx.runtime_generate_unsupported("server routing section " + routing_section_name + " cannot use action " + action);
@@ -3058,6 +3977,7 @@ function add_server_routes(config, servers, sections) {
             });
         }
     }
+    ctx.current_section = null;
 }
 
 return {
@@ -3094,6 +4014,7 @@ return {
     reserve_section_outbound_tags,
     add_route_for_section,
     add_service_route_rules,
+    add_full_tunnel_route_rule,
     enabled_sections,
     enabled_servers,
     section_by_name,
@@ -3106,5 +4027,6 @@ return {
     load_community_subnet_cidrs,
     section_excluded_candidate_tags,
     urltest_exclude_outbounds,
-    urltest_filtered_outbounds
+    urltest_filtered_outbounds,
+    urltest_idle_timeout
 };

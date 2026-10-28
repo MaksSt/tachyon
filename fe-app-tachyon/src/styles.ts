@@ -13,6 +13,15 @@ ${MonitoringTab.styles}
 ${UpdatesTab.styles}
 ${PartialStyles}
 
+/* Scroll stability & theme anchoring isolation */
+[id^="cbi-${TACHYON_CBI_PREFIX}"],
+.tachyon-view {
+    overflow-anchor: none !important;
+}
+
+[id^="cbi-${TACHYON_CBI_PREFIX}"] [data-fs-floor] {
+    min-height: auto !important;
+}
 
 /* Hide extra H3 for settings tab */
 #cbi-${TACHYON_CBI_PREFIX}-settings > h3 {
@@ -207,20 +216,16 @@ ${PartialStyles}
 
 /* Tachyon modal sizing by content type */
 
-/* Compact modals: UrlTest details, priority info, server info */
+/* Compact modals: UrlTest details, priority info */
 .modal:has(.tachyon_dashboard-page__urltest-details),
-.cbi-modal:has(.tachyon_dashboard-page__urltest-details),
-.modal:has(.fkp-server-info-modal),
-.cbi-modal:has(.fkp-server-info-modal),
-.modal .fkp-server-info-modal,
-.cbi-modal .fkp-server-info-modal {
+.cbi-modal:has(.tachyon_dashboard-page__urltest-details) {
     width: min(94vw, 680px) !important;
     max-width: min(94vw, 680px) !important;
     box-sizing: border-box;
     margin: 10px auto;
 }
 
-/* Medium modals: Support, Service check, DNS benchmark, Updates, AI Chat */
+/* Medium modals: Support, Service check, DNS benchmark, Updates, AI Chat, Server info */
 .modal:has(.tachyon-support-modal),
 .cbi-modal:has(.tachyon-support-modal),
 .modal:has(.tachyon-service-check-modal),
@@ -230,11 +235,23 @@ ${PartialStyles}
 .modal:has(.tachyon-update-progress-modal),
 .cbi-modal:has(.tachyon-update-progress-modal),
 .modal:has(.tachyon-ai-chat-modal),
-.cbi-modal:has(.tachyon-ai-chat-modal) {
-    width: min(94vw, 840px) !important;
-    max-width: min(94vw, 840px) !important;
+.cbi-modal:has(.tachyon-ai-chat-modal),
+.modal.fkp-server-info-dialog,
+.cbi-modal.fkp-server-info-dialog,
+.modal:has(.fkp-server-info-modal),
+.cbi-modal:has(.fkp-server-info-modal) {
+    width: min(94vw, 880px) !important;
+    max-width: min(94vw, 880px) !important;
     box-sizing: border-box;
     margin: 10px auto;
+}
+
+.modal .fkp-server-info-modal,
+.cbi-modal .fkp-server-info-modal {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box;
+    margin: 0 !important;
 }
 
 /* Wide modals: Strategy Fuzzer, Leak detection */
@@ -262,9 +279,7 @@ ${PartialStyles}
     .modal:has([class*="tachyon"]),
     .cbi-modal:has([class*="tachyon"]),
     .modal:has(.fkp-server-info-modal),
-    .cbi-modal:has(.fkp-server-info-modal),
-    .modal .fkp-server-info-modal,
-    .cbi-modal .fkp-server-info-modal {
+    .cbi-modal:has(.fkp-server-info-modal) {
         width: 96vw !important;
         max-width: 96vw !important;
     }
@@ -275,12 +290,154 @@ ${PartialStyles}
     .modal:has([class*="tachyon"]),
     .cbi-modal:has([class*="tachyon"]),
     .modal:has(.fkp-server-info-modal),
-    .cbi-modal:has(.fkp-server-info-modal),
-    .modal .fkp-server-info-modal,
-    .cbi-modal .fkp-server-info-modal {
+    .cbi-modal:has(.fkp-server-info-modal) {
         width: calc(100vw - 16px) !important;
         max-width: calc(100vw - 16px) !important;
         margin: 8px auto;
     }
+}
+
+/* Header language selector */
+.tachyon-map-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.tachyon-lang-selector {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    margin-left: auto;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.2;
+}
+
+.tachyon-lang-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color-medium, rgba(128, 128, 128, 0.35));
+    background: var(--background-color-high, rgba(128, 128, 128, 0.08));
+    color: inherit;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.tachyon-lang-btn:hover:not(:disabled) {
+    background: var(--background-color-low, rgba(128, 128, 128, 0.16));
+    border-color: var(--primary-color-high, #1976d2);
+}
+
+.tachyon-lang-btn:disabled {
+    opacity: 0.65;
+    cursor: wait;
+}
+
+.tachyon-lang-flag {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.tachyon-lang-code {
+    letter-spacing: 0.03em;
+}
+
+.tachyon-lang-caret {
+    font-size: 10px;
+    opacity: 0.7;
+}
+
+.tachyon-lang-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    min-width: 210px;
+    padding: 6px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color-medium, rgba(128, 128, 128, 0.3));
+    background: var(--background-color-high, #fff);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    z-index: 1000;
+}
+
+.tachyon-lang-menu[hidden] {
+    display: none !important;
+}
+
+.tachyon-lang-menu__header {
+    padding: 4px 8px 6px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.6;
+    border-bottom: 1px solid var(--border-color-low, rgba(128, 128, 128, 0.15));
+    margin-bottom: 4px;
+}
+
+.tachyon-lang-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 7px 8px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+}
+
+.tachyon-lang-option:hover {
+    background: var(--background-color-low, rgba(128, 128, 128, 0.12));
+}
+
+.tachyon-lang-option.is-active {
+    background: rgba(25, 118, 210, 0.1);
+}
+
+.tachyon-lang-option__text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+}
+
+.tachyon-lang-option__native {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.tachyon-lang-option__sub {
+    font-size: 11px;
+    opacity: 0.65;
+}
+
+.tachyon-lang-option__badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.tachyon-lang-option__badge--active {
+    color: var(--primary-color-high, #1976d2);
+}
+
+.tachyon-lang-option__badge--install {
+    background: rgba(25, 118, 210, 0.14);
+    color: var(--primary-color-high, #1976d2);
 }
 `;

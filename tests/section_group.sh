@@ -101,6 +101,24 @@ fixture "$WORK_DIR/group-disabled.json" '[
 assert_rejects "group over a disabled member" "$WORK_DIR/group-disabled.json" \
   "references disabled rule 'beta'"
 
+fixture "$WORK_DIR/group-partial-disabled.json" '[
+  { ".name": "alpha", ".type": "section", "enabled": "1", "action": "connection",
+    "selector_proxy_links": [ "'"$LINK_A1"'" ] },
+  { ".name": "beta", ".type": "section", "enabled": "0", "action": "connection",
+    "selector_proxy_links": [ "'"$LINK_B1"'" ] },
+  { ".name": "grp", ".type": "section", "enabled": "1", "action": "group",
+    "group_members": [ "alpha", "beta" ] }
+]'
+assert_accepts "group with one enabled and one disabled member" "$WORK_DIR/group-partial-disabled.json"
+
+fixture "$WORK_DIR/group-blank-enabled.json" '[
+  { ".name": "amnezia", ".type": "section", "enabled": "", "action": "connection",
+    "selector_proxy_links": [ "'"$LINK_A1"'" ] },
+  { ".name": "grp", ".type": "section", "enabled": "1", "action": "group",
+    "group_members": [ "amnezia" ] }
+]'
+assert_accepts "group with member having empty enabled string" "$WORK_DIR/group-blank-enabled.json"
+
 fixture "$WORK_DIR/group-self.json" '[
   { ".name": "grp", ".type": "section", "enabled": "1", "action": "group",
     "group_members": [ "grp" ] }
@@ -183,6 +201,13 @@ if (length(group.outbounds || []) != 3)
     die("flat group urltest must be exactly the union of member leaves, got " +
         length(group.outbounds || []) + "\n");
 
+let group_sel = outbound_by_tag(config, "grp-out");
+if (!group_sel || group_sel.type != "selector" || group_sel.default != "grp-urltest-out")
+    die("the group section must produce a grp-out selector defaulting to grp-urltest-out\n");
+for (let want in [ "alpha-1-out", "alpha-2-out", "beta-1-out", "grp-urltest-out" ])
+    if (!contains(group_sel.outbounds || [], want))
+        die("grp-out selector is missing " + want + "\n");
+
 // merge semantics keep member selectors — they stay usable as detour targets
 if (!outbound_by_tag(config, "alpha-out") || !outbound_by_tag(config, "beta-out"))
     die("member section selectors must survive the merge\n");
@@ -191,7 +216,7 @@ let alpha_rule = null;
 let beta_rule = null;
 let group_rule_count = 0;
 for (let rule in config.route.rules || []) {
-    if (rule.outbound == "grp-urltest-out")
+    if (rule.outbound == "grp-out")
         group_rule_count++;
     if (contains(rule.domain_suffix || [], "alpha.example"))
         alpha_rule = rule;
@@ -200,12 +225,158 @@ for (let rule in config.route.rules || []) {
 }
 if (!alpha_rule || !beta_rule)
     die("member routing rules were not generated\n");
-if (alpha_rule.outbound != "grp-urltest-out" || beta_rule.outbound != "grp-urltest-out")
-    die("member rules must route through the group urltest, got alpha=" +
+if (alpha_rule.outbound != "grp-out" || beta_rule.outbound != "grp-out")
+    die("member rules must route through the group selector grp-out, got alpha=" +
         (alpha_rule.outbound || "null") + " beta=" + (beta_rule.outbound || "null") + "\n");
 if (group_rule_count != 2)
-    die("the group itself must not add route rules; expected 2, got " + group_rule_count + "\n");
+    die("the group itself must not add route rules when it has no conditions; expected 2, got " + group_rule_count + "\n");
+
+let grp_cache = json(fs.readfile(ARGV[0] + ".section-cache/grp.json"));
+if (!grp_cache || type(grp_cache.outboundMetadata) != "object" || type(grp_cache.outboundMetadata.names) != "object")
+    die("group section cache grp.json must be written with outboundMetadata.names\n");
+for (let want in [ "alpha-1-out", "alpha-2-out", "beta-1-out" ])
+    if (!grp_cache.outboundMetadata.names[want])
+        die("group section cache grp.json is missing metadata for " + want + "\n");
 ' "$group_config" || fail "generated section group behavior"
+
+# ─── generator: routing conditions on group section + mixed proxy + filter ────
+
+cat >"$WORK_DIR/group-direct-rules-fixture.json" <<JSON
+{
+  "settings": { ".name": "settings", ".type": "settings", "log_level": "warn" },
+  "section": [
+    { ".name": "alpha", ".type": "section", "enabled": "1", "action": "connection",
+      "selector_proxy_links": [ "$LINK_A1", "$LINK_A2" ],
+      "dashboard_filter_mode": "exclude",
+      "dashboard_exclude_outbounds": [ "Alpha Two" ] },
+    { ".name": "beta", ".type": "section", "enabled": "1", "action": "connection",
+      "selector_proxy_links": [ "$LINK_B1" ] },
+    { ".name": "grp", ".type": "section", "enabled": "1", "action": "group",
+      "group_members": [ "alpha", "beta" ],
+      "domain_suffix": [ "group-direct.example" ],
+      "mixed_proxy_enabled": "1",
+      "mixed_proxy_port": "4599" }
+  ]
+}
+JSON
+
+group_direct_config="$WORK_DIR/group-direct-config.json"
+mkdir -p "${group_direct_config}.section-cache"
+ucode -L "$TACHYON_LIB" "$GENERATOR_UC" generate-config-fixture \
+  "$WORK_DIR/group-direct-rules-fixture.json" "$group_direct_config" "127.0.0.1"
+
+ucode -e '
+let fs = require("fs");
+function outbound_by_tag(config, want) {
+    for (let outbound in config.outbounds || [])
+        if (outbound && outbound.tag == want)
+            return outbound;
+    return null;
+}
+function contains(values, needle) {
+    for (let value in values || [])
+        if (value == needle)
+            return true;
+    return false;
+}
+let config = json(fs.readfile(ARGV[0]));
+let group = outbound_by_tag(config, "grp-urltest-out");
+if (!group || group.type != "urltest")
+    die("grp-urltest-out missing\n");
+if (contains(group.outbounds || [], "alpha-2-out"))
+    die("filtered-out member leaf alpha-2-out must not be in grp-urltest-out\n");
+for (let want in [ "alpha-1-out", "beta-1-out" ])
+    if (!contains(group.outbounds || [], want))
+        die("expected leaf " + want + " in grp-urltest-out\n");
+
+let direct_rule = null;
+let mixed_rule = null;
+for (let rule in config.route.rules || []) {
+    if (contains(rule.domain_suffix || [], "group-direct.example"))
+        direct_rule = rule;
+    if ((rule.inbound == "grp-mixed-in" || contains(rule.inbound || [], "grp-mixed-in")) && !rule.ip_is_private)
+        mixed_rule = rule;
+}
+if (!direct_rule || direct_rule.outbound != "grp-out")
+    die("routing conditions on the group section itself must route to grp-out\n");
+if (!mixed_rule || mixed_rule.outbound != "grp-out")
+    die("mixed proxy on the group section must route to grp-out\n");
+
+let grp_direct_cache = json(fs.readfile(ARGV[0] + ".section-cache/grp.json"));
+if (!grp_direct_cache || type(grp_direct_cache.links) != "object")
+    die("grp.json must exist for group-direct-config\n");
+if (grp_direct_cache.links["alpha-2-out"] || (grp_direct_cache.servers && grp_direct_cache.servers["alpha-2-out"]) ||
+    (grp_direct_cache.outboundMetadata && grp_direct_cache.outboundMetadata.names && grp_direct_cache.outboundMetadata.names["alpha-2-out"]))
+    die("excluded member leaf alpha-2-out must not leak into grp.json links/servers/outboundMetadata\n");
+if (!grp_direct_cache.links["alpha-1-out"] || !grp_direct_cache.links["beta-1-out"])
+    die("included member leaves alpha-1-out and beta-1-out must be present in grp.json links\n");
+' "$group_direct_config" || fail "generated section group direct rules, filter, and mixed proxy"
+
+# ─── generator: manual action=awg endpoint included in group urltest ──────────
+
+cat >"$WORK_DIR/group-awg-fixture.json" <<JSON
+{
+  "settings": { ".name": "settings", ".type": "settings", "log_level": "warn" },
+  "section": [
+    { ".name": "alpha", ".type": "section", "enabled": "1", "action": "connection",
+      "domain_suffix": [ "alpha.example" ],
+      "selector_proxy_links": [ "$LINK_A1" ] },
+    { ".name": "amnezia", ".type": "section", "enabled": "1", "action": "awg",
+      "domain_suffix": [ "awg.example" ],
+      "awg_private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "awg_peer_public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+      "awg_server_address": "198.51.100.10",
+      "awg_server_port": "51820",
+      "awg_local_address": [ "10.8.1.2/32" ] },
+    { ".name": "grp", ".type": "section", "enabled": "1", "action": "group",
+      "group_members": [ "alpha", "amnezia" ] }
+  ]
+}
+JSON
+
+group_awg_config="$WORK_DIR/group-awg-config.json"
+mkdir -p "${group_awg_config}.section-cache"
+ucode -L "$TACHYON_LIB" "$GENERATOR_UC" generate-config-fixture \
+  "$WORK_DIR/group-awg-fixture.json" "$group_awg_config" "127.0.0.1"
+
+ucode -e '
+let fs = require("fs");
+function outbound_by_tag(config, want) {
+    for (let outbound in config.outbounds || [])
+        if (outbound && outbound.tag == want)
+            return outbound;
+    return null;
+}
+function endpoint_by_tag(config, want) {
+    for (let ep in config.endpoints || [])
+        if (ep && ep.tag == want)
+            return ep;
+    return null;
+}
+function contains(values, needle) {
+    for (let value in values || [])
+        if (value == needle)
+            return true;
+    return false;
+}
+let config = json(fs.readfile(ARGV[0]));
+let ep = endpoint_by_tag(config, "amnezia-out");
+if (!ep || ep.type != "wireguard")
+    die("manual action=awg section must produce a wireguard endpoint amnezia-out\n");
+let group = outbound_by_tag(config, "grp-urltest-out");
+if (!group || group.type != "urltest")
+    die("group over connection + manual awg must produce grp-urltest-out\n");
+for (let want in [ "alpha-1-out", "amnezia-out" ])
+    if (!contains(group.outbounds || [], want))
+        die("group urltest is missing member leaf " + want + "\n");
+let awg_rule = null;
+for (let rule in config.route.rules || [])
+    if (contains(rule.domain_suffix || [], "awg.example"))
+        awg_rule = rule;
+if (!awg_rule || awg_rule.outbound != "grp-out")
+    die("manual awg member route rule must be repointed to grp-out, got " +
+        (awg_rule ? awg_rule.outbound : "null") + "\n");
+' "$group_awg_config" || fail "generated section group with manual awg member"
 
 # ─── parking: sing-box supports sections.group, steer does not ────────────────
 

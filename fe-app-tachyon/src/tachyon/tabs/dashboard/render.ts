@@ -8,57 +8,38 @@ export function render() {
       class: 'tachyon_dashboard-page',
     },
     [
-      E(
-        'div',
-        {
-          class: 'tachyon_dashboard-page__service-stopped',
-          role: 'status',
-        },
-        _(
-          'Tachyon service is stopped. Start the service to display the dashboard.',
-        ),
-      ),
       E('div', { class: 'tachyon_dashboard-page__content' }, [
         E('div', { class: 'tachyon_dashboard-page__widgets-section' }, [
-          E(
-            'div',
-            { id: 'dashboard-widget-traffic' },
+          E('div', { id: 'dashboard-widget-system-services' }, [
             renderWidget({
               loading: true,
               failed: false,
               title: '',
               items: [],
             }),
+          ]),
+          E(
+            'div',
+            {
+              id: 'dashboard-widgets-sections-list',
+              style: 'display: contents;',
+            },
+            [
+              renderWidget({
+                loading: true,
+                failed: false,
+                title: '',
+                items: [],
+              }),
+            ],
           ),
           E(
             'div',
-            { id: 'dashboard-widget-traffic-total' },
-            renderWidget({
-              loading: true,
-              failed: false,
-              title: '',
-              items: [],
-            }),
-          ),
-          E(
-            'div',
-            { id: 'dashboard-widget-system-info' },
-            renderWidget({
-              loading: true,
-              failed: false,
-              title: '',
-              items: [],
-            }),
-          ),
-          E(
-            'div',
-            { id: 'dashboard-widget-service-info' },
-            renderWidget({
-              loading: true,
-              failed: false,
-              title: '',
-              items: [],
-            }),
+            {
+              id: 'dashboard-widget-inbounds',
+              class: 'tachyon-inbounds-fullwidth-slot',
+            },
+            [],
           ),
           E(
             'div',
@@ -71,6 +52,16 @@ export function render() {
             }),
           ),
         ]),
+        E(
+          'div',
+          {
+            class: 'tachyon_dashboard-page__service-stopped',
+            role: 'status',
+          },
+          _(
+            'Tachyon service is stopped. Start the service to display the dashboard.',
+          ),
+        ),
         E('div', { id: 'dashboard-connections-grid' }, []),
         E(
           'div',

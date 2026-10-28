@@ -134,7 +134,7 @@ function dns_check_through_singbox(domain) {
 
 function dns_check_router_resolver_available(domain) {
     for (let address in [ "127.0.0.1", SB_DNS_INBOUND_ADDRESS ]) {
-        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=3", "+tries=2" ]))
+        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=1", "+tries=1" ]))
             return true;
     }
 
@@ -144,13 +144,13 @@ function dns_check_router_resolver_available(domain) {
         listen_address = replace(as_string(pipe.read("all")), /[\r\n]+$/g, "");
         pipe.close();
     }
-    if (listen_address != "" && command_success_from_args([ "dig", "@" + listen_address, domain, "+timeout=3", "+tries=2" ]))
+    if (listen_address != "" && command_success_from_args([ "dig", "@" + listen_address, domain, "+timeout=1", "+tries=1" ]))
         return true;
 
     let source_interfaces = option(settings(), "source_network_interfaces", "br-lan");
     for (let interface in network_mod.words(source_interfaces)) {
         let address = network_mod.device_ipv4_address(interface);
-        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=3", "+tries=2" ]))
+        if (address != "" && command_success_from_args([ "dig", "@" + address, domain, "+timeout=1", "+tries=1" ]))
             return true;
     }
 
@@ -180,13 +180,18 @@ function check_dns_available() {
     let cfg = settings();
     let dns_type = option(cfg, "dns_type", "");
     let active = runtime_dns.active_values(cfg);
+    if (runtime_dns.is_explicit_fallback_index(cfg, active.state.main_index) ||
+        runtime_dns.is_wan_fallback_index(cfg, active.state.main_index))
+        dns_type = "udp";
     let dns_server = active.main;
     let bootstrap_dns_server = active.bootstrap;
     let dont_touch_dhcp = bool_option(cfg, "dont_touch_dhcp", false) ? 1 : 0;
     let domain = "example.com";
     let timeout_seconds = dns_check_timeout_seconds(option(cfg, "dns_check_timeout", "2s"));
-    if (timeout_seconds < 3)
-        timeout_seconds = 3;
+    if (timeout_seconds < 1)
+        timeout_seconds = 1;
+    if (timeout_seconds > 2)
+        timeout_seconds = 2;
     let dns_status = 0;
     let dns_on_router = 0;
     let bootstrap_dns_status = 0;
@@ -207,7 +212,7 @@ function check_dns_available() {
     push(active_dns_args, "A");
     push(active_dns_args, "+short");
     push(active_dns_args, "+timeout=" + as_string(timeout_seconds));
-    push(active_dns_args, "+tries=2");
+    push(active_dns_args, "+tries=1");
     for (let line in split(command_output_from_args(active_dns_args), "\n"))
         if (valid_ipv4(trim(as_string(line)))) {
             dns_status = 1;
@@ -225,7 +230,7 @@ function check_dns_available() {
             for (let line in split(command_output_from_args([
                 "dig", "-p", as_string(runtime_dns.health_port("bootstrap", active.state.bootstrap_index)),
                 "@" + runtime_dns.DNS_HEALTH_ADDRESS, domain, "A", "+short",
-                "+timeout=" + as_string(timeout_seconds), "+tries=2"
+                "+timeout=" + as_string(timeout_seconds), "+tries=1"
             ]), "\n"))
                 if (valid_ipv4(trim(as_string(line)))) {
                     bootstrap_dns_status = 1;
@@ -339,9 +344,14 @@ function resolve_domain_cli(domain) {
     let ips = [];
     let seen = {};
 
+    let is_fakeip = function(ip) {
+        ip = lc(trim(as_string(ip)));
+        return match(ip, /^198\.(18|19)\./) != null || match(ip, /^fc[0-3][0-9a-f]:/) != null;
+    };
+
     let add_ip = function(ip) {
         ip = trim(as_string(ip));
-        if (ip == "" || ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" || seen[ip])
+        if (ip == "" || ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" || is_fakeip(ip) || seen[ip])
             return;
         if (!core_ip.valid_ip(ip))
             return;
@@ -349,12 +359,8 @@ function resolve_domain_cli(domain) {
         push(ips, ip);
     };
 
-    let cmd_local = command_output_from_args([ "nslookup", domain, "127.0.0.1" ]);
-    let cmd_def = command_output_from_args([ "nslookup", domain ]);
-    let outputs = [ cmd_local, cmd_def ];
-
-    for (let out in outputs) {
-        if (!out) continue;
+    let parse_nslookup_output = function(out) {
+        if (!out) return;
         let past_header = false;
         for (let line in split(out, "\n")) {
             line = trim(as_string(line));
@@ -365,6 +371,36 @@ function resolve_domain_cli(domain) {
                 if (m && m[1] && m[1] != "127.0.0.1" && m[1] != "::1")
                     add_ip(m[1]);
             }
+        }
+    };
+
+    parse_nslookup_output(command_output_from_args([ "nslookup", domain, "127.0.0.1" ]));
+    if (length(ips) == 0)
+        parse_nslookup_output(command_output_from_args([ "nslookup", domain ]));
+
+    if (length(ips) == 0) {
+        let cfg = settings();
+        let bootstrap_list = get_all_dns_servers(cfg, "bootstrap_dns_server");
+        let fallback_resolvers = [];
+        for (let b in bootstrap_list) {
+            let h = url_host(b);
+            if (h == "") h = trim(as_string(b));
+            if (valid_ipv4(h) && !is_fakeip(h))
+                push(fallback_resolvers, h);
+        }
+        for (let pub_dns in [ "77.88.8.8", "1.1.1.1", "8.8.8.8" ])
+            push(fallback_resolvers, pub_dns);
+
+        for (let srv in fallback_resolvers) {
+            let resolved = dns_check_resolve_host(domain, srv, 2);
+            if (resolved != "") {
+                add_ip(resolved);
+                if (length(ips) > 0)
+                    break;
+            }
+            parse_nslookup_output(command_output_from_args([ "nslookup", domain, srv ]));
+            if (length(ips) > 0)
+                break;
         }
     }
 

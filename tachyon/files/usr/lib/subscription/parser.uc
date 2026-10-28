@@ -25,6 +25,8 @@ function starts_with(value, prefix) {
 
 function is_supported_share_link(line) {
     return starts_with(line, "vpn://") ||
+        starts_with(line, "amneziawg://") ||
+        starts_with(line, "awg://") ||
         starts_with(line, "ss://") ||
         starts_with(line, "vmess://") ||
         starts_with(line, "vless://") ||
@@ -42,6 +44,18 @@ function is_supported_share_link(line) {
         starts_with(line, "fptnb:") ||
         starts_with(line, "fptn://") ||
         starts_with(line, "fptnb://") ||
+        starts_with(line, "anytls://") ||
+        starts_with(line, "naive+https://") ||
+        starts_with(line, "naive+quic://") ||
+        starts_with(line, "snell://") ||
+        starts_with(line, "mieru://") ||
+        starts_with(line, "mierus://") ||
+        starts_with(line, "tg://proxy?") ||
+        starts_with(line, "mtproto://") ||
+        starts_with(line, "tewfai://") ||
+        starts_with(line, "trusttunnel://") ||
+        starts_with(line, "masque://") ||
+        starts_with(line, "shadowtls://") ||
         crypt4.is_crypt4(line);
 }
 
@@ -380,7 +394,7 @@ function read_file(path) {
 
 
 function reality_public_key_valid(value) {
-    return match(as_string(value), /^[A-Za-z0-9_-]{43}$/) != null;
+    return match(as_string(value), /^[A-Za-z0-9_-]{43}=?$/) != null;
 }
 
 function outbound_is_unsupported_stub(outbound) {
@@ -442,19 +456,34 @@ function validate_subscription(path) {
         return false;
 
     let usable_count = 0;
+    let filtered = [];
+    let dropped_invalid_reality = false;
     for (let outbound in value.outbounds) {
-        if (outbound_is_unsupported_stub(outbound))
+        if (outbound_is_unsupported_stub(outbound)) {
+            push(filtered, outbound);
             continue;
+        }
 
         let tls = type(outbound) == "object" && type(outbound.tls) == "object" ? outbound.tls : {};
         let reality = tls.reality;
-        if (type(reality) == "object" && reality.enabled !== false && !reality_public_key_valid(reality.public_key))
-            return false;
+        if (type(reality) == "object" && reality.enabled != false && !reality_public_key_valid(reality.public_key)) {
+            dropped_invalid_reality = true;
+            continue;
+        }
 
+        push(filtered, outbound);
         usable_count++;
     }
 
-    return usable_count > 0;
+    if (usable_count == 0)
+        return false;
+
+    if (dropped_invalid_reality) {
+        value.outbounds = filtered;
+        write_json_file(path, value);
+    }
+
+    return true;
 }
 
 
@@ -626,12 +655,15 @@ function parse_host_port(value) {
         value = substr(value, 0, length(value) - 1);
     if (starts_with(value, "[")) {
         let m = match(value, /^\[([^\]]+)\]:(.+)$/);
-        return m ? [m[1], parse_port_value(m[2])] : ["", null];
+        if (m)
+            return [m[1], parse_port_value(m[2])];
+        let m_host = match(value, /^\[([^\]]+)\]$/);
+        return m_host ? [m_host[1], null] : ["", null];
     }
 
     let colon = rindex(value, ":");
     if (colon < 0)
-        return ["", null];
+        return [value, null];
 
     let host = substr(value, 0, colon);
     let port = substr(value, colon + 1);
@@ -754,9 +786,16 @@ function add_tls(url, security, default_tls) {
             tls.reality.public_key = public_key;
         if (short_id != "")
             tls.reality.short_id = short_id;
+        // Three spellings of the same flag are in the wild: the sing-box
+        // snake_case one, the camelCase one some panels emit, and the
+        // kebab-case one a share link carries. Priority order is kept: the
+        // first one that is present wins, and an explicit false is never
+        // turned into true by a later spelling.
         let mlkem_preference = query.support_x25519mlkem768;
         if (mlkem_preference == null)
             mlkem_preference = query.supportX25519MLKEM768;
+        if (mlkem_preference == null)
+            mlkem_preference = query["support-x25519mlkem768"];
         if (mlkem_preference != null)
             tls.reality.support_x25519mlkem768 = is_true(mlkem_preference);
     }
@@ -851,7 +890,7 @@ function valid_port(port) {
 }
 
 function normalize_port_number(value) {
-    value = trim(value);
+    value = trim(as_string(value));
     if (!is_integer_string(value))
         return "";
 
@@ -978,13 +1017,13 @@ function process_socks(raw, url) {
     if (url.userinfo != "") {
         let colon = index(url.userinfo, ":");
         if (colon >= 0) {
-            username = urldecode(substr(url.userinfo, 0, colon));
-            password = urldecode(substr(url.userinfo, colon + 1));
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
             if (username == password)
                 password = "";
         }
         else {
-            username = urldecode(url.userinfo);
+            username = url.userinfo;
         }
     }
 
@@ -1016,13 +1055,13 @@ function process_http(raw, url) {
     if (url.userinfo != "") {
         let colon = index(url.userinfo, ":");
         if (colon >= 0) {
-            username = urldecode(substr(url.userinfo, 0, colon));
-            password = urldecode(substr(url.userinfo, colon + 1));
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
             if (username == password)
                 password = "";
         }
         else {
-            username = urldecode(url.userinfo);
+            username = url.userinfo;
         }
     }
 
@@ -1229,7 +1268,7 @@ function process_hysteria2(raw, url) {
         tls.insecure = true;
     if ((url.query.alpn || "") != "")
         tls.alpn = split_csv(url.query.alpn);
-    let certificate_pin = common.certificate_pin_base64(url.query.pcs || "");
+    let certificate_pin = common.certificate_pin_base64(url.query.pcs || url.query.pinSHA256 || "");
     if (certificate_pin != "")
         tls.certificate_sha256 = [ certificate_pin ];
 
@@ -1241,10 +1280,15 @@ function process_hysteria2(raw, url) {
         password: password,
         tls: tls
     };
-    if (server_ports != null)
+    if (server_ports != null) {
         outbound.server_ports = server_ports;
-    else
+        let parts = split(server_ports[0], ":");
+        let initial_port = normalize_port_number(url.port);
+        outbound.server_port = initial_port != "" ? int(initial_port, 10) : int(parts[0], 10);
+    }
+    else {
         outbound.server_port = int(server_port, 10);
+    }
 
     if ((url.query.network || "") != "")
         outbound.network = url.query.network;
@@ -1285,7 +1329,7 @@ function process_tuic(raw, url) {
         tls.insecure = true;
     if ((url.query.alpn || "") != "")
         tls.alpn = split_csv(url.query.alpn);
-    let certificate_pin = common.certificate_pin_base64(url.query.pcs || "");
+    let certificate_pin = common.certificate_pin_base64(url.query.pcs || url.query.pinSHA256 || "");
     if (certificate_pin != "")
         tls.certificate_sha256 = [ certificate_pin ];
 
@@ -1361,6 +1405,11 @@ function process_vmess_json(raw, decoded) {
         let tls = { enabled: true };
         if (string_value(vmess.sni) != "")
             tls.server_name = string_value(vmess.sni);
+        if (is_true(vmess.allowInsecure || vmess.insecure))
+            tls.insecure = true;
+        let certificate_pin = common.certificate_pin_base64(string_value(vmess.pcs));
+        if (certificate_pin != "")
+            tls.certificate_sha256 = [ certificate_pin ];
         let alpn = tls_alpn_for_transport(split_csv(string_value(vmess.alpn)), network);
         if (length(alpn) > 0)
             tls.alpn = alpn;
@@ -1412,15 +1461,490 @@ function process_vmess(raw) {
     return process_vmess_json(raw, trimmed);
 }
 
+function from_amneziawg_share_link(line) {
+    line = trim(line);
+    let hash_pos = index(line, "#");
+    let link_part = hash_pos >= 0 ? substr(line, 0, hash_pos) : line;
+    let name = hash_pos >= 0 ? urldecode_fragment(substr(line, hash_pos + 1)) : "";
+
+    let scheme_marker = index(link_part, "://");
+    if (scheme_marker < 0)
+        return null;
+    let payload = substr(link_part, scheme_marker + 3);
+    if (payload == "")
+        return null;
+
+    let conf_text = base64_decode(payload);
+    if (conf_text == null || conf_text == "") {
+        if (index(payload, "[Interface]") >= 0 || index(payload, "[interface]") >= 0)
+            conf_text = payload;
+        else
+            return null;
+    }
+
+    let endpoint = wireguard.from_conf(conf_text, line, name);
+    if (endpoint)
+        return endpoint;
+
+    try {
+        let amnezia = require("subscription.amnezia");
+        let decoded = amnezia.decode(conf_text);
+        if (decoded && decoded.text)
+            return wireguard.from_conf(decoded.text, line, name || decoded.name);
+    } catch (e) {}
+
+    return null;
+}
+
+function process_anytls(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let outbound = {
+        type: "anytls",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: url.port,
+        password: url.userinfo
+    };
+
+    if (is_integer_string(url.query.min_idle_session || ""))
+        outbound.min_idle_session = int(url.query.min_idle_session, 10);
+    if ((url.query.idle_session_check_interval || "") != "")
+        outbound.idle_session_check_interval = url.query.idle_session_check_interval;
+    if ((url.query.idle_session_timeout || "") != "")
+        outbound.idle_session_timeout = url.query.idle_session_timeout;
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (!tls_result[1])
+        return null;
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_naive(raw, url) {
+    let port = url.port;
+    if (port == null || port == "")
+        port = 443;
+    if (url.host == "" || is_dummy_server(url.host, port) || !valid_port(port))
+        return null;
+
+    let username = "", password = "";
+    if (url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
+        } else {
+            username = url.userinfo;
+        }
+    }
+
+    let outbound = {
+        type: "naive",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(port)
+    };
+    if (username != "")
+        outbound.username = username;
+    if (password != "")
+        outbound.password = password;
+    if (url.scheme == "naive+quic" || is_true(url.query.quic))
+        outbound.quic = true;
+    if ((url.query.quic_congestion_control || "") != "")
+        outbound.quic_congestion_control = url.query.quic_congestion_control;
+    if (is_integer_string(url.query.insecure_concurrency || ""))
+        outbound.insecure_concurrency = int(url.query.insecure_concurrency, 10);
+    if (is_true(url.query.uot || url.query.udp_over_tcp))
+        outbound.udp_over_tcp = true;
+
+    let tls = { enabled: true };
+    if ((url.query.sni || "") != "")
+        tls.server_name = url.query.sni;
+    let certificate_pin = common.certificate_pin_base64(url.query.pcs || url.query.pinSHA256 || "");
+    if (certificate_pin != "")
+        tls.certificate_sha256 = [ certificate_pin ];
+    outbound.tls = tls;
+    return outbound;
+}
+
+function process_snell(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let version = int(url.query.version || 5);
+    if (version < 1 || version > 5)
+        version = 5;
+
+    let outbound = {
+        type: "snell",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: url.port,
+        psk: url.userinfo,
+        version: version
+    };
+    let obfs = lc(trim(as_string(url.query.obfs || "")));
+    if (obfs == "http" || obfs == "tls") {
+        outbound.obfs = { mode: obfs };
+        if ((url.query["obfs-host"] || url.query.obfs_host || url.query.host || "") != "")
+            outbound.obfs.host = url.query["obfs-host"] || url.query.obfs_host || url.query.host;
+    }
+    if (is_true(url.query.uot || url.query.udp_over_tcp))
+        outbound.udp_over_tcp = true;
+    if (is_true(url.query.reuse))
+        outbound.reuse = true;
+    return outbound;
+}
+
+function process_mieru(raw, url) {
+    let port_val = url.port;
+    if (!valid_port(port_val) && (url.query.port || "") != "")
+        port_val = parse_port_value(url.query.port);
+    if (url.host == "" || is_dummy_server(url.host, port_val) || !valid_port(port_val) || url.userinfo == "")
+        return null;
+
+    let username = "", password = "";
+    let colon = index(url.userinfo, ":");
+    if (colon >= 0) {
+        username = substr(url.userinfo, 0, colon);
+        password = substr(url.userinfo, colon + 1);
+    } else {
+        username = url.userinfo;
+    }
+    if (username == "" || password == "")
+        return null;
+
+    let transport = uc(trim(as_string(url.query.protocol || url.query.transport || "TCP")));
+    if (transport != "UDP")
+        transport = "TCP";
+
+    let tag_val = url.fragment != "" ? url.fragment : (url.query.profile || (url.host + ":" + port_val));
+    let outbound = {
+        type: "mieru",
+        tag: tag_val,
+        share_link: raw,
+        server: url.host,
+        server_port: int(port_val),
+        username: username,
+        password: password,
+        transport: transport
+    };
+    if ((url.query.multiplexing || "") != "")
+        outbound.multiplexing = url.query.multiplexing;
+    return outbound;
+}
+
+function process_mtproto(raw, url) {
+    let server = url.host;
+    let port = url.port;
+    let secret = url.userinfo;
+    if (url.scheme == "tg" || url.scheme == "http" || url.scheme == "https") {
+        server = as_string(url.query.server || "");
+        port = parse_port_value(url.query.port || "");
+        secret = as_string(url.query.secret || "");
+    } else {
+        if (secret == "")
+            secret = as_string(url.query.secret || "");
+    }
+    if (server == "" || is_dummy_server(server, port) || !valid_port(port) || secret == "")
+        return null;
+
+    let norm_secret = lc(trim(as_string(secret)));
+    let padded_prefix = false;
+    if (length(norm_secret) >= 34 && match(norm_secret, /^(ee|dd)[0-9a-f]{32}/)) {
+        padded_prefix = substr(norm_secret, 0, 2) == "dd";
+        secret = substr(norm_secret, 2, 32);
+    } else if (length(norm_secret) == 32 && match(norm_secret, /^[0-9a-f]{32}$/)) {
+        secret = norm_secret;
+    }
+
+    let outbound = {
+        type: "mtproto",
+        tag: url.fragment != "" ? url.fragment : (server + ":" + port),
+        share_link: raw,
+        server: server,
+        server_port: int(port),
+        secret: secret
+    };
+    let transport = lc(trim(as_string(url.query.transport || "")));
+    if (transport == "abridged" || transport == "intermediate" || transport == "padded_intermediate" || transport == "full")
+        outbound.transport = transport;
+    else if (padded_prefix)
+        outbound.transport = "padded_intermediate";
+    let mode = lc(trim(as_string(url.query.mode || "")));
+    if (mode == "mtproto" || mode == "mtproxy")
+        outbound.mode = mode;
+    if ((url.query.sni || url.query.faketls || "") != "")
+        outbound.tls = { enabled: true, server_name: url.query.sni || url.query.faketls };
+    return outbound;
+}
+
+function process_shadowtls(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let version = int(url.query.version || 3);
+    if (version < 1 || version > 3)
+        version = 3;
+
+    let outbound = {
+        type: "shadowtls",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port),
+        version: version,
+        password: url.userinfo
+    };
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    else
+        outbound.tls = { enabled: true, server_name: url.query.sni || url.host };
+    return outbound;
+}
+
+function process_tewfai(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port) || url.userinfo == "")
+        return null;
+
+    let uuid = "";
+    let password = "";
+    let colon = index(url.userinfo, ":");
+    if (colon >= 0) {
+        uuid = substr(url.userinfo, 0, colon);
+        password = substr(url.userinfo, colon + 1);
+    } else {
+        uuid = url.userinfo;
+    }
+    if (uuid == "")
+        return null;
+
+    let outbound = {
+        type: "tewfai",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port),
+        uuid: uuid
+    };
+    if (password != "")
+        outbound.password = password;
+    if ((url.query.transport || "") != "") {
+        let tr_list = [];
+        for (let item in split_csv(url.query.transport)) {
+            item = lc(trim(as_string(item)));
+            if (item == "raw_tls" || item == "h2" || item == "ws") item = "tcp";
+            else if (item == "h3_stream" || item == "h3_datagram") item = "quic";
+            if (item == "tcp" || item == "quic") {
+                if (index(tr_list, item) < 0)
+                    push(tr_list, item);
+            }
+        }
+        if (length(tr_list) > 0)
+            outbound.transport = tr_list;
+    }
+    let cipher = as_string(url.query.inner_cipher || "");
+    if (cipher == "aes-256-gcm" || cipher == "none")
+        outbound.inner_cipher = cipher;
+    let morph = as_string(url.query.morph_profile || "");
+    if (morph == "browsing" || morph == "video" || morph == "webrtc" || morph == "bulk")
+        outbound.morph_profile = morph;
+    if (is_true(url.query.pqc))
+        outbound.pqc = true;
+    if (is_true(url.query.handover))
+        outbound.handover = { enabled: true };
+    if (is_true(url.query.fec))
+        outbound.fec = true;
+    if (is_true(url.query.shaper)) {
+        let sp = as_string(url.query.shaper_profile || "adaptive");
+        let mode = (sp == "fixed" || sp == "off") ? sp : "adaptive";
+        outbound.shaper = { mode };
+    }
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (!tls_result[1])
+        return null;
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_trusttunnel(raw, url) {
+    if (url.host == "" || is_dummy_server(url.host, url.port) || !valid_port(url.port))
+        return null;
+
+    let username = "", password = "";
+    if (url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
+        } else {
+            password = url.userinfo;
+        }
+    }
+
+    let outbound = {
+        type: "trusttunnel",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + url.port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(url.port)
+    };
+    if (username != "")
+        outbound.username = username;
+    if (password != "")
+        outbound.password = password;
+    if (is_true(url.query.quic))
+        outbound.quic = "true";
+    if ((url.query.quic_congestion_control || url.query.cc || "") != "")
+        outbound.quic_congestion_control = url.query.quic_congestion_control || url.query.cc;
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (!tls_result[1])
+        return null;
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_masque(raw, url) {
+    let port = url.port;
+    if (port == null || port == "")
+        port = 443;
+    if (url.host == "" || is_dummy_server(url.host, port) || !valid_port(port))
+        return null;
+
+    let outbound = {
+        type: "masque",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(port)
+    };
+    if ((url.query.profile || "") != "")
+        outbound.profile = url.query.profile;
+    if ((url.query.vhttp || "") != "")
+        outbound.vhttp = url.query.vhttp;
+    if ((url.query.private_key || "") != "") {
+        outbound.private_key = url.query.private_key;
+    } else if ((url.userinfo || "") != "" && index(url.userinfo, ":") < 0) {
+        outbound.private_key = url.userinfo;
+    }
+    if ((url.query.public_key || "") != "")
+        outbound.public_key = url.query.public_key;
+    if (outbound.profile == null) {
+        outbound.profile = (outbound.private_key != null && outbound.public_key != null) ? "cloudflare" : "standard";
+    }
+    if ((url.query.ip || "") != "")
+        outbound.ip = url.query.ip;
+    if ((url.query.ipv6 || "") != "")
+        outbound.ipv6 = url.query.ipv6;
+    if ((url.query.uri || "") != "")
+        outbound.uri = url.query.uri;
+    else if (outbound.profile == "standard")
+        outbound.uri = "https://" + (index(url.host, ":") >= 0 ? "[" + url.host + "]" : url.host) + ":" + int(port) + "/.well-known/masque/ip/*/*/";
+    if (is_integer_string(url.query.mtu || ""))
+        outbound.mtu = int(url.query.mtu, 10);
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
+function process_openconnect(raw, url) {
+    let port = url.port;
+    if (port == null || port == "")
+        port = 443;
+    if (url.host == "" || is_dummy_server(url.host, port) || !valid_port(port))
+        return null;
+
+    let username = "", password = "", cookie = as_string(url.query.cookie || "");
+    if (url.userinfo != "") {
+        let colon = index(url.userinfo, ":");
+        if (colon >= 0) {
+            username = substr(url.userinfo, 0, colon);
+            password = substr(url.userinfo, colon + 1);
+        } else if (cookie == "") {
+            cookie = url.userinfo;
+        } else {
+            username = url.userinfo;
+        }
+    }
+
+    let outbound = {
+        type: "openconnect",
+        tag: url.fragment != "" ? url.fragment : (url.host + ":" + port),
+        share_link: raw,
+        server: url.host,
+        server_port: int(port),
+        flavor: as_string(url.query.flavor || "anyconnect")
+    };
+    if (username != "")
+        outbound.username = username;
+    if (password != "")
+        outbound.password = password;
+    if (cookie != "")
+        outbound.cookie = cookie;
+    if ((url.query.urlpath || "") != "")
+        outbound.urlpath = url.query.urlpath;
+    if ((url.query.realm || "") != "")
+        outbound.realm = url.query.realm;
+    if ((url.query.region || "") != "")
+        outbound.region = url.query.region;
+    if ((url.query.user_agent || "") != "")
+        outbound.user_agent = url.query.user_agent;
+    if ((url.query.local_hostname || "") != "")
+        outbound.local_hostname = url.query.local_hostname;
+    if ((url.query.server_cert_pin || "") != "")
+        outbound.server_cert_pin = url.query.server_cert_pin;
+    if ((url.query.address || "") != "")
+        outbound.address = split(as_string(url.query.address), "/")[0];
+    if ((url.query.address_v6 || "") != "")
+        outbound.address_v6 = split(as_string(url.query.address_v6), "/")[0];
+    if (is_true(url.query.ip))
+        outbound.ip = true;
+    if (is_true(url.query.esp))
+        outbound.esp = true;
+    if (is_true(url.query.dtls))
+        outbound.dtls = true;
+    if (is_true(url.query.hip_report))
+        outbound.hip_report = true;
+    if (is_integer_string(url.query.mtu || ""))
+        outbound.mtu = as_string(url.query.mtu);
+
+    let tls_result = add_tls(url, url.query.security || "", true);
+    if (tls_result[0])
+        outbound.tls = tls_result[0];
+    return outbound;
+}
+
 function parse_share_link(line) {
     if (starts_with(line, "vpn://"))
         return wireguard.from_vpn(line);
+    if (starts_with(line, "amneziawg://") || starts_with(line, "awg://"))
+        return from_amneziawg_share_link(line);
     if (starts_with(line, "vmess://"))
         return process_vmess(line);
     if (starts_with(line, "ss://"))
         return process_shadowsocks(line);
-    if (starts_with(line, "fptn:") || starts_with(line, "fptnb:") || starts_with(line, "fptn://") || starts_with(line, "fptnb://"))
-        return { type: "fptn", token: line, share_link: line };
+    if (starts_with(line, "fptn:") || starts_with(line, "fptnb:") || starts_with(line, "fptn://") || starts_with(line, "fptnb://")) {
+        let hash_pos = index(line, "#");
+        let clean_token = hash_pos >= 0 ? substr(line, 0, hash_pos) : line;
+        let frag = hash_pos >= 0 ? urldecode_fragment(substr(line, hash_pos + 1)) : "";
+        let res = { type: "fptn", token: clean_token, share_link: line };
+        if (frag != "")
+            res.tag = frag;
+        return res;
+    }
 
     let url = parse_url(line);
     if (!url)
@@ -1434,10 +1958,33 @@ function parse_share_link(line) {
         return process_hysteria2(line, url);
     if (url.scheme == "tuic")
         return process_tuic(line, url);
+    if (url.scheme == "anytls")
+        return process_anytls(line, url);
+    if (url.scheme == "naive+https" || url.scheme == "naive+quic")
+        return process_naive(line, url);
+    if (url.scheme == "snell")
+        return process_snell(line, url);
+    if (url.scheme == "mieru" || url.scheme == "mierus")
+        return process_mieru(line, url);
+    if (url.scheme == "tg" || url.scheme == "mtproto")
+        return process_mtproto(line, url);
+    if (url.scheme == "shadowtls")
+        return process_shadowtls(line, url);
+    if (url.scheme == "tewfai")
+        return process_tewfai(line, url);
+    if (url.scheme == "trusttunnel")
+        return process_trusttunnel(line, url);
+    if (url.scheme == "masque")
+        return process_masque(line, url);
+    if (url.scheme == "openconnect" || url.scheme == "anyconnect")
+        return process_openconnect(line, url);
     if (match(url.scheme, /^socks/))
         return process_socks(line, url);
-    if (url.scheme == "http" || url.scheme == "https")
+    if (url.scheme == "http" || url.scheme == "https") {
+        if ((url.host == "t.me" || url.host == "telegram.me") && (url.query.secret || "") != "" && (url.query.server || "") != "")
+            return process_mtproto(line, url);
         return process_http(line, url);
+    }
     return null;
 }
 
@@ -1874,6 +2421,166 @@ function parse_clash_record(record) {
             outbound.password = as_string(record.password);
         if (proxy_type == "https" || is_true(record.tls))
             outbound.tls = { enabled: true };
+        return outbound;
+    }
+    if (proxy_type == "anytls") {
+        let password = as_string(record.password);
+        if (password == "")
+            return null;
+        let outbound = { type: "anytls", tag: name, server: server, server_port: port, password: password };
+        if (is_integer_string(as_string(record["min-idle-session"] || record.min_idle_session || "")))
+            outbound.min_idle_session = int(record["min-idle-session"] || record.min_idle_session, 10);
+        if (as_string(record["idle-session-check-interval"] || record.idle_session_check_interval || "") != "")
+            outbound.idle_session_check_interval = as_string(record["idle-session-check-interval"] || record.idle_session_check_interval);
+        if (as_string(record["idle-session-timeout"] || record.idle_session_timeout || "") != "")
+            outbound.idle_session_timeout = as_string(record["idle-session-timeout"] || record.idle_session_timeout);
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "snell") {
+        let psk = as_string(record.psk || record.password || "");
+        if (psk == "")
+            return null;
+        let version = int(record.version || 5);
+        if (version < 1 || version > 5)
+            version = 5;
+        let outbound = { type: "snell", tag: name, server: server, server_port: port, psk: psk, version: version };
+        let obfs_mode = lc(as_string(record["obfs-opts.mode"] || record.obfs || ""));
+        if (obfs_mode == "http" || obfs_mode == "tls") {
+            outbound.obfs = { mode: obfs_mode };
+            let obfs_host = as_string(record["obfs-opts.host"] || record["obfs-host"] || "");
+            if (obfs_host != "")
+                outbound.obfs.host = obfs_host;
+        }
+        if (is_true(record.uot) || is_true(record.udp_over_tcp) || is_true(record["udp-over-tcp"]))
+            outbound.udp_over_tcp = true;
+        if (is_true(record.reuse))
+            outbound.reuse = true;
+        return outbound;
+    }
+    if (proxy_type == "mieru") {
+        let username = as_string(record.username || "");
+        let password = as_string(record.password || "");
+        if (username == "" || password == "")
+            return null;
+        let transport = uc(as_string(record.transport || "TCP"));
+        if (transport != "UDP")
+            transport = "TCP";
+        let outbound = {
+            type: "mieru",
+            tag: name,
+            server: server,
+            server_port: port,
+            username: username,
+            password: password,
+            transport: transport
+        };
+        if (as_string(record.multiplexing || "") != "")
+            outbound.multiplexing = as_string(record.multiplexing);
+        return outbound;
+    }
+    if (proxy_type == "shadow-tls" || proxy_type == "shadowtls") {
+        let password = as_string(record.password || "");
+        if (password == "")
+            return null;
+        let version = int(record.version || 3);
+        if (version < 1 || version > 3)
+            version = 3;
+        let outbound = {
+            type: "shadowtls",
+            tag: name,
+            server: server,
+            server_port: port,
+            version: version,
+            password: password
+        };
+        options.always = true;
+        if (options.sni == "" && as_string(record.host || "") != "")
+            options.sni = as_string(record.host);
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "mtproto" || proxy_type == "tg") {
+        let secret = as_string(record.secret || record.password || "");
+        if (secret == "")
+            return null;
+        let outbound = {
+            type: "mtproto",
+            tag: name,
+            server: server,
+            server_port: port,
+            secret: secret
+        };
+        if (as_string(record.transport || "") != "")
+            outbound.transport = lc(as_string(record.transport));
+        if (options.sni != "")
+            outbound.tls = { enabled: true, server_name: options.sni };
+        return outbound;
+    }
+    if (proxy_type == "tewfai") {
+        let uuid = as_string(record.uuid || "");
+        if (uuid == "")
+            return null;
+        let outbound = {
+            type: "tewfai",
+            tag: name,
+            server: server,
+            server_port: port,
+            uuid: uuid
+        };
+        if (as_string(record.password || "") != "")
+            outbound.password = as_string(record.password);
+        if (as_string(record.transport || "") != "")
+            outbound.transport = split_csv(as_string(record.transport));
+        if (as_string(record["inner-cipher"] || record.inner_cipher || "") != "")
+            outbound.inner_cipher = as_string(record["inner-cipher"] || record.inner_cipher);
+        if (as_string(record["morph-profile"] || record.morph_profile || "") != "")
+            outbound.morph_profile = as_string(record["morph-profile"] || record.morph_profile);
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "trusttunnel") {
+        let outbound = {
+            type: "trusttunnel",
+            tag: name,
+            server: server,
+            server_port: port
+        };
+        if (as_string(record.username || "") != "")
+            outbound.username = as_string(record.username);
+        if (as_string(record.password || "") != "")
+            outbound.password = as_string(record.password);
+        if (is_true(record.quic))
+            outbound.quic = true;
+        if (as_string(record["congestion-control"] || record.quic_congestion_control || "") != "")
+            outbound.quic_congestion_control = as_string(record["congestion-control"] || record.quic_congestion_control);
+        options.always = true;
+        add_clash_tls(outbound, options);
+        return outbound;
+    }
+    if (proxy_type == "masque") {
+        let outbound = {
+            type: "masque",
+            tag: name,
+            server: server,
+            server_port: port
+        };
+        if (as_string(record.profile || "") != "")
+            outbound.profile = as_string(record.profile);
+        if (as_string(record.vhttp || "") != "")
+            outbound.vhttp = as_string(record.vhttp);
+        if (as_string(record["private-key"] || record.private_key || "") != "")
+            outbound.private_key = as_string(record["private-key"] || record.private_key);
+        if (as_string(record["public-key"] || record.public_key || "") != "")
+            outbound.public_key = as_string(record["public-key"] || record.public_key);
+        if (as_string(record.ip || "") != "")
+            outbound.ip = as_string(record.ip);
+        if (as_string(record.ipv6 || "") != "")
+            outbound.ipv6 = as_string(record.ipv6);
+        options.always = true;
+        add_clash_tls(outbound, options);
         return outbound;
     }
     return null;
@@ -2714,15 +3421,30 @@ function xray_tag_base(original_tag, config_index, config_count) {
 
 function xray_protocol_supported(protocol) {
     protocol = lc(as_string(protocol));
-    return protocol == "vless" || protocol == "socks" || protocol == "hysteria";
+    return protocol == "vless" || protocol == "vmess" || protocol == "trojan" ||
+        protocol == "shadowsocks" || protocol == "ss" || protocol == "socks" ||
+        protocol == "http" || protocol == "hysteria" || protocol == "hysteria2" ||
+        protocol == "hy2";
+}
+
+function xray_apply_stream_tls_transport(result, outbound) {
+    let stream = object_or_empty(outbound.streamSettings);
+    let transport = xray_transport_from_stream(stream);
+    let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
+    if (tls)
+        result.tls = tls;
+    if (transport)
+        result.transport = transport;
+    return result;
 }
 
 function convert_xray_vless(outbound, tag) {
-    let vnext = xray_first_array_object(object_or_empty(outbound.settings).vnext);
+    let settings = object_or_empty(outbound.settings);
+    let vnext = xray_first_array_object(settings.vnext);
     let user = xray_first_array_object(vnext.users);
-    let server = as_string(vnext.address || "");
-    let port = xray_valid_port_value(vnext.port);
-    let uuid = as_string(user.id || "");
+    let server = as_string(vnext.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(vnext.port != null ? vnext.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let uuid = as_string(user.id || outbound.uuid || outbound.id || settings.id || "");
     if (server == "" || is_dummy_server(server, port) || port == null || uuid == "")
         return null;
 
@@ -2734,28 +3456,134 @@ function convert_xray_vless(outbound, tag) {
         uuid: uuid
     };
 
-    let flow = as_string(user.flow || "");
+    let flow = as_string(user.flow || outbound.flow || "");
     if (flow != "")
         result.flow = flow;
-    let encryption = normalize_vless_encryption(user.encryption || "");
+    let encryption = normalize_vless_encryption(user.encryption || outbound.encryption || "");
     if (encryption != "")
         result.encryption = encryption;
+
+    return xray_apply_stream_tls_transport(result, outbound);
+}
+
+function convert_xray_vmess(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let vnext = xray_first_array_object(settings.vnext);
+    let user = xray_first_array_object(vnext.users);
+    let server = as_string(vnext.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(vnext.port != null ? vnext.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let uuid = as_string(user.id || outbound.uuid || outbound.id || settings.id || "");
+    if (server == "" || is_dummy_server(server, port) || port == null || uuid == "")
+        return null;
+
+    let security = as_string(user.security || outbound.security || settings.security || "auto");
+    let result = {
+        type: "vmess",
+        tag: tag,
+        server: server,
+        server_port: port,
+        uuid: uuid,
+        security: security != "" ? security : "auto"
+    };
+
+    let alter_id = user.alterId != null ? user.alterId : (outbound.alter_id != null ? outbound.alter_id : outbound.alterId);
+    if (alter_id != null && as_string(alter_id) != "")
+        result.alter_id = int(alter_id);
+
+    return xray_apply_stream_tls_transport(result, outbound);
+}
+
+function convert_xray_trojan(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let srv = xray_first_array_object(settings.servers);
+    let server = as_string(srv.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(srv.port != null ? srv.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let password = as_string(srv.password || outbound.password || settings.password || "");
+    if (server == "" || is_dummy_server(server, port) || port == null || password == "")
+        return null;
+
+    let result = {
+        type: "trojan",
+        tag: tag,
+        server: server,
+        server_port: port,
+        password: password
+    };
+
+    return xray_apply_stream_tls_transport(result, outbound);
+}
+
+function convert_xray_shadowsocks(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let srv = xray_first_array_object(settings.servers);
+    let server = as_string(srv.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(srv.port != null ? srv.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    let method = normalize_shadowsocks_method(srv.method || srv.cipher || outbound.method || outbound.cipher || settings.method || settings.cipher || "");
+    let password = as_string(srv.password || outbound.password || settings.password || "");
+    if (server == "" || is_dummy_server(server, port) || port == null || !valid_shadowsocks_password(method, password))
+        return null;
+
+    let result = {
+        type: "shadowsocks",
+        tag: tag,
+        server: server,
+        server_port: port,
+        method: method,
+        password: password
+    };
+
+    let plugin = as_string(srv.plugin || outbound.plugin || settings.plugin || "");
+    let plugin_opts = as_string(srv.pluginOpts || srv.plugin_opts || outbound.plugin_opts || outbound.pluginOpts || settings.pluginOpts || settings.plugin_opts || "");
+    if (plugin != "")
+        result.plugin = plugin;
+    if (plugin_opts != "")
+        result.plugin_opts = plugin_opts;
 
     let stream = object_or_empty(outbound.streamSettings);
     let transport = xray_transport_from_stream(stream);
     let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
-    if (tls)
-        result.tls = tls;
-    if (transport)
-        result.transport = transport;
+    if (transport != null && transport.type == "ws" && result.plugin == null) {
+        result.plugin = "v2ray-plugin";
+        let opts = [ "mode=websocket" ];
+        if (tls != null && tls.enabled === true) {
+            push(opts, "tls");
+            if (as_string(tls.server_name || "") != "")
+                push(opts, "host=" + as_string(tls.server_name));
+        }
+        let ws_host = as_string(object_or_empty(transport.headers).Host || object_or_empty(transport.headers).host || "");
+        if (ws_host != "" && (tls == null || as_string(tls.server_name || "") == ""))
+            push(opts, "host=" + ws_host);
+        else if (ws_host != "" && tls != null && as_string(tls.server_name || "") != "" && ws_host != as_string(tls.server_name)) {
+            let filtered = [];
+            for (let item in opts) {
+                if (substr(item, 0, 5) != "host=")
+                    push(filtered, item);
+            }
+            opts = filtered;
+            push(opts, "host=" + ws_host);
+        }
+        let ws_path = as_string(transport.path || "/");
+        if (ws_path != "")
+            push(opts, "path=" + ws_path);
+        result.plugin_opts = join(";", opts);
+    } else {
+        if (tls)
+            result.tls = tls;
+        if (transport)
+            result.transport = transport;
+    }
+
+    if (is_true(srv.uot || outbound.uot || outbound.udp_over_tcp || settings.uot))
+        result.udp_over_tcp = true;
 
     return result;
 }
 
 function convert_xray_socks(outbound, tag) {
-    let server_config = xray_first_array_object(object_or_empty(outbound.settings).servers);
-    let server = as_string(server_config.address || "");
-    let port = xray_valid_port_value(server_config.port);
+    let settings = object_or_empty(outbound.settings);
+    let server_config = xray_first_array_object(settings.servers);
+    let server = as_string(server_config.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(server_config.port != null ? server_config.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
     if (server == "" || is_dummy_server(server, port) || port == null)
         return null;
 
@@ -2768,10 +3596,43 @@ function convert_xray_socks(outbound, tag) {
     };
 
     let user = xray_first_array_object(server_config.users);
-    if (as_string(user.user || "") != "")
-        result.username = as_string(user.user);
-    if (as_string(user.pass || user.password || "") != "")
-        result.password = as_string(user.pass || user.password);
+    let username = as_string(user.user || outbound.username || settings.user || "");
+    let password = as_string(user.pass || user.password || outbound.password || settings.pass || settings.password || "");
+    if (username != "")
+        result.username = username;
+    if (password != "")
+        result.password = password;
+
+    return result;
+}
+
+function convert_xray_http(outbound, tag) {
+    let settings = object_or_empty(outbound.settings);
+    let server_config = xray_first_array_object(settings.servers);
+    let server = as_string(server_config.address || outbound.server || outbound.address || settings.address || "");
+    let port = xray_valid_port_value(server_config.port != null ? server_config.port : (outbound.server_port != null ? outbound.server_port : (outbound.port != null ? outbound.port : settings.port)));
+    if (server == "" || is_dummy_server(server, port) || port == null)
+        return null;
+
+    let result = {
+        type: "http",
+        tag: tag,
+        server: server,
+        server_port: port
+    };
+
+    let user = xray_first_array_object(server_config.users);
+    let username = as_string(user.user || outbound.username || settings.user || "");
+    let password = as_string(user.pass || user.password || outbound.password || settings.pass || settings.password || "");
+    if (username != "")
+        result.username = username;
+    if (password != "")
+        result.password = password;
+
+    let stream = object_or_empty(outbound.streamSettings);
+    let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
+    if (tls)
+        result.tls = tls;
 
     return result;
 }
@@ -2780,13 +3641,14 @@ function convert_xray_hysteria2(outbound, tag) {
     let settings = object_or_empty(outbound.settings);
     let stream = object_or_empty(outbound.streamSettings);
     let hysteria_settings = object_or_empty(stream.hysteriaSettings);
-    let version = int(settings.version || hysteria_settings.version || 0);
+    let protocol = lc(as_string(outbound.protocol || ""));
+    let version = int(settings.version || hysteria_settings.version || (protocol == "hysteria2" || protocol == "hy2" ? 2 : 0));
     if (version != 2)
         return null;
 
-    let server = as_string(settings.address || settings.server || "");
-    let port = xray_valid_port_value(settings.port);
-    let password = as_string(hysteria_settings.auth || settings.auth || settings.password || "");
+    let server = as_string(settings.address || settings.server || outbound.server || outbound.address || "");
+    let port = xray_valid_port_value(settings.port != null ? settings.port : (outbound.server_port != null ? outbound.server_port : outbound.port));
+    let password = as_string(hysteria_settings.auth || settings.auth || settings.password || outbound.password || "");
     if (server == "" || is_dummy_server(server, port) || port == null || password == "")
         return null;
 
@@ -2833,9 +3695,17 @@ function convert_xray_outbound(outbound, tag) {
     let protocol = lc(as_string(outbound.protocol || ""));
     if (protocol == "vless")
         return convert_xray_vless(outbound, tag);
+    if (protocol == "vmess")
+        return convert_xray_vmess(outbound, tag);
+    if (protocol == "trojan")
+        return convert_xray_trojan(outbound, tag);
+    if (protocol == "shadowsocks" || protocol == "ss")
+        return convert_xray_shadowsocks(outbound, tag);
     if (protocol == "socks")
         return convert_xray_socks(outbound, tag);
-    if (protocol == "hysteria")
+    if (protocol == "http")
+        return convert_xray_http(outbound, tag);
+    if (protocol == "hysteria" || protocol == "hysteria2" || protocol == "hy2")
         return convert_xray_hysteria2(outbound, tag);
     return null;
 }
@@ -3192,13 +4062,398 @@ function sing_box_outbound_tag(outbound) {
     return type(outbound) == "object" ? as_string(outbound.tag || "") : "";
 }
 
-function normalize_sing_box_json_outbounds(candidates) {
+function decode_base64_or_raw_conf_text(raw_config) {
+    let text = trim(as_string(raw_config));
+    if (text == "")
+        return "";
+    if (index(lc(text), "[interface]") >= 0)
+        return text;
+    let payload = replace(replace(text, /[\r\n \t]+/g, ""), /-/g, "+");
+    payload = replace(payload, /_/g, "/");
+    if (match(payload, /^[A-Za-z0-9+\/]*={0,2}$/) && length(payload) % 4 != 1) {
+        while (length(payload) % 4)
+            payload += "=";
+        try {
+            let decoded = b64dec(payload);
+            if (decoded != null && decoded != "")
+                return decoded;
+        } catch (e) {}
+    }
+    return text;
+}
+
+let last_normalize_error_reason = "";
+
+function get_last_normalize_error() {
+    return last_normalize_error_reason;
+}
+
+function extract_peer_params_from_object(obj) {
+    if (type(obj) != "object")
+        return { public_key: "", endpoint: "", pre_shared_key: "", allowed_ips: null };
+
+    let sub = type(obj.peer) == "object" ? obj.peer :
+        (type(obj.server) == "object" ? obj.server :
+        (type(obj.wireguard) == "object" ? obj.wireguard :
+        (type(obj.amnezia) == "object" ? obj.amnezia :
+        (type(obj.awg) == "object" ? obj.awg : {}))));
+    if (type(obj.peers) == "array" && length(obj.peers) > 0 && type(obj.peers[0]) == "object")
+        sub = obj.peers[0];
+
+    let peer_pub = trim(as_string(
+        obj.public_key || obj.publicKey || obj.peer_public_key || obj.peerPublicKey || obj.server_public_key || obj.serverPublicKey ||
+        sub.public_key || sub.publicKey || sub.peer_public_key || sub.peerPublicKey || sub.server_public_key || sub.serverPublicKey || ""
+    ));
+    let peer_ep = trim(as_string(obj.endpoint || obj.server_endpoint || sub.endpoint || sub.server_endpoint || ""));
+    if (peer_ep == "") {
+        let srv = trim(as_string(obj.server || obj.host || obj.hostname || sub.server || sub.host || sub.address || ""));
+        let prt = trim(as_string(obj.server_port || obj.port || sub.server_port || sub.port || ""));
+        if (srv != "" && prt != "")
+            peer_ep = (index(srv, ":") >= 0 && substr(srv, 0, 1) != "[") ? ("[" + srv + "]:" + prt) : (srv + ":" + prt);
+    }
+    let psk = trim(as_string(
+        obj.pre_shared_key || obj.preshared_key || obj.presharedKey || obj.psk ||
+        sub.pre_shared_key || sub.preshared_key || sub.presharedKey || sub.psk || ""
+    ));
+    let allowed = obj.allowed_ips != null ? obj.allowed_ips : (obj.allowedIps != null ? obj.allowedIps : (sub.allowed_ips != null ? sub.allowed_ips : sub.allowedIps));
+    return {
+        public_key: peer_pub,
+        endpoint: peer_ep,
+        pre_shared_key: psk,
+        allowed_ips: allowed
+    };
+}
+
+function extract_peer_params_from_headers_file(headers_file) {
+    let result = { public_key: "", endpoint: "", pre_shared_key: "", allowed_ips: null };
+    if (as_string(headers_file) == "")
+        return result;
+    let data = read_file(headers_file);
+    if (data == null || data == "")
+        return result;
+    let host = "", port = "";
+    for (let line in split(as_string(data), "\n")) {
+        line = trim(replace(line, /\r$/g, ""));
+        let colon = index(line, ":");
+        if (colon <= 0)
+            continue;
+        let k = lc(trim(substr(line, 0, colon)));
+        let v = trim(substr(line, colon + 1));
+        if (v == "")
+            continue;
+        if (k == "x-peer-public-key" || k == "x-wg-public-key" || k == "x-awg-public-key" || k == "x-server-public-key" || k == "peer-public-key")
+            result.public_key = v;
+        else if (k == "x-peer-endpoint" || k == "x-wg-endpoint" || k == "x-awg-endpoint" || k == "x-endpoint" || k == "peer-endpoint")
+            result.endpoint = v;
+        else if (k == "x-peer-host" || k == "x-server-host")
+            host = v;
+        else if (k == "x-peer-port" || k == "x-server-port")
+            port = v;
+        else if (k == "x-preshared-key" || k == "x-pre-shared-key")
+            result.pre_shared_key = v;
+    }
+    if (result.endpoint == "" && host != "" && port != "")
+        result.endpoint = (index(host, ":") >= 0 && substr(host, 0, 1) != "[") ? ("[" + host + "]:" + port) : (host + ":" + port);
+    return result;
+}
+
+function is_json_candidate_container(item) {
+    if (type(item) != "object")
+        return false;
+    if (type(item.servers) == "array" || type(item.configs) == "array" ||
+        type(item.nodes) == "array" || type(item.items) == "array" ||
+        type(item.endpoints) == "array")
+        return true;
+    if (type(item.outbounds) == "array" && !sing_box_urltest_group(item) && lc(as_string(item.type || "")) != "selector") {
+        for (let ob in item.outbounds) {
+            if (type(ob) == "object")
+                return true;
+        }
+    }
+    return false;
+}
+
+function extract_container_candidates(container, fallback_peer) {
+    let result = [];
+    let item_peer = extract_peer_params_from_object(container);
+    let child_peer = {};
+    if (type(fallback_peer) == "object") {
+        for (let k, v in fallback_peer)
+            child_peer[k] = v;
+    }
+    if (item_peer.public_key != "") child_peer.public_key = item_peer.public_key;
+    if (item_peer.endpoint != "") child_peer.endpoint = item_peer.endpoint;
+    if (item_peer.pre_shared_key != "") child_peer.pre_shared_key = item_peer.pre_shared_key;
+    if (item_peer.allowed_ips != null) child_peer.allowed_ips = item_peer.allowed_ips;
+
+    let container_name = trim(as_string(container.name || container.tag || container.remark || ""));
+
+    let sub_lists = [
+        container.servers,
+        container.configs,
+        container.nodes,
+        container.items,
+        container.endpoints,
+        container.outbounds
+    ];
+
+    for (let list in sub_lists) {
+        if (type(list) != "array")
+            continue;
+        for (let i = 0; i < length(list); i++) {
+            let child = list[i];
+            if (type(child) == "object") {
+                if (child.__fallback_peer == null && length(keys(child_peer)) > 0)
+                    child.__fallback_peer = child_peer;
+                if (container_name != "" && as_string(child.name || child.tag || child.remark || "") == "")
+                    child.name = length(list) == 1 ? container_name : sprintf("%s (%d)", container_name, i + 1);
+                push(result, child);
+            }
+        }
+    }
+    return result;
+}
+
+function flatten_json_candidate_items(candidates, fallback_peer, depth) {
+    depth = int(depth || 0);
+    if (depth > 5)
+        return candidates;
+    let result = [];
+    let has_container = false;
+    for (let item in candidates) {
+        if (type(item) != "object")
+            continue;
+        if (is_json_candidate_container(item)) {
+            has_container = true;
+            let eff_peer = item.__fallback_peer || fallback_peer;
+            let children = extract_container_candidates(item, eff_peer);
+            for (let child in children)
+                push(result, child);
+        } else {
+            push(result, item);
+        }
+    }
+    if (has_container)
+        return flatten_json_candidate_items(result, fallback_peer, depth + 1);
+    return result;
+}
+
+function expand_json_config_outbound_items(item, fallback_peer) {
+    if (type(item) != "object")
+        return null;
+
+    if (is_json_candidate_container(item)) {
+        let eff_peer = item.__fallback_peer || fallback_peer;
+        delete item.__fallback_peer;
+        let children = extract_container_candidates(item, eff_peer);
+        let result = [];
+        for (let child in children) {
+            let child_peer = child.__fallback_peer || eff_peer;
+            delete child.__fallback_peer;
+            let child_res = expand_json_config_outbound_items(child, child_peer);
+            if (type(child_res) == "array") {
+                for (let ep in child_res)
+                    push(result, ep);
+            }
+        }
+        if (length(result) > 0)
+            return result;
+    }
+
+    let raw_cfg = as_string(item.config || item.awg_config || item.wg_config || "");
+    if (raw_cfg == "")
+        return null;
+
+    let item_name = trim(as_string(item.name || item.tag || item.remark || ""));
+    let endpoints = null;
+    if (starts_with(trim(raw_cfg), "vpn://")) {
+        endpoints = wireguard.from_vpn_endpoints(trim(raw_cfg));
+    } else {
+        let conf_text = decode_base64_or_raw_conf_text(raw_cfg);
+        if (conf_text != "" && index(lc(conf_text), "[peer]") < 0) {
+            let item_peer = extract_peer_params_from_object(item);
+            let fb = type(fallback_peer) == "object" ? fallback_peer : {};
+            let peer_pub = item_peer.public_key != "" ? item_peer.public_key : as_string(fb.public_key || "");
+            let peer_ep = item_peer.endpoint != "" ? item_peer.endpoint : as_string(fb.endpoint || "");
+            let psk = item_peer.pre_shared_key != "" ? item_peer.pre_shared_key : as_string(fb.pre_shared_key || "");
+            let allowed = item_peer.allowed_ips != null ? item_peer.allowed_ips : fb.allowed_ips;
+            if (peer_pub != "" && peer_ep != "") {
+                conf_text += "\n[Peer]\nPublicKey = " + peer_pub + "\nEndpoint = " + peer_ep + "\n";
+                if (psk != "")
+                    conf_text += "PresharedKey = " + psk + "\n";
+                if (type(allowed) == "array" && length(allowed) > 0)
+                    conf_text += "AllowedIPs = " + join(", ", allowed) + "\n";
+                else if (type(allowed) == "string" && trim(allowed) != "")
+                    conf_text += "AllowedIPs = " + trim(allowed) + "\n";
+            } else if (index(lc(conf_text), "[interface]") >= 0) {
+                last_normalize_error_reason = "incomplete_awg_missing_peer";
+            }
+        }
+        let share = "vpn://" + replace(replace(replace(b64enc(conf_text), /\+/g, "-"), /\//g, "_"), /=+$/, "");
+        endpoints = wireguard.from_conf_endpoints(conf_text, share, item_name);
+    }
+
+    if (type(endpoints) != "array" || length(endpoints) == 0)
+        return [];
+
+    let result = [];
+    for (let i = 0; i < length(endpoints); i++) {
+        let ep = endpoints[i];
+        if (item_name != "") {
+            ep.tag = i == 0 ? item_name : sprintf("%s (%d)", item_name, i + 1);
+            ep.remark = ep.tag;
+        }
+        push(result, ep);
+    }
+    return result;
+}
+
+function normalize_sing_box_wireguard_outbound(outbound) {
+    if (type(outbound) != "object")
+        return outbound;
+    let out_type = lc(trim(as_string(outbound.type || "")));
+    if (out_type != "wireguard" && out_type != "amneziawg" && out_type != "awg")
+        return outbound;
+
+    outbound.type = "wireguard";
+    let tag_val = trim(as_string(outbound.tag || outbound.name || outbound.remark || ""));
+    if (tag_val != "")
+        outbound.tag = tag_val;
+
+    if (outbound.address == null && outbound.local_address != null) {
+        outbound.address = type(outbound.local_address) == "array" ? outbound.local_address : [ as_string(outbound.local_address) ];
+        delete outbound.local_address;
+    } else if (type(outbound.address) == "string") {
+        outbound.address = [ outbound.address ];
+    }
+
+    if (type(outbound.peers) != "array" || length(outbound.peers) == 0) {
+        let srv = trim(as_string(outbound.server || outbound.host || ""));
+        let prt = int(outbound.server_port || outbound.port || 0);
+        let pub = trim(as_string(outbound.peer_public_key || outbound.public_key || outbound.publicKey || ""));
+        if (srv != "" && prt > 0 && pub != "") {
+            let peer = {
+                address: srv,
+                port: prt,
+                public_key: pub,
+                allowed_ips: type(outbound.allowed_ips) == "array" && length(outbound.allowed_ips) > 0
+                    ? outbound.allowed_ips
+                    : [ "0.0.0.0/0", "::/0" ]
+            };
+            let psk = trim(as_string(outbound.pre_shared_key || outbound.preshared_key || ""));
+            if (psk != "")
+                peer.pre_shared_key = psk;
+            if (outbound.reserved != null)
+                peer.reserved = outbound.reserved;
+            if (outbound.persistent_keepalive_interval != null)
+                peer.persistent_keepalive_interval = outbound.persistent_keepalive_interval;
+            outbound.peers = [ peer ];
+            delete outbound.server;
+            delete outbound.server_port;
+            delete outbound.peer_public_key;
+            delete outbound.pre_shared_key;
+            delete outbound.preshared_key;
+            delete outbound.reserved;
+            delete outbound.allowed_ips;
+            delete outbound.persistent_keepalive_interval;
+        }
+    } else {
+        for (let peer in outbound.peers) {
+            if (type(peer) != "object")
+                continue;
+            if (peer.address == null && peer.server != null) {
+                peer.address = peer.server;
+                delete peer.server;
+            }
+            if (peer.port == null && peer.server_port != null) {
+                peer.port = int(peer.server_port);
+                delete peer.server_port;
+            }
+            if (peer.public_key == null && peer.peer_public_key != null) {
+                peer.public_key = peer.peer_public_key;
+                delete peer.peer_public_key;
+            }
+            if (peer.allowed_ips == null)
+                peer.allowed_ips = [ "0.0.0.0/0", "::/0" ];
+        }
+    }
+
+    if (type(outbound.amnezia) == "object") {
+        for (let k, v in outbound.amnezia) {
+            if (outbound[k] == null)
+                outbound[k] = v;
+        }
+        delete outbound.amnezia;
+    }
+
+    if (outbound.mtu == null)
+        outbound.mtu = 1280;
+
+    return outbound;
+}
+
+function normalize_sing_box_json_outbounds(candidates, fallback_peer) {
+    candidates = flatten_json_candidate_items(candidates, fallback_peer);
     let outbounds = [];
     let urltest_refs = {};
     let detour_refs = {};
+    let idx = 0;
 
     for (let outbound in candidates) {
+        idx++;
         if (type(outbound) != "object" || outbound_is_unsupported_stub(outbound))
+            continue;
+        let eff_peer = outbound.__fallback_peer || fallback_peer;
+        delete outbound.__fallback_peer;
+        let expanded_cfg = expand_json_config_outbound_items(outbound, eff_peer);
+        if (expanded_cfg != null) {
+            for (let ep in expanded_cfg)
+                push(outbounds, ep);
+            continue;
+        }
+        if ((outbound.type == null || as_string(outbound.type) == "") &&
+            (outbound.protocol != null || outbound.streamSettings != null || outbound.settings != null)) {
+            let xray_tag = xray_source_tag(outbound, lc(as_string(outbound.protocol || "server")) + "-" + idx);
+            let converted = convert_xray_outbound(outbound, xray_tag);
+            if (converted == null)
+                continue;
+            let disp = xray_display_name(as_string(outbound.remarks || outbound.remark || outbound.ps || outbound.name || outbound.tag || ""));
+            if (disp != "")
+                converted.remark = disp;
+            let detour = xray_outbound_detour(outbound);
+            if (detour != "")
+                converted.detour = detour;
+            outbound = converted;
+        }
+        else if (outbound.streamSettings != null && outbound.transport == null) {
+            let stream = object_or_empty(outbound.streamSettings);
+            let transport = xray_transport_from_stream(stream);
+            let tls = xray_tls_from_stream(stream, lc(as_string(stream.network || "")));
+            if (lc(as_string(outbound.type || "")) == "shadowsocks" && transport != null && transport.type == "ws" && outbound.plugin == null) {
+                outbound.plugin = "v2ray-plugin";
+                let opts = [ "mode=websocket" ];
+                if (tls != null && tls.enabled === true) {
+                    push(opts, "tls");
+                    if (as_string(tls.server_name || "") != "")
+                        push(opts, "host=" + as_string(tls.server_name));
+                }
+                let ws_host = as_string(object_or_empty(transport.headers).Host || object_or_empty(transport.headers).host || "");
+                if (ws_host != "" && (tls == null || as_string(tls.server_name || "") == ""))
+                    push(opts, "host=" + ws_host);
+                let ws_path = as_string(transport.path || "/");
+                if (ws_path != "")
+                    push(opts, "path=" + ws_path);
+                outbound.plugin_opts = join(";", opts);
+            } else {
+                if (tls != null && outbound.tls == null)
+                    outbound.tls = tls;
+                if (transport != null && outbound.transport == null)
+                    outbound.transport = transport;
+            }
+            delete outbound.streamSettings;
+        }
+        outbound = normalize_sing_box_wireguard_outbound(outbound);
+        if (outbound.type == "wireguard" && (type(outbound.peers) != "array" || length(outbound.peers) == 0))
             continue;
         outbound = normalize_sing_box_hysteria2_outbound(outbound);
         outbound = normalize_sing_box_tuic_outbound(outbound);
@@ -3232,7 +4487,7 @@ function normalize_sing_box_json_outbounds(candidates) {
     return outbounds;
 }
 
-function normalize_sing_box_json_value(value, output_file) {
+function normalize_sing_box_json_value(value, output_file, headers_file) {
     let candidates = [];
     let outbounds = [];
 
@@ -3249,14 +4504,28 @@ function normalize_sing_box_json_value(value, output_file) {
         });
     }
 
-    if (type(value) == "object" && type(value.outbounds) == "array")
-        candidates = value.outbounds;
+    let fallback_peer = extract_peer_params_from_headers_file(headers_file);
+    if (type(value) == "object") {
+        let top_peer = extract_peer_params_from_object(value);
+        if (top_peer.public_key != "")
+            fallback_peer.public_key = top_peer.public_key;
+        if (top_peer.endpoint != "")
+            fallback_peer.endpoint = top_peer.endpoint;
+        if (top_peer.pre_shared_key != "")
+            fallback_peer.pre_shared_key = top_peer.pre_shared_key;
+        if (top_peer.allowed_ips != null)
+            fallback_peer.allowed_ips = top_peer.allowed_ips;
+    }
+
+    if (type(value) == "object" && is_json_candidate_container(value)) {
+        candidates = extract_container_candidates(value, fallback_peer);
+    }
     else if (type(value) == "array")
         candidates = value;
-    else if (type(value) == "object" && type(value.type) == "string")
+    else if (type(value) == "object" && (type(value.type) == "string" || type(value.protocol) == "string" || value.config != null || value.awg_config != null || value.wg_config != null))
         candidates = [value];
 
-    outbounds = normalize_sing_box_json_outbounds(candidates);
+    outbounds = normalize_sing_box_json_outbounds(candidates, fallback_peer);
 
     if (length(outbounds) == 0) {
         fs.unlink(output_file);
@@ -3348,7 +4617,7 @@ function extract_ui_metadata_file(headers_file, body_file, output_file) {
     return true;
 }
 
-function normalize_content_data(data, output_file, depth) {
+function normalize_content_data(data, output_file, depth, headers_file) {
     data = as_string(data);
     if (index(data, "\r") >= 0)
         data = replace(data, /\r/g, "");
@@ -3357,14 +4626,14 @@ function normalize_content_data(data, output_file, depth) {
     if (depth < 2 && crypt4.is_crypt4(data)) {
         let decrypted = crypt4.decrypt(data);
         if (decrypted != null && decrypted != "")
-            return normalize_content_data(decrypted, output_file, depth + 1);
+            return normalize_content_data(decrypted, output_file, depth + 1, headers_file);
     }
 
     let first = first_non_ws_char(data);
     if (first == "{" || first == "[") {
         let decoded_json = json_decode_text(data);
         if (decoded_json != null)
-            return normalize_sing_box_json_value(decoded_json, output_file);
+            return normalize_sing_box_json_value(decoded_json, output_file, headers_file);
     }
 
     if (index(data, "proxies:") >= 0 && content_is_clash_yaml(data)) {
@@ -3385,21 +4654,23 @@ function normalize_content_data(data, output_file, depth) {
         let compact = replace(data, /[\r\n\t ]/g, "");
         let decoded = base64_decode(compact);
         if (decoded != null && decoded != "")
-            return normalize_content_data(decoded, output_file, depth + 1);
+            return normalize_content_data(decoded, output_file, depth + 1, headers_file);
     }
 
     return false;
 }
 
-function normalize_content_file(input_file, output_file) {
+function normalize_content_file(input_file, output_file, headers_file) {
+    last_normalize_error_reason = "";
     if (file_looks_like_uri_list(input_file))
         return normalize_uri_list_file(input_file, output_file, true);
 
     let data = read_file(input_file);
-    return data == null ? false : normalize_content_data(data, output_file, 0);
+    return data == null ? false : normalize_content_data(data, output_file, 0, headers_file);
 }
 
-function normalize_content_validated(input_file, output_file) {
+function normalize_content_validated(input_file, output_file, headers_file) {
+    last_normalize_error_reason = "";
     let normalize_input = input_file;
     let decoded_tmp = temp_path("tachyon-subscription-gzip");
     let decoded = gzip_decode_file(input_file, decoded_tmp);
@@ -3408,7 +4679,7 @@ function normalize_content_validated(input_file, output_file) {
     else
         fs.unlink(decoded_tmp);
 
-    let ok = normalize_content_file(normalize_input, output_file);
+    let ok = normalize_content_file(normalize_input, output_file, headers_file);
     if (decoded)
         fs.unlink(decoded_tmp);
     if (!ok)
@@ -3472,6 +4743,7 @@ function module_exports() {
         parse_subscription_source_entry,
         validate_subscription,
         normalize_content_validated,
+        get_last_normalize_error,
         normalized_skipped_message,
         try_decode_gzip_content_file,
         extract_ui_metadata_file,
@@ -3497,9 +4769,9 @@ else if (mode == "normalize-uri-list")
 else if (mode == "normalize-clash-yaml")
     ok = normalize_clash_yaml(ARGV[1], ARGV[2]);
 else if (mode == "normalize-content")
-    ok = normalize_content_file(ARGV[1], ARGV[2]);
+    ok = normalize_content_file(ARGV[1], ARGV[2], ARGV[3]);
 else if (mode == "normalize-content-validated")
-    ok = normalize_content_validated(ARGV[1], ARGV[2]);
+    ok = normalize_content_validated(ARGV[1], ARGV[2], ARGV[3]);
 else if (mode == "try-decode-gzip-content")
     ok = try_decode_gzip_content_file(ARGV[1]);
 else if (mode == "runtime-outbounds-equal")

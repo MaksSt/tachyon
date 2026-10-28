@@ -2,6 +2,7 @@
 
 let fs = require("fs");
 let common = require("core.common");
+let exec = require("core.exec");
 let as_string = common.as_string;
 let shell_quote = common.shell_quote;
 
@@ -64,14 +65,205 @@ function tokenize_strategy_args(raw_args) {
     return { valid: true, tokens: tokens };
 }
 
+const DESYNC_PRESETS = [
+    "fake_split", "fakesplit", "split", "disorder", "tlsrec", "tls_rec", "fake", "oob", "auto",
+    // Legacy aliases mapped to valid tachyon-core presets/parameters
+    "general", "general_alt", "general_alt2", "general_alt3", "general_alt4",
+    "general_alt5", "general_alt6", "general_alt7", "general_alt8", "general_alt9",
+    "general_alt10", "general_alt11", "general_fake_tls", "general_fake_tls_alt",
+    "general_fake_tls_alt2", "general_fake_tls_alt3", "general_simple_fake",
+    "general_simple_fake_alt", "general_simple_fake_alt2",
+    "youtube", "google_youtube", "discord", "cloudflare", "aggressive", "light"
+];
+
+const DESYNC_MODES = [
+    "fake_split", "fakesplit", "split", "disorder", "tlsrec", "tls_rec", "fake", "oob", "none",
+    // Legacy aliases mapped to valid tachyon-core modes
+    "fake+split", "fake+disorder", "multisplit", "multidisorder",
+    "fake_disorder", "tlsrec_split", "fakedsplit", "fakeddisorder", "syndata"
+];
+
+function normalize_desync_preset(lv, outbound) {
+    if (lv == "fakesplit" || lv == "fake_split") return "fake_split";
+    if (lv == "tls_rec" || lv == "tlsrec") return "tlsrec";
+    if (lv == "split" || lv == "disorder" || lv == "fake" || lv == "oob" || lv == "auto") return lv;
+    if (lv == "youtube" || lv == "google_youtube") {
+        if (outbound.split_pos == null) outbound.split_pos = "midsld";
+        if (outbound.fake_ttl == null) outbound.fake_ttl = 6;
+        if (outbound.fake_sni == null) outbound.fake_sni = "www.google.com";
+        if (outbound.udp_fake == null) outbound.udp_fake = true;
+        return "fake_split";
+    }
+    if (lv == "discord") {
+        if (outbound.split_pos == null) outbound.split_pos = "midsld";
+        if (outbound.fake_ttl == null) outbound.fake_ttl = 6;
+        if (outbound.udp_fake == null) outbound.udp_fake = true;
+        if (outbound.udp_repeats == null) outbound.udp_repeats = 6;
+        return "fake_split";
+    }
+    if (lv == "cloudflare" || lv == "light") {
+        if (outbound.split_pos == null) outbound.split_pos = "sni";
+        return "tlsrec";
+    }
+    if (lv == "aggressive" || index(lv, "general_alt") == 0) {
+        if (outbound.split_pos == null) outbound.split_pos = 1;
+        if (outbound.fake_ttl == null) outbound.fake_ttl = 4;
+        return "disorder";
+    }
+    if (index(lv, "general") == 0) {
+        if (outbound.split_pos == null) outbound.split_pos = "midsld";
+        if (outbound.fake_ttl == null) outbound.fake_ttl = 5;
+        if (outbound.fake_sni == null) outbound.fake_sni = "max.ru";
+        return "fake_split";
+    }
+    return "fake_split";
+}
+
+function normalize_desync_mode(lv) {
+    if (lv == "fake_split" || lv == "fakesplit" || lv == "fake+split" || lv == "fakedsplit")
+        return "fake_split";
+    if (lv == "disorder" || lv == "fake_disorder" || lv == "fake+disorder" || lv == "fakeddisorder" || lv == "multidisorder")
+        return "disorder";
+    if (lv == "split" || lv == "multisplit" || lv == "syndata")
+        return "split";
+    if (lv == "tlsrec" || lv == "tls_rec" || lv == "tlsrec_split")
+        return "tlsrec";
+    if (lv == "fake" || lv == "oob" || lv == "none")
+        return lv;
+    return "fake_split";
+}
+
+function parse_desync_outbound(args_val, tag_name) {
+    let tok_res = tokenize_strategy_args(args_val);
+    if (!tok_res.valid)
+        return null;
+
+    let outbound = {
+        type: "desync",
+        tag: as_string(tag_name || "desync-out")
+    };
+    let recognized = 0;
+
+    for (let tok in tok_res.tokens) {
+        let eq = index(tok, "=");
+        if (eq <= 0)
+            return null;
+        let k = lc(trim(substr(tok, 0, eq)));
+        let v = trim(substr(tok, eq + 1));
+        if (v == "")
+            return null;
+
+        if (k == "preset") {
+            let lv = lc(v);
+            if (index(DESYNC_PRESETS, lv) < 0)
+                return null;
+            outbound.preset = normalize_desync_preset(lv, outbound);
+            recognized++;
+        } else if (k == "mode") {
+            let lv = lc(v);
+            if (index(DESYNC_MODES, lv) < 0)
+                return null;
+            outbound.mode = normalize_desync_mode(lv);
+            recognized++;
+        } else if (k == "split_pos") {
+            let lv = lc(v);
+            if (lv == "midsld" || lv == "sld" || lv == "host") {
+                outbound.split_pos = "midsld";
+            } else if (lv == "sni" || lv == "sniext") {
+                outbound.split_pos = "sni";
+            } else if (match(v, /^[0-9]+$/)) {
+                let n = int(v);
+                if (n < 1 || n > 1400) return null;
+                outbound.split_pos = n;
+            } else {
+                return null;
+            }
+            recognized++;
+        } else if (k == "fake_ttl" || k == "ttl") {
+            if (!match(v, /^[0-9]+$/)) return null;
+            let n = int(v);
+            if (n < 1 || n > 128) return null;
+            outbound.fake_ttl = n;
+            recognized++;
+        } else if (k == "fake_sni") {
+            if (!is_valid_hostname(v)) return null;
+            outbound.fake_sni = v;
+            recognized++;
+        } else if (k == "repeats") {
+            if (!match(v, /^[0-9]+$/)) return null;
+            let n = int(v);
+            if (n < 1 || n > 100) return null;
+            outbound.repeats = n;
+            recognized++;
+        } else if (k == "split_delay_ms") {
+            if (!match(v, /^[0-9]+$/)) return null;
+            let n = int(v);
+            if (n < 0 || n > 1000) return null;
+            outbound.split_delay_ms = n;
+            recognized++;
+        } else if (k == "udp_fake") {
+            let lv = lc(v);
+            if (lv == "true" || lv == "1") outbound.udp_fake = true;
+            else if (lv == "false" || lv == "0") outbound.udp_fake = false;
+            else return null;
+            recognized++;
+        } else if (k == "udp_repeats") {
+            if (!match(v, /^[0-9]+$/)) return null;
+            let n = int(v);
+            if (n < 1 || n > 50) return null;
+            outbound.udp_repeats = n;
+            recognized++;
+        } else if (k == "udp_fake_ttl") {
+            if (!match(v, /^[0-9]+$/)) return null;
+            let n = int(v);
+            if (n < 1 || n > 128) return null;
+            outbound.udp_fake_ttl = n;
+            recognized++;
+        } else {
+            return null;
+        }
+    }
+
+    if (recognized <= 0 || (outbound.preset == null && outbound.mode == null))
+        return null;
+
+    // In tachyon-core <= 0.1.7, DesyncMode::FakeSplit and DesyncMode::Fake write
+    // fake_payload directly into the connected TcpStream before the real ClientHello,
+    // which advances SND.NXT and causes the kernel TCP stack to retransmit fake_payload
+    // to the origin server with normal TTL. Using "disorder" (low-TTL first segment +
+    // out-of-order retransmission) or "tlsrec" preserves a valid TCP sequence stream
+    // while keeping all split_pos, fake_ttl, repeats and udp_fake parameters active.
+    if (outbound.preset == "fake_split" || outbound.preset == "auto") {
+        outbound.preset = "disorder";
+        if (outbound.split_pos == null) outbound.split_pos = "midsld";
+        if (outbound.udp_fake == null) outbound.udp_fake = true;
+    } else if (outbound.preset == "fake") {
+        outbound.preset = "disorder";
+        if (outbound.split_pos == null) outbound.split_pos = 1;
+        if (outbound.udp_fake == null) outbound.udp_fake = true;
+    }
+    if (outbound.mode == "fake_split") {
+        outbound.mode = "disorder";
+        if (outbound.split_pos == null) outbound.split_pos = "midsld";
+    } else if (outbound.mode == "fake") {
+        outbound.mode = "disorder";
+        if (outbound.split_pos == null) outbound.split_pos = 1;
+    }
+
+    return outbound;
+}
+
 function validate_strategy_args(engine, args_val) {
     engine = lc(as_string(engine));
-    if (engine != "zapret" && engine != "zapret2" && engine != "byedpi")
+    if (engine != "zapret" && engine != "zapret2" && engine != "byedpi" && engine != "desync")
         return false;
 
     let tok_res = tokenize_strategy_args(args_val);
     if (!tok_res.valid)
         return false;
+
+    if (engine == "desync")
+        return parse_desync_outbound(args_val, "desync-out") != null;
 
     try {
         if (engine == "zapret2") {
@@ -145,15 +337,50 @@ function build_zapret_argv(bin, qnum, fwmark_flag, lua_init_flags, blob_flags, f
     return argv;
 }
 
+function find_child_pids(parent_pid) {
+    let children = [];
+    let p_int = int(parent_pid);
+    if (p_int <= 1) return children;
+    let procs = fs.glob("/proc/[0-9]*/stat");
+    if (!procs) return children;
+    for (let st_path in procs) {
+        let data = fs.readfile(st_path);
+        if (!data) continue;
+        let rparen = rindex(data, ")");
+        if (rparen < 0) continue;
+        let m_pid = match(substr(data, 0, rparen), /^([0-9]+)[ \t]+\(/);
+        let rest = trim(substr(data, rparen + 1));
+        let fields = split(rest, /[ \t]+/);
+        if (m_pid && m_pid[1] && length(fields) >= 2 && int(fields[1]) == p_int) {
+            push(children, m_pid[1]);
+        }
+    }
+    return children;
+}
+
 function kill_pid_file(path) {
     let pid_str = fs.readfile(path);
     if (pid_str) {
         let pid = trim(as_string(pid_str));
         if (pid != "" && match(pid, /^[0-9]+$/) != null) {
-            system(sprintf("kill %s >/dev/null 2>&1 || kill -9 %s >/dev/null 2>&1", pid, pid));
+            let children = find_child_pids(pid);
+            for (let c in children) {
+                for (let gc in find_child_pids(c)) {
+                    if (fs.stat("/proc/" + gc) != null)
+                        exec.command_status_from_args([ "kill", "-9", "" + gc ]);
+                }
+                if (fs.stat("/proc/" + c) != null)
+                    exec.command_status_from_args([ "kill", "-9", "" + c ]);
+            }
+            if (fs.stat("/proc/" + pid) != null)
+                exec.command_status_from_args([ "kill", "" + pid ]);
             for (let k = 0; k < 3; k++) {
-                if (system(sprintf("kill -0 %s >/dev/null 2>&1", pid)) != 0) break;
-                system("sleep 0.1");
+                if (fs.stat("/proc/" + pid) == null) break;
+                exec.command_status_from_args([ "sleep", "0.1" ]);
+            }
+            if (fs.stat("/proc/" + pid) != null) {
+                exec.command_status_from_args([ "kill", "-9", "" + pid ]);
+                exec.command_status_from_args([ "sleep", "0.1" ]);
             }
         }
         try { fs.unlink(path); } catch (e) {}
@@ -221,9 +448,12 @@ function calculate_jitter(values, median_val) {
 }
 
 return {
+    DESYNC_PRESETS,
+    DESYNC_MODES,
     is_valid_hostname,
     is_valid_url,
     tokenize_strategy_args,
+    parse_desync_outbound,
     validate_strategy_args,
     build_byedpi_argv,
     build_zapret_argv,

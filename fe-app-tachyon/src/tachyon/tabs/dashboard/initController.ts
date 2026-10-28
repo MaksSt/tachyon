@@ -3,6 +3,7 @@ import {
   canUseDirectClashApi,
   getClashWsUrl,
   isCopyableProxyLink,
+  isUserActivelyScrolling,
   onMount,
   openPrefixColorPickerModal,
   preserveScrollForPage,
@@ -15,6 +16,7 @@ import { showToast } from '../../../helpers/showToast';
 import { prettyBytes } from '../../../helpers/prettyBytes';
 import { renderCopyIcon24, renderLoaderCircleIcon24 } from '../../../icons';
 import { CustomTachyonMethods, TachyonShellMethods } from '../../methods';
+import { tr, isRussianLanguage } from '../../helpers/i18n';
 import {
   logger,
   markUiActionOwned,
@@ -30,18 +32,36 @@ import {
   renderFlagEmojis,
   renderSections,
   renderWidget,
+  renderDualWidget,
   renderConnections,
+  patchConnections,
+  patchExistingClientRowsByIp,
   IConnection,
 } from './partials';
 import { fetchServicesInfo } from '../../fetchers/fetchServicesInfo';
 import { fetchHostnames } from '../../fetchers/fetchHostnames';
 import { getExpandedSections, toggleSectionExpansion } from './actions';
-import { aggregateClientConnections } from './connections';
+import {
+  aggregateClientConnections,
+  aggregateTopDomains,
+  ITopDomain,
+} from './connections';
+import {
+  getAllActiveRoutes,
+  isServiceGroup,
+  ActiveRouteInfo,
+} from './activeRoute';
+import { ensureOutboundDisplayFlag } from '../../helpers/country';
 import {
   computeTrafficRates,
   createInitialTrafficRatesState,
   TrafficRatesState,
 } from './metrics';
+import {
+  getConfiguredServerInbounds,
+  renderInboundServersDashboardWidget,
+  switchToServersTab,
+} from './inboundServers';
 
 let expandedSections = getExpandedSections();
 
@@ -83,6 +103,9 @@ let dashboardDataUpdatesStarted = false;
 let dashboardDataUpdatesId = 0;
 let connectionsRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let currentConnections: IConnection[] = [];
+let currentTopDomains: ITopDomain[] = [];
+let lastRawConnections: any[] = [];
+let cachedHostnames = new Map<string, string>();
 let directSocketsFailed = false;
 let trafficRatesState: TrafficRatesState = createInitialTrafficRatesState();
 let pageUnloading = false;
@@ -120,7 +143,9 @@ function unsubscribeClashSockets() {
   clashSocketSubscriptions = [];
 }
 
-const customProxyLatencies = new Map<string, number>();
+export const customProxyLatencies = new Map<string, number>();
+const activeCountryFilters = new Map<string, string>();
+const activeRegionFilters = new Map<string, string>();
 const singleTestingOutboundCodes: Record<string, boolean> = {};
 let isTestingAllSections = false;
 
@@ -163,14 +188,17 @@ async function fetchDashboardSectionsOnce(mountId: number) {
 
   const prev = store.get().sectionsWidget;
   const hasRenderedData = prev.data.length > 0;
+  const nextLoading = prev.loading && !hasRenderedData;
 
-  store.set({
-    sectionsWidget: {
-      ...prev,
-      failed: false,
-      loading: prev.loading && !hasRenderedData,
-    },
-  });
+  if (prev.failed !== false || prev.loading !== nextLoading) {
+    store.set({
+      sectionsWidget: {
+        ...prev,
+        failed: false,
+        loading: nextLoading,
+      },
+    });
+  }
 
   try {
     const { data, success } = await CustomTachyonMethods.getDashboardSections();
@@ -491,6 +519,21 @@ async function followLatencyTestState(state: Tachyon.LatencyActionState) {
       await TachyonShellMethods.waitLatencyTestJob(jobId);
     }
 
+    const testedTags = extractTestedTags(
+      state.latency_type,
+      sectionName,
+      state.tag,
+    );
+    if (testedTags.length > 0) {
+      const startedAtMs =
+        typeof state.started_at === 'number'
+          ? state.started_at > 1e11
+            ? state.started_at
+            : state.started_at * 1000
+          : 0;
+      await applyTestedLatenciesResults(testedTags, startedAtMs);
+    }
+
     await completeLatencyTestJob(jobId, sectionName);
   } catch (error) {
     logger.error('[DASHBOARD]', 'followLatencyTestState failed', error);
@@ -621,6 +664,15 @@ async function connectToClashSockets(dataUpdatesId: number) {
       directSocketsFailed = false;
       const parsedMsg = JSON.parse(msg);
 
+      if (Array.isArray(parsedMsg.connections)) {
+        lastRawConnections = parsedMsg.connections;
+        currentConnections = aggregateClientConnections(
+          parsedMsg.connections,
+          cachedHostnames,
+        );
+        currentTopDomains = aggregateTopDomains(parsedMsg.connections);
+      }
+
       store.set({
         trafficTotalWidget: {
           loading: false,
@@ -638,6 +690,17 @@ async function connectToClashSockets(dataUpdatesId: number) {
             memory: parsedMsg.memory,
           },
         },
+      });
+
+      if (
+        Array.isArray(parsedMsg.connections) &&
+        expandedSections.has('active_clients')
+      ) {
+        renderConnectionsWidget();
+      }
+      renderInboundServersDashboardWidget({
+        rawConnections: lastRawConnections,
+        hostnames: cachedHostnames,
       });
     },
     (_err) => {
@@ -685,6 +748,7 @@ function stopDashboardDataUpdates() {
   // Only this tab's listeners, not socket.resetAll(): the monitoring tab holds
   // its own subscription to the same /connections URL and would go silent.
   unsubscribeClashSockets();
+  currentConnections = [];
 }
 
 function startDashboardDataUpdates() {
@@ -727,6 +791,7 @@ function syncDashboardServiceAvailability() {
 
   if (stopped || availability === 'loading') {
     stopDashboardDataUpdates();
+    void renderSystemServicesWidget();
     return;
   }
 
@@ -796,6 +861,100 @@ function getInitialLatencyProgress(
   }
 }
 
+export function extractTestedTags(
+  latencyType: Tachyon.LatencyActionState['latency_type'],
+  sectionName: string,
+  tag: string,
+): string[] {
+  if (latencyType === 'proxy_list') {
+    try {
+      const parsed = JSON.parse(tag);
+      if (Array.isArray(parsed)) {
+        return parsed.filter(
+          (item): item is string => typeof item === 'string' && item.length > 0,
+        );
+      }
+    } catch {
+      return [];
+    }
+  }
+
+  if (latencyType === 'group') {
+    const section = store
+      .get()
+      .sectionsWidget.data.find((s) => s.sectionName === sectionName);
+    if (section?.outbounds) {
+      return section.outbounds
+        .filter(
+          (o) => !['SING_BOX', 'ZAPRET', 'ZAPRET2', 'BYEDPI'].includes(o.type),
+        )
+        .map((o) => o.code);
+    }
+    return [];
+  }
+
+  if (latencyType === 'proxy') {
+    const parsedTag = tag.startsWith('[')
+      ? (JSON.parse(tag)[0] as string)
+      : tag;
+    return parsedTag ? [parsedTag] : [];
+  }
+
+  return [];
+}
+
+export async function applyTestedLatenciesResults(
+  testedTags: string[],
+  testStartedAt: number,
+  beforeTimes?: Map<string, string>,
+) {
+  if (!testedTags || testedTags.length === 0) {
+    return;
+  }
+
+  try {
+    const proxiesRes = await TachyonShellMethods.getClashApiProxies();
+    if (!proxiesRes.success || !proxiesRes.data) {
+      return;
+    }
+
+    const proxies = (proxiesRes.data as any)?.proxies || {};
+    for (const tag of testedTags) {
+      const proxy = proxies[tag] || proxies[tag.trim()];
+      const latest = proxy?.history?.[0];
+      const delay = typeof latest?.delay === 'number' ? latest.delay : 0;
+      const currentTime = typeof latest?.time === 'string' ? latest.time : '';
+      const prevTime = beforeTimes?.get(tag);
+
+      const historyTimestamp = currentTime ? Date.parse(currentTime) : 0;
+      const isFreshTimestamp =
+        testStartedAt > 0 &&
+        Number.isFinite(historyTimestamp) &&
+        historyTimestamp >= testStartedAt - 15000;
+
+      const isNewMeasurement =
+        Boolean(currentTime) &&
+        (prevTime != null ? currentTime !== prevTime : isFreshTimestamp);
+
+      if (isNewMeasurement && delay > 0) {
+        customProxyLatencies.set(tag, delay);
+      } else {
+        // Tag was tested, but either timed out (no history / old history) or errored
+        customProxyLatencies.set(tag, -1);
+      }
+    }
+
+    capMapSize(customProxyLatencies);
+    void renderSectionsWidget();
+  } catch (error) {
+    logger.warn(
+      '[DASHBOARD]',
+      'Failed to apply tested latencies results',
+      error,
+    );
+  }
+}
+
 async function handleTestLatency(
   latencyType: Tachyon.LatencyActionState['latency_type'],
   sectionName: string,
@@ -815,6 +974,26 @@ async function handleTestLatency(
   let jobId = '';
   let ownsJobFollow = false;
   let completed = false;
+  const testedTags = extractTestedTags(latencyType, sectionName, tag);
+  const testStartedAt = Date.now();
+  const beforeTimes = new Map<string, string>();
+
+  if (testedTags.length > 0 && latencyType !== 'proxy') {
+    try {
+      const beforeProxiesRes = await TachyonShellMethods.getClashApiProxies();
+      if (beforeProxiesRes.success && beforeProxiesRes.data) {
+        const proxies = (beforeProxiesRes.data as any)?.proxies || {};
+        for (const t of testedTags) {
+          const time = (proxies[t] || proxies[t.trim()])?.history?.[0]?.time;
+          if (typeof time === 'string') {
+            beforeTimes.set(t, time);
+          }
+        }
+      }
+    } catch (e) {
+      logger.debug('[DASHBOARD]', 'snapshot proxies before test failed', e);
+    }
+  }
 
   try {
     if (latencyType === 'proxy') {
@@ -865,6 +1044,7 @@ async function handleTestLatency(
       followedLatencyJobs.add(jobId);
       ownsJobFollow = true;
       await TachyonShellMethods.waitLatencyTestJob(jobId);
+      await applyTestedLatenciesResults(testedTags, testStartedAt, beforeTimes);
       await completeLatencyTestJob(jobId, sectionName);
       completed = true;
     }
@@ -919,6 +1099,7 @@ async function handleTestSingleOutbound(
   } finally {
     delete singleTestingOutboundCodes[outboundCode];
     void renderSectionsWidget();
+    void renderTrafficTotalWidget();
   }
 }
 
@@ -1054,6 +1235,9 @@ function getDetectedCountryFlag(country?: string) {
 
 function renderDetailsMemberName(member: Tachyon.UrlTestMember) {
   const countryFlag = getDetectedCountryFlag(member.country);
+  const displayTitle = countryFlag
+    ? member.displayName
+    : ensureOutboundDisplayFlag(member);
   const elements = countryFlag
     ? [
         E(
@@ -1061,9 +1245,9 @@ function renderDetailsMemberName(member: Tachyon.UrlTestMember) {
           { class: 'tachyon_dashboard-page__urltest-details__country-badge' },
           countryFlag,
         ),
-        ...renderFlagEmojis(member.displayName),
+        ...renderFlagEmojis(displayTitle),
       ]
-    : renderFlagEmojis(member.displayName);
+    : renderFlagEmojis(displayTitle);
 
   if (member.prefix) {
     const pStyle = resolvePrefixBadgeStyle(member.prefix);
@@ -1563,12 +1747,11 @@ function renderPrioritySelectedValue(info: Tachyon.PriorityInfo) {
       ),
       ...(selectedMember?.type
         ? [
-            E(
-              'span',
-              {
-                class: 'tachyon_dashboard-page__urltest-details__selected-type',
-              },
+            renderOutboundTypeWithPopover(
               selectedMember.type,
+              selectedMember.transport,
+              selectedMember.details,
+              'tachyon_dashboard-page__urltest-details__selected-type',
             ),
           ]
         : []),
@@ -1588,6 +1771,9 @@ function renderPrioritySelectedValue(info: Tachyon.PriorityInfo) {
 
 function renderPriorityMemberName(member: Tachyon.PriorityMember) {
   const countryFlag = getDetectedCountryFlag(member.country);
+  const displayTitle = countryFlag
+    ? member.displayName
+    : ensureOutboundDisplayFlag(member);
   const flagElements = countryFlag
     ? [
         E(
@@ -1598,15 +1784,35 @@ function renderPriorityMemberName(member: Tachyon.PriorityMember) {
       ]
     : [];
 
-  return [
+  const elements = [
     ...flagElements,
     E(
       'span',
       { class: 'tachyon_dashboard-page__urltest-details__priority-level' },
       `[${member.levelName}]`,
     ),
-    ...renderFlagEmojis(member.displayName),
+    ...renderFlagEmojis(displayTitle),
   ];
+
+  if (member.prefix) {
+    const pStyle = resolvePrefixBadgeStyle(member.prefix);
+    return [
+      ...elements,
+      E(
+        'span',
+        {
+          class: 'tachyon_dashboard-page__outbound-grid__item__prefix-badge',
+          style: `margin-left: 6px; background: ${pStyle.bg}; color: ${pStyle.color}; border: 1px solid ${pStyle.border}; font-weight: 600; cursor: pointer;`,
+          title: _('Click to customize prefix colors'),
+          click: (event: MouseEvent) =>
+            openPrefixColorPickerModal(member.prefix!, event),
+        },
+        renderFlagEmojis(member.prefix),
+      ),
+    ];
+  }
+
+  return elements;
 }
 
 function renderPriorityInfoModal(
@@ -1697,6 +1903,12 @@ function handleShowPriorityInfo(
     existing: customProxyLatencies,
     probe: (tag, timeout) =>
       TachyonShellMethods.getClashApiProxyLatency(tag, timeout),
+    // The core says what failed: the dial, the tls handshake, the status the
+    // server answered with. "An error occurred in the delay test" on its own
+    // leaves the user with nothing to act on.
+    onFailure: (tag, reason) => {
+      showToast(`${tag}: ${reason}`, 'error');
+    },
   }).then((measured) => {
     if (measured.size === 0 || !body.isConnected) {
       return;
@@ -1842,18 +2054,25 @@ function updateLatencyProgressInline(
       return false;
     }
 
-    const isConnectionNode = [
-      'vpn',
-      'awg',
-      'warp',
-      'anytls',
-      'snell',
-      'mieru',
-      'naive',
-      'sudoku',
-      'masque',
-      'openvpn',
-    ].includes(section.action || '');
+    const isConnectionNode =
+      !section.withTagSelect &&
+      [
+        'vpn',
+        'awg',
+        'warp',
+        'anytls',
+        'snell',
+        'mieru',
+        'naive',
+        'sudoku',
+        'masque',
+        'openvpn',
+        'openconnect',
+        'tewfai',
+        'trusttunnel',
+        'shadowtls',
+        'desync',
+      ].includes(section.action || '');
 
     const text = isConnectionNode
       ? _('Checking Connection...')
@@ -1871,12 +2090,30 @@ function updateLatencyProgressInline(
 
 // Renderer
 
+let sectionsRenderFrame: number | null = null;
+function scheduleSectionsWidgetRender() {
+  if (sectionsRenderFrame !== null) return;
+  const schedule =
+    typeof requestAnimationFrame !== 'undefined'
+      ? requestAnimationFrame
+      : (cb: () => void) => setTimeout(cb, 16);
+  sectionsRenderFrame = schedule(() => {
+    sectionsRenderFrame = null;
+    void renderSectionsWidget();
+  }) as unknown as number;
+}
+
 async function renderSectionsWidget() {
   logger.debug('[DASHBOARD]', 'renderSectionsWidget');
   const sectionsWidget = store.get().sectionsWidget;
   const container = document.getElementById('dashboard-sections-grid');
 
   if (!container) {
+    return;
+  }
+
+  if (isUserActivelyScrolling()) {
+    scheduleSectionsWidgetRender();
     return;
   }
 
@@ -1951,7 +2188,7 @@ async function renderSectionsWidget() {
 
     return preserveScrollForPage(() => {
       container.replaceChildren(renderedWidget);
-    });
+    }, container);
   }
 
   const hasTestableSections = sectionsWithCustomLatencies.some(
@@ -2027,13 +2264,50 @@ async function renderSectionsWidget() {
       )
     : null;
 
-  const renderedWidgets = sectionsWithCustomLatencies.map((section) =>
-    renderSections({
+  const renderedWidgets: HTMLElement[] = [];
+  let pendingServiceCards: HTMLElement[] = [];
+
+  const flushServiceCards = () => {
+    if (pendingServiceCards.length === 0) return;
+    if (pendingServiceCards.length === 1) {
+      renderedWidgets.push(pendingServiceCards[0]);
+    } else {
+      renderedWidgets.push(
+        E(
+          'div',
+          { class: 'tachyon_dashboard-page__service-sections-row' },
+          pendingServiceCards,
+        ),
+      );
+    }
+    pendingServiceCards = [];
+  };
+
+  for (const section of sectionsWithCustomLatencies) {
+    const widget = renderSections({
       loading: sectionsWidget.loading,
       failed: sectionsWidget.failed,
       section,
       isCollapsed: !expandedSections.has(section.code),
       onToggleCollapse: () => toggleSectionExpanded(section.code),
+      collapsedSourceGroups: expandedSections,
+      onToggleSourceGroupCollapse: (groupKey: string) =>
+        toggleSectionExpanded(groupKey),
+      activeCountryFilter: activeCountryFilters.get(section.sectionName),
+      onFilterCountry: (sectionName: string, countryCode?: string) => {
+        if (countryCode) {
+          activeCountryFilters.set(sectionName, countryCode);
+        } else {
+          activeCountryFilters.delete(sectionName);
+        }
+        void renderSectionsWidget();
+      },
+      activeRegionFilter: activeRegionFilters.get(section.sectionName) || 'all',
+      onFilterRegion: (sectionName: string, region: string) => {
+        activeRegionFilters.set(sectionName, region);
+        activeCountryFilters.delete(sectionName);
+        void renderSectionsWidget();
+      },
       latencyFetching: Boolean(
         sectionsWidget.latencyFetchingSections[section.sectionName],
       ),
@@ -2083,15 +2357,23 @@ async function renderSectionsWidget() {
       onUpdateSubscription: (section) => {
         void handleUpdateSubscription(section);
       },
-    }),
-  );
+    });
+
+    if (isServiceGroup(section)) {
+      pendingServiceCards.push(widget);
+    } else {
+      flushServiceCards();
+      renderedWidgets.push(widget);
+    }
+  }
+  flushServiceCards();
 
   return preserveScrollForPage(() => {
     container.replaceChildren(
       ...(testAllHeader ? [testAllHeader] : []),
       ...renderedWidgets,
     );
-  });
+  }, container);
 }
 
 function renderStoreWidget(
@@ -2104,9 +2386,13 @@ function renderStoreWidget(
     | 'tailscaleWidget',
   title: string,
   getItems: (data: any) => Array<{
-    key: string;
-    value: string;
-    attributes?: Record<string, string>;
+    key?: string | HTMLElement;
+    value: string | HTMLElement | (string | HTMLElement)[];
+    attributes?: {
+      class?: string;
+      title?: string;
+      [key: string]: string | undefined;
+    };
   }>,
   debugName: string,
 ) {
@@ -2138,21 +2424,59 @@ async function fetchConnections() {
   const activeEngine = store.get().activeEngine;
   const isSteer = activeEngine === 'steer' || activeEngine === 'steer-extended';
 
-  const shouldFetchHostnames = expandedSections.has('active_clients');
+  const hasEnabledInbounds = getConfiguredServerInbounds().some(
+    (s) => s.enabled,
+  );
+  const shouldFetchHostnames =
+    expandedSections.has('active_clients') || hasEnabledInbounds;
   const needsFallbackPolling =
     directSocketsFailed || !canUseDirectClashApi() || isSteer;
   if (!needsFallbackPolling && !shouldFetchHostnames) {
     return;
   }
   try {
+    if (!needsFallbackPolling && lastRawConnections.length > 0) {
+      const hostnames = await fetchHostnames();
+      if (hostnames.size > 0) {
+        cachedHostnames = hostnames;
+      }
+      currentConnections = aggregateClientConnections(
+        lastRawConnections,
+        cachedHostnames,
+      );
+      void renderSystemInfoWidget();
+      renderConnectionsWidget();
+      renderInboundServersDashboardWidget({
+        rawConnections: lastRawConnections,
+        hostnames: cachedHostnames,
+      });
+      return;
+    }
+
     const [res, hostnames] = await Promise.all([
       TachyonShellMethods.getClashApiConnections(),
       shouldFetchHostnames
         ? fetchHostnames()
-        : Promise.resolve(new Map<string, string>()),
+        : Promise.resolve(cachedHostnames),
     ]);
+    if (shouldFetchHostnames && hostnames.size > 0) {
+      cachedHostnames = hostnames;
+    }
     if (res.success && res.data && typeof res.data === 'object') {
       const payload = res.data as any;
+
+      if (Array.isArray(payload.connections)) {
+        lastRawConnections = payload.connections;
+        currentConnections = aggregateClientConnections(
+          payload.connections,
+          cachedHostnames,
+        );
+        currentTopDomains = aggregateTopDomains(payload.connections);
+      }
+      renderInboundServersDashboardWidget({
+        rawConnections: lastRawConnections,
+        hostnames: cachedHostnames,
+      });
 
       if (needsFallbackPolling) {
         const downloadTotal = Number(payload.downloadTotal) || 0;
@@ -2188,161 +2512,1036 @@ async function fetchConnections() {
             data: { connections: connCount, memory },
           },
         });
-      }
-
-      if (shouldFetchHostnames && Array.isArray(payload.connections)) {
-        currentConnections = aggregateClientConnections(
-          payload.connections,
-          hostnames,
-        );
+      } else if (shouldFetchHostnames) {
+        void renderSystemInfoWidget();
       }
     }
   } catch (_e) {
     // Ignore connections fetch errors
   }
-  renderConnectionsWidget();
+  scheduleConnectionsWidgetRender();
+}
+
+let connectionsRenderFrame: number | null = null;
+let connectionsWidgetHovered = false;
+let connectionsHoverDeferredTimer: ReturnType<typeof setTimeout> | null = null;
+let connectionsWidgetListenersAttached = false;
+
+function isConnectionsHoverActive(container: HTMLElement): boolean {
+  if (connectionsWidgetHovered) {
+    try {
+      const el = container.querySelector(
+        '.tachyon-client-row:hover, .tachyon_proto-popover-trigger:hover, .tachyon_proto-popover:hover, .tachyon-clients-container:hover',
+      );
+      if (el) return true;
+    } catch {
+      return true;
+    }
+  }
+  try {
+    return Boolean(
+      container.querySelector(
+        '.tachyon-client-row:hover, .tachyon_proto-popover-trigger:hover, .tachyon_proto-popover:hover, .tachyon-clients-container:hover',
+      ),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function attachConnectionsWidgetHoverListeners(container: HTMLElement) {
+  if (connectionsWidgetListenersAttached) return;
+  container.addEventListener('mouseenter', () => {
+    connectionsWidgetHovered = true;
+  });
+  container.addEventListener('mouseleave', () => {
+    connectionsWidgetHovered = false;
+    if (connectionsHoverDeferredTimer !== null) {
+      clearTimeout(connectionsHoverDeferredTimer);
+      connectionsHoverDeferredTimer = null;
+    }
+    scheduleConnectionsWidgetRender();
+  });
+  connectionsWidgetListenersAttached = true;
+}
+
+function scheduleConnectionsWidgetRender() {
+  if (connectionsRenderFrame !== null) return;
+  const schedule =
+    typeof requestAnimationFrame !== 'undefined'
+      ? requestAnimationFrame
+      : (cb: () => void) => setTimeout(cb, 16);
+  connectionsRenderFrame = schedule(() => {
+    connectionsRenderFrame = null;
+    renderConnectionsWidget();
+  }) as unknown as number;
 }
 
 function renderConnectionsWidget() {
   const container = document.getElementById('dashboard-connections-grid');
   if (!container) return;
 
-  container.replaceChildren(
-    renderConnections(
+  attachConnectionsWidgetHoverListeners(container);
+
+  if (isUserActivelyScrolling()) {
+    scheduleConnectionsWidgetRender();
+    return;
+  }
+
+  const isCollapsed = !expandedSections.has('active_clients');
+
+  // Fast-path in-place DOM update without replacing children
+  if (
+    patchConnections(
+      container,
       currentConnections,
-      !expandedSections.has('active_clients'),
-      () => toggleSectionExpanded('active_clients'),
-    ),
+      isCollapsed,
+      currentTopDomains,
+    )
+  ) {
+    return;
+  }
+
+  const clientsContainer = container.querySelector(
+    '.tachyon-clients-container',
   );
+  const wasCollapsed = !clientsContainer;
+  const isCollapseToggled = isCollapsed !== wasCollapsed;
+
+  // If order changed or clients connected/disconnected while user is hovering over
+  // rows or popovers, do not recreate DOM underneath their cursor.
+  // Patch existing row values in-place and defer full re-render until hover ends.
+  if (!isCollapseToggled && isConnectionsHoverActive(container)) {
+    patchExistingClientRowsByIp(container, currentConnections);
+
+    if (connectionsHoverDeferredTimer === null) {
+      connectionsHoverDeferredTimer = setTimeout(() => {
+        connectionsHoverDeferredTimer = null;
+        scheduleConnectionsWidgetRender();
+      }, 1000);
+    }
+    return;
+  }
+
+  if (connectionsHoverDeferredTimer !== null) {
+    clearTimeout(connectionsHoverDeferredTimer);
+    connectionsHoverDeferredTimer = null;
+  }
+
+  preserveScrollForPage(() => {
+    container.replaceChildren(
+      renderConnections(
+        currentConnections,
+        isCollapsed,
+        () => toggleSectionExpanded('active_clients'),
+        currentTopDomains,
+      ),
+    );
+  }, container);
+}
+
+export function getSectionConnectionStats(
+  sectionName: string,
+  totalProxySections: number,
+  rawConns: Array<{
+    chains?: string[];
+    upload?: number | string;
+    download?: number | string;
+  }>,
+  totals: {
+    downloadTotal?: number;
+    uploadTotal?: number;
+    downSpeed?: number;
+    upSpeed?: number;
+  },
+) {
+  if (totalProxySections <= 1) {
+    return {
+      conns: rawConns.length,
+      upload: totals.uploadTotal || 0,
+      download: totals.downloadTotal || 0,
+      downSpeed: totals.downSpeed || 0,
+      upSpeed: totals.upSpeed || 0,
+    };
+  }
+
+  const target = (sectionName || '').toLowerCase();
+  let conns = 0;
+  let upload = 0;
+  let download = 0;
+
+  for (const c of rawConns) {
+    const rawChains = Array.isArray(c.chains)
+      ? c.chains
+      : Array.isArray((c as any).metadata?.chains)
+        ? (c as any).metadata.chains
+        : [];
+    const chains = rawChains.map((ch: any) => String(ch).toLowerCase());
+    if (chains.some((ch: string) => ch === target || ch.includes(target))) {
+      conns++;
+      upload += Number(c.upload) || 0;
+      download += Number(c.download) || 0;
+    }
+  }
+
+  return {
+    conns,
+    upload,
+    download,
+    downSpeed: target === 'main' ? totals.downSpeed || 0 : 0,
+    upSpeed: target === 'main' ? totals.upSpeed || 0 : 0,
+  };
+}
+
+export async function renderSectionDashboardWidgets() {
+  const container = document.getElementById('dashboard-widgets-sections-list');
+  if (!container) return;
+
+  const sectionsWidget = store.get().sectionsWidget;
+  const sectionsWithCustomLatencies = sectionsWidget.data.map((section) => ({
+    ...section,
+    outbounds: section.outbounds.map((outbound) => {
+      const customLatency = customProxyLatencies.get(outbound.code);
+      return {
+        ...outbound,
+        latency: customLatency ?? outbound.latency,
+        urlTestInfo: outbound.urlTestInfo
+          ? {
+              ...outbound.urlTestInfo,
+              outbounds: outbound.urlTestInfo.outbounds.map((member) => ({
+                ...member,
+                latency:
+                  customProxyLatencies.get(member.code) ?? member.latency,
+              })),
+            }
+          : undefined,
+        priorityInfo: outbound.priorityInfo
+          ? {
+              ...outbound.priorityInfo,
+              outbounds: outbound.priorityInfo.outbounds.map((member) => ({
+                ...member,
+                latency:
+                  customProxyLatencies.get(member.code) ?? member.latency,
+              })),
+            }
+          : undefined,
+      };
+    }),
+  }));
+
+  const activeRoutes = getAllActiveRoutes(sectionsWithCustomLatencies);
+  const isCheckingLatency =
+    Object.keys(sectionsWidget.latencyFetchingSections || {}).length > 0 ||
+    Object.keys(singleTestingOutboundCodes).length > 0;
+
+  const bandwidth = store.get().bandwidthWidget.data;
+  const total = store.get().trafficTotalWidget.data;
+  const loading = sectionsWidget.loading;
+  const failed = sectionsWidget.failed;
+
+  const routesToRender: ActiveRouteInfo[] =
+    activeRoutes.length > 0
+      ? activeRoutes
+      : [
+          {
+            sectionName: 'main',
+            sectionDisplayName: 'Main',
+            name: tr('Ожидание / Напрямую', 'Standby / Direct'),
+            selector: '—',
+            latency: -1,
+            type: 'Proxy',
+          },
+        ];
+
+  const totalProxySections = routesToRender.length;
+
+  // Check if we can update existing cards in-place without touching DOM tree
+  const existingCards = Array.from(
+    container.querySelectorAll<HTMLElement>('[data-section-card]'),
+  );
+  const existingNames = existingCards.map((c) =>
+    c.getAttribute('data-section-card'),
+  );
+  const newNames = routesToRender.map((r) => r.sectionName || 'main');
+
+  const canUpdateInPlace =
+    existingCards.length > 0 &&
+    existingCards.length === routesToRender.length &&
+    existingNames.every((name, i) => name === newNames[i]) &&
+    !loading &&
+    !failed;
+
+  if (canUpdateInPlace) {
+    routesToRender.forEach((route, idx) => {
+      const card = existingCards[idx];
+      const sectionName = route.sectionName || 'main';
+      const stats = getSectionConnectionStats(
+        sectionName,
+        totalProxySections,
+        lastRawConnections,
+        {
+          downloadTotal: total.downloadTotal,
+          uploadTotal: total.uploadTotal,
+          downSpeed: bandwidth.down,
+          upSpeed: bandwidth.up,
+        },
+      );
+
+      const downPill = card.querySelector<HTMLElement>(
+        '[data-metric="down-speed"]',
+      );
+      if (downPill) {
+        const nextText = `↓ ${prettyBytes(stats.downSpeed)}/s`;
+        if (downPill.textContent !== nextText) downPill.textContent = nextText;
+      }
+
+      const upPill = card.querySelector<HTMLElement>(
+        '[data-metric="up-speed"]',
+      );
+      if (upPill) {
+        const nextText = `↑ ${prettyBytes(stats.upSpeed)}/s`;
+        if (upPill.textContent !== nextText) upPill.textContent = nextText;
+      }
+
+      const sDownPill = card.querySelector<HTMLElement>(
+        '[data-metric="session-down"]',
+      );
+      const sUpPill = card.querySelector<HTMLElement>(
+        '[data-metric="session-up"]',
+      );
+      if (sDownPill && sUpPill) {
+        const nextDown = `↓ ${prettyBytes(stats.download || 0)}`;
+        const nextUp = `↑ ${prettyBytes(stats.upload || 0)}`;
+        if (sDownPill.textContent !== nextDown)
+          sDownPill.textContent = nextDown;
+        if (sUpPill.textContent !== nextUp) sUpPill.textContent = nextUp;
+      } else {
+        const sTraffic = card.querySelector<HTMLElement>(
+          '[data-metric="session-traffic"]',
+        );
+        if (sTraffic) {
+          const nextText = `▼ ${prettyBytes(stats.download || 0)} • ▲ ${prettyBytes(stats.upload || 0)}`;
+          if (sTraffic.textContent !== nextText)
+            sTraffic.textContent = nextText;
+        }
+      }
+
+      const connsPill = card.querySelector<HTMLElement>(
+        '[data-metric="conns"]',
+      );
+      if (connsPill) {
+        const nextText = String(stats.conns);
+        if (connsPill.textContent !== nextText)
+          connsPill.textContent = nextText;
+      }
+
+      const latencyPill = card.querySelector<HTMLElement>(
+        '[data-metric="latency"]',
+      );
+      if (latencyPill) {
+        const hasPillClass = latencyPill.className.includes(
+          'tachyon-latency-pill',
+        );
+        if (hasPillClass) {
+          const latencyClass =
+            route.latency > 0
+              ? route.latency <= 150
+                ? 'tachyon-latency-pill tachyon-latency-pill--fast'
+                : route.latency <= 300
+                  ? 'tachyon-latency-pill tachyon-latency-pill--medium'
+                  : 'tachyon-latency-pill tachyon-latency-pill--slow'
+              : 'tachyon-latency-pill tachyon-latency-pill--neutral';
+          if (latencyPill.className !== latencyClass)
+            latencyPill.className = latencyClass;
+        } else {
+          const latencyClass = route.latency > 0 ? 'tachyon-stat--down' : '';
+          if (latencyPill.className !== latencyClass)
+            latencyPill.className = latencyClass;
+        }
+        const latencyText =
+          route.latency > 0
+            ? `${route.latency}ms`
+            : isCheckingLatency
+              ? tr('Проверка...', 'Checking...')
+              : '—';
+        if (latencyPill.textContent !== latencyText)
+          latencyPill.textContent = latencyText;
+      }
+
+      const serverEl = card.querySelector<HTMLElement>(
+        '[data-metric="server"]',
+      );
+      if (serverEl) {
+        if (serverEl.getAttribute('data-server-name') !== route.name) {
+          serverEl.setAttribute('data-server-name', route.name);
+          const flagNodes = renderFlagEmojis(
+            ensureOutboundDisplayFlag({ displayName: route.name }),
+          );
+          serverEl.replaceChildren(
+            ...(Array.isArray(flagNodes) ? flagNodes : [flagNodes]),
+          );
+        }
+      }
+
+      const selectorEl = card.querySelector<HTMLElement>(
+        '[data-metric="selector"]',
+      );
+      if (selectorEl && selectorEl.textContent !== route.selector) {
+        selectorEl.textContent = route.selector;
+      }
+
+      const protoEl = card.querySelector<HTMLElement>(
+        '[data-metric="protocol"]',
+      );
+      if (protoEl) {
+        const protoText = route.type || '—';
+        if (protoEl.textContent !== protoText) protoEl.textContent = protoText;
+      }
+    });
+    return;
+  }
+
+  // If full DOM re-creation is required, defer while user is actively scrolling
+  if (isUserActivelyScrolling()) {
+    scheduleSectionDashboardWidgetsRender();
+    return;
+  }
+
+  const widgets = routesToRender.map((route) => {
+    const sectionName = route.sectionName || 'main';
+    const sectionDisplayName = route.sectionDisplayName || sectionName;
+    const stats = getSectionConnectionStats(
+      sectionName,
+      totalProxySections,
+      lastRawConnections,
+      {
+        downloadTotal: total.downloadTotal,
+        uploadTotal: total.uploadTotal,
+        downSpeed: bandwidth.down,
+        upSpeed: bandwidth.up,
+      },
+    );
+
+    const latencyClass =
+      route.latency > 0
+        ? route.latency <= 150
+          ? 'tachyon-latency-pill tachyon-latency-pill--fast'
+          : route.latency <= 300
+            ? 'tachyon-latency-pill tachyon-latency-pill--medium'
+            : 'tachyon-latency-pill tachyon-latency-pill--slow'
+        : 'tachyon-latency-pill tachyon-latency-pill--neutral';
+
+    const latencyValue =
+      route.latency > 0
+        ? E('span', { class: latencyClass }, `${route.latency}ms`)
+        : isCheckingLatency
+          ? E('span', { class: latencyClass }, tr('Проверка...', 'Checking...'))
+          : E('span', { class: latencyClass }, '—');
+
+    const routeItems = [
+      {
+        key: tr('Сервер', 'Server'),
+        value: E(
+          'span',
+          {
+            class: 'tachyon-route-pill tachyon-route-pill--server',
+            'data-metric': 'server',
+            'data-server-name': route.name,
+          } as any,
+          renderFlagEmojis(
+            ensureOutboundDisplayFlag({ displayName: route.name }),
+          ),
+        ),
+      },
+      {
+        key: tr('Селектор', 'Selector'),
+        value: E(
+          'span',
+          {
+            class: 'tachyon-route-pill tachyon-route-pill--selector',
+            'data-metric': 'selector',
+          } as any,
+          route.selector,
+        ),
+      },
+      {
+        key: tr('Задержка', 'Latency'),
+        value: latencyValue,
+      },
+      {
+        key: tr('Протокол', 'Protocol'),
+        value:
+          route.type && route.type !== '-'
+            ? E(
+                'span',
+                {
+                  'data-metric': 'protocol',
+                  class: 'tachyon-protocol-pill',
+                } as any,
+                route.type,
+              )
+            : '-',
+      },
+    ];
+
+    const trafficItems = [
+      {
+        key: tr('Входящий', 'Downlink'),
+        value: E(
+          'span',
+          {
+            class: 'tachyon-stat-pill tachyon-stat-pill--down',
+            'data-metric': 'down-speed',
+          } as any,
+          `↓ ${prettyBytes(stats.downSpeed)}/s`,
+        ),
+      },
+      {
+        key: tr('Исходящий', 'Uplink'),
+        value: E(
+          'span',
+          {
+            class: 'tachyon-stat-pill tachyon-stat-pill--up',
+            'data-metric': 'up-speed',
+          } as any,
+          `↑ ${prettyBytes(stats.upSpeed)}/s`,
+        ),
+      },
+      {
+        key:
+          totalProxySections <= 1
+            ? tr('За сессию', 'Session total')
+            : tr('Трафик секции', 'Section traffic'),
+        value: E('span', { class: 'tachyon-stat--session' } as any, [
+          E(
+            'span',
+            {
+              class: 'tachyon-traffic-pill tachyon-traffic-pill--down',
+              'data-metric': 'session-down',
+            } as any,
+            `↓ ${prettyBytes(stats.download || 0)}`,
+          ),
+          E(
+            'span',
+            {
+              class: 'tachyon-traffic-pill tachyon-traffic-pill--up',
+              'data-metric': 'session-up',
+            } as any,
+            `↑ ${prettyBytes(stats.upload || 0)}`,
+          ),
+        ]),
+      },
+      {
+        key: tr('Соединения', 'Connections'),
+        value: E(
+          'span',
+          {
+            class: 'tachyon-stat-pill tachyon-stat-pill--conns',
+            'data-metric': 'conns',
+          } as any,
+          String(stats.conns),
+        ),
+      },
+    ];
+
+    return renderDualWidget({
+      loading,
+      failed,
+      title: `${tr('Секция', 'Section')}: ${sectionDisplayName}`,
+      badge: tr('Активна', 'Active'),
+      attributes: {
+        'data-section-card': sectionName,
+      },
+      columns: [
+        {
+          title: tr('Активный маршрут', 'Active Route'),
+          items: routeItems,
+        },
+        {
+          title: tr('Трафик и скорость', 'Traffic & Speed'),
+          items: trafficItems,
+        },
+      ],
+    });
+  });
+
+  preserveScrollForPage(() => {
+    container.replaceChildren(...widgets);
+  }, container);
+}
+
+export async function renderSystemServicesWidget() {
+  const container = document.getElementById('dashboard-widget-system-services');
+  if (!container) return;
+
+  if (isUserActivelyScrolling()) {
+    scheduleSystemServicesWidgetRender();
+    return;
+  }
+
+  const sysState = store.get().systemInfoWidget;
+  const srvState = store.get().servicesInfoWidget;
+  const sections = store.get().sectionsWidget.data || [];
+  const proxySections = sections.filter(
+    (g) => !isServiceGroup(g) && g.outbounds && g.outbounds.length > 0,
+  );
+
+  const loading = sysState.loading && srvState.loading;
+  const failed = sysState.failed && srvState.failed;
+  const srvData = srvState.data;
+  const isTachyonRunning = Boolean(srvData?.tachyonRunning);
+  const connectionsCount = isTachyonRunning
+    ? sysState.data?.connections || 0
+    : 0;
+  const activeSectionsCount = isTachyonRunning ? proxySections.length : 0;
+  const activeClientsCount = isTachyonRunning ? currentConnections.length : 0;
+  const enabledInboundsCount = isTachyonRunning
+    ? getConfiguredServerInbounds().filter((s) => s.enabled).length
+    : 0;
+
+  const routingItems: Array<{
+    key?: string | HTMLElement;
+    value: string | HTMLElement | (string | HTMLElement)[];
+    attributes?: Record<string, string>;
+    onClick?: (e: MouseEvent) => void;
+  }> = [
+    {
+      key: tr('Режим работы', 'Mode'),
+      value: E(
+        'span',
+        { class: 'tachyon-mode-pill tachyon-mode-pill--active' },
+        'TProxy + Fake-IP',
+      ),
+    },
+    {
+      key: tr('Всего соединений', 'Active Connections'),
+      value: E(
+        'span',
+        { class: 'tachyon-stat-pill tachyon-stat-pill--conns' },
+        String(connectionsCount),
+      ),
+    },
+    {
+      key: tr('Секции правил', 'Routing Sections'),
+      value: E(
+        'span',
+        { class: 'tachyon-stat-pill tachyon-stat-pill--conns' },
+        String(activeSectionsCount),
+      ),
+    },
+    {
+      key: tr('Активные клиенты', 'Active Clients'),
+      value: E(
+        'span',
+        { class: 'tachyon-stat-pill tachyon-stat-pill--conns' },
+        String(activeClientsCount),
+      ),
+    },
+  ];
+
+  if (enabledInboundsCount > 0) {
+    routingItems.push({
+      key: tr('Входящие серверы', 'Inbound Servers'),
+      value: E(
+        'span',
+        {
+          class: 'tachyon-stat-pill tachyon-stat-pill--conns',
+          style: 'cursor: pointer;',
+        },
+        `${enabledInboundsCount} ${tr('активных', 'active')}`,
+      ),
+      onClick: () => switchToServersTab(),
+    });
+  }
+
+  const srvItems: Array<{
+    key?: string | HTMLElement;
+    value: string | HTMLElement | (string | HTMLElement)[];
+    attributes?: Record<string, string>;
+  }> = [];
+
+  if (srvData) {
+    const tachyonUptime = formatLocalizedUptime(
+      srvData.tachyonUptimePretty,
+      srvData.tachyonUptimeSeconds,
+    );
+    const tachyonTooltip = formatServiceTooltip({
+      pid: srvData.tachyonPid,
+      uptimePretty: tachyonUptime,
+    });
+
+    const singboxUptime = formatLocalizedUptime(
+      srvData.singboxUptimePretty,
+      srvData.singboxUptimeSeconds,
+    );
+    const singboxTooltip = formatServiceTooltip({
+      pid: srvData.singboxPid,
+      uptimePretty: singboxUptime,
+    });
+
+    srvItems.push(
+      renderServiceRowItem('Tachyon', {
+        running: srvData.tachyonRunning,
+        memoryMb: srvData.tachyonMemoryMb,
+        uptimePretty: tachyonUptime,
+        tooltip: tachyonTooltip,
+      }),
+      renderServiceRowItem(
+        (() => {
+          if (srvData.engineVariant) {
+            return srvData.engineVariant;
+          }
+          if (
+            store.get().activeEngine === 'steer' ||
+            store.get().activeEngine === 'steer-extended'
+          ) {
+            return 'Steer';
+          }
+          const systemInfo = store.get().diagnosticsSystemInfo;
+          if (systemInfo?.sing_box_tachyon_core) {
+            return 'Tachyon Core';
+          }
+          if (systemInfo?.sing_box_lx) {
+            return 'Sing-box LX';
+          }
+          if (systemInfo?.sing_box_extended) {
+            return 'Sing-box Ext';
+          }
+          return 'Sing-box';
+        })(),
+        {
+          running: srvData.singbox,
+          memoryMb: srvData.singboxMemoryMb,
+          uptimePretty: singboxUptime,
+          tooltip: singboxTooltip,
+        },
+      ),
+    );
+
+    if (srvData.dnsmasqRunning != null) {
+      const dnsmasqUptime = formatLocalizedUptime(
+        srvData.dnsmasqUptimePretty,
+        srvData.dnsmasqUptimeSeconds,
+      );
+      const dnsmasqTooltip = formatServiceTooltip({
+        pid: srvData.dnsmasqPid,
+        uptimePretty: dnsmasqUptime,
+      });
+
+      srvItems.push(
+        renderServiceRowItem('Dnsmasq (DNS)', {
+          running: srvData.dnsmasqRunning,
+          memoryMb: srvData.dnsmasqMemoryMb,
+          uptimePretty: dnsmasqUptime,
+          tooltip: dnsmasqTooltip,
+        }),
+      );
+    }
+
+    if (srvData.zapret2Running) {
+      const zapret2Uptime = formatLocalizedUptime(
+        srvData.zapret2UptimePretty,
+        srvData.zapret2UptimeSeconds,
+      );
+      const zapret2Tooltip = formatServiceTooltip({
+        pid: srvData.zapret2Pid,
+        uptimePretty: zapret2Uptime,
+      });
+
+      srvItems.push(
+        renderServiceRowItem('Zapret2', {
+          running: srvData.zapret2Running,
+          memoryMb: srvData.zapret2MemoryMb,
+          uptimePretty: zapret2Uptime,
+          tooltip: zapret2Tooltip,
+        }),
+      );
+    }
+  }
+
+  const widget = renderDualWidget({
+    loading,
+    failed,
+    title: tr('Система и сервисы', 'System & Services'),
+    badge: tr('Активна', 'Active'),
+    attributes: {
+      class: 'tachyon-dual-card--system-pinned',
+    },
+    columns: [
+      {
+        title: tr('Маршрутизация и правила', 'Routing & Rules'),
+        items: routingItems,
+      },
+      {
+        title: tr('Службы роутера', 'Router Services'),
+        items: srvItems,
+      },
+    ],
+  });
+
+  preserveScrollForPage(() => {
+    container.replaceChildren(widget);
+  }, container);
+}
+
+let sectionWidgetsRenderFrame: number | null = null;
+function scheduleSectionDashboardWidgetsRender() {
+  if (sectionWidgetsRenderFrame !== null) return;
+  const schedule =
+    typeof requestAnimationFrame !== 'undefined'
+      ? requestAnimationFrame
+      : (cb: () => void) => setTimeout(cb, 16);
+  sectionWidgetsRenderFrame = schedule(() => {
+    sectionWidgetsRenderFrame = null;
+    void renderSectionDashboardWidgets();
+    renderInboundServersDashboardWidget({
+      rawConnections: lastRawConnections,
+      hostnames: cachedHostnames,
+    });
+  }) as unknown as number;
+}
+
+let systemServicesRenderFrame: number | null = null;
+function scheduleSystemServicesWidgetRender() {
+  if (systemServicesRenderFrame !== null) return;
+  const schedule =
+    typeof requestAnimationFrame !== 'undefined'
+      ? requestAnimationFrame
+      : (cb: () => void) => setTimeout(cb, 16);
+  systemServicesRenderFrame = schedule(() => {
+    systemServicesRenderFrame = null;
+    void renderSystemServicesWidget();
+  }) as unknown as number;
 }
 
 async function renderBandwidthWidget() {
-  renderStoreWidget(
-    'dashboard-widget-traffic',
-    'bandwidthWidget',
-    _('Traffic'),
-    (data) => [
-      { key: _('Uplink'), value: `${prettyBytes(data.up)}/s` },
-      { key: _('Downlink'), value: `${prettyBytes(data.down)}/s` },
-    ],
-    'renderBandwidthWidget',
-  );
+  scheduleSectionDashboardWidgetsRender();
 }
 
 async function renderTrafficTotalWidget() {
-  renderStoreWidget(
-    'dashboard-widget-traffic-total',
-    'trafficTotalWidget',
-    _('Traffic Total'),
-    (data) => [
-      { key: _('Uplink'), value: String(prettyBytes(data.uploadTotal)) },
-      { key: _('Downlink'), value: String(prettyBytes(data.downloadTotal)) },
-    ],
-    'renderTrafficTotalWidget',
-  );
+  scheduleSectionDashboardWidgetsRender();
 }
 
 async function renderSystemInfoWidget() {
-  renderStoreWidget(
-    'dashboard-widget-system-info',
-    'systemInfoWidget',
-    _('System info'),
-    (data) => [
-      { key: _('Active Connections'), value: String(data.connections) },
-      { key: _('Memory Usage'), value: String(prettyBytes(data.memory)) },
-    ],
-    'renderSystemInfoWidget',
-  );
+  scheduleSystemServicesWidgetRender();
 }
 
 async function renderServicesInfoWidget() {
-  renderStoreWidget(
-    'dashboard-widget-service-info',
-    'servicesInfoWidget',
-    _('Services info'),
-    (data) => {
-      const items = [
-        {
-          key: 'Tachyon',
-          value: data.tachyonRunning
-            ? data.tachyonMemoryMb
-              ? `\u2713 (${data.tachyonMemoryMb} MB)`
-              : '\u2713'
-            : '\u2717',
-          attributes: {
-            class: data.tachyonRunning
-              ? 'tachyon_dashboard-page__widgets-section__item__row--success'
-              : 'tachyon_dashboard-page__widgets-section__item__row--error',
-          },
-        },
-        {
-          key: (() => {
-            if (
-              store.get().activeEngine === 'steer' ||
-              store.get().activeEngine === 'steer-extended'
-            ) {
-              return 'Steer';
-            }
-            const systemInfo = store.get().diagnosticsSystemInfo;
-            if (systemInfo.sing_box_tachyon_core) {
-              return 'Tachyon Core';
-            }
-            return 'Sing-box';
-          })(),
-          value: data.singbox
-            ? data.singboxMemoryMb
-              ? `\u2713 (${data.singboxMemoryMb} MB)`
-              : '\u2713'
-            : '\u2717',
-          attributes: {
-            class: data.singbox
-              ? 'tachyon_dashboard-page__widgets-section__item__row--success'
-              : 'tachyon_dashboard-page__widgets-section__item__row--error',
-          },
-        },
-      ];
+  scheduleSystemServicesWidgetRender();
+}
 
-      if (data.zapret2Running) {
-        items.push({
-          key: 'Zapret2',
-          value: data.zapret2MemoryMb
-            ? `\u2713 (${data.zapret2MemoryMb} MB)`
-            : '\u2713',
-          attributes: {
+export function formatServiceRowValue(options: {
+  running: boolean | number;
+  memoryMb?: number;
+  uptimePretty?: string;
+  version?: string;
+  extraSuffix?: string;
+}): string {
+  if (!options.running) {
+    const versionPart = options.version
+      ? ` [v${options.version.replace(/^v/, '')}]`
+      : '';
+    return `\u2717${versionPart}`;
+  }
+
+  const parts: string[] = ['\u2713'];
+  if (options.memoryMb) {
+    parts[0] += ` (${options.memoryMb} MB)`;
+  }
+  if (options.uptimePretty) {
+    parts.push(options.uptimePretty);
+  }
+  let res = parts.join(' \u2022 ');
+  if (options.version) {
+    res += ` [v${options.version.replace(/^v/, '')}]`;
+  }
+  if (options.extraSuffix) {
+    res += options.extraSuffix;
+  }
+  return res;
+}
+
+export function formatLocalizedUptime(
+  uptimePretty?: string,
+  uptimeSeconds?: number,
+): string | undefined {
+  if (uptimeSeconds != null && uptimeSeconds >= 0) {
+    if (isRussianLanguage()) {
+      if (uptimeSeconds < 60) return `${uptimeSeconds}с`;
+      const min = Math.floor(uptimeSeconds / 60);
+      if (min < 60) return `${min}м`;
+      const hours = Math.floor(min / 60);
+      const remMin = min % 60;
+      if (hours < 24) return `${hours}ч ${remMin}м`;
+      const days = Math.floor(hours / 24);
+      const remHours = hours % 24;
+      return `${days}д ${remHours}ч`;
+    } else {
+      if (uptimeSeconds < 60) return `${uptimeSeconds}s`;
+      const min = Math.floor(uptimeSeconds / 60);
+      if (min < 60) return `${min}m`;
+      const hours = Math.floor(min / 60);
+      const remMin = min % 60;
+      if (hours < 24) return `${hours}h ${remMin}m`;
+      const days = Math.floor(hours / 24);
+      const remHours = hours % 24;
+      return `${days}d ${remHours}h`;
+    }
+  }
+
+  if (!uptimePretty) return undefined;
+
+  if (!isRussianLanguage()) {
+    return uptimePretty
+      .replace(/(\d+)\s*д/g, '$1d ')
+      .replace(/(\d+)\s*ч/g, '$1h ')
+      .replace(/(\d+)\s*м/g, '$1m ')
+      .replace(/(\d+)\s*с/g, '$1s ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  return uptimePretty;
+}
+
+export function formatServiceTooltip(options: {
+  pid?: number;
+  uptimePretty?: string;
+}): string | undefined {
+  const parts: string[] = [];
+  if (options.pid) {
+    parts.push(`PID: ${options.pid}`);
+  }
+  if (options.uptimePretty) {
+    parts.push(`${tr('Время работы', 'Uptime')}: ${options.uptimePretty}`);
+  }
+  return parts.length > 0 ? parts.join(' \u2022 ') : undefined;
+}
+
+export function renderServiceRowItem(
+  name: string,
+  options: {
+    running: boolean | number;
+    memoryMb?: number;
+    uptimePretty?: string;
+    version?: string;
+    extraSuffix?: string;
+    tooltip?: string;
+  },
+) {
+  const isRunning = Boolean(options.running);
+  const keyEl = E('span', { class: 'tachyon-service-key' }, [
+    E('span', {
+      class: `tachyon-service-dot ${isRunning ? 'tachyon-service-dot--online' : 'tachyon-service-dot--offline'}`,
+    }),
+    E('span', { class: 'tachyon-service-name' }, name),
+  ]);
+
+  const valueChildren: HTMLElement[] = [];
+  if (isRunning) {
+    const hasMemory = options.memoryMb != null && options.memoryMb > 0;
+    const hasUptime = Boolean(options.uptimePretty);
+
+    if (hasMemory) {
+      valueChildren.push(
+        E(
+          'span',
+          { class: 'tachyon-service-pill tachyon-service-pill--ram' },
+          `${options.memoryMb} MB`,
+        ),
+      );
+    } else if (hasUptime) {
+      valueChildren.push(
+        E(
+          'span',
+          {
             class:
-              'tachyon_dashboard-page__widgets-section__item__row--success',
+              'tachyon-service-pill tachyon-service-pill--ram tachyon-service-pill--empty',
           },
-        });
-      }
+          '—',
+        ),
+      );
+    }
 
-      if (data.dnsmasqRunning != null) {
-        let cacheDetail = '';
-        if (data.dnsmasqLocalCacheEnabled && data.dnsmasqCacheSize) {
-          const approxMb = (
-            (data.dnsmasqCacheSize * 120) /
-            (1024 * 1024)
-          ).toFixed(1);
-          cacheDetail = ` [${_('Cache')}: ${approxMb} MB]`;
-        }
-        items.push({
-          key: 'Dnsmasq (DNS)',
-          value: data.dnsmasqRunning
-            ? data.dnsmasqMemoryMb
-              ? `\u2713 (${data.dnsmasqMemoryMb} MB)${cacheDetail}`
-              : `\u2713${cacheDetail}`
-            : '\u2717',
-          attributes: {
-            class: data.dnsmasqRunning
-              ? 'tachyon_dashboard-page__widgets-section__item__row--success'
-              : 'tachyon_dashboard-page__widgets-section__item__row--error',
+    if (hasUptime) {
+      valueChildren.push(
+        E(
+          'span',
+          { class: 'tachyon-service-pill tachyon-service-pill--uptime' },
+          options.uptimePretty,
+        ),
+      );
+    } else if (hasMemory) {
+      valueChildren.push(
+        E(
+          'span',
+          {
+            class:
+              'tachyon-service-pill tachyon-service-pill--uptime tachyon-service-pill--empty',
           },
-        });
-      }
+          '—',
+        ),
+      );
+    }
 
-      return items;
+    if (options.version) {
+      valueChildren.push(
+        E(
+          'span',
+          { class: 'tachyon-service-pill tachyon-service-pill--version' },
+          `v${options.version.replace(/^v/, '')}`,
+        ),
+      );
+    }
+    if (options.extraSuffix) {
+      valueChildren.push(
+        E(
+          'span',
+          { style: 'font-size: 11px; opacity: 0.8;' },
+          options.extraSuffix,
+        ),
+      );
+    }
+    if (valueChildren.length === 0) {
+      valueChildren.push(
+        E(
+          'span',
+          { class: 'tachyon-service-pill tachyon-service-pill--active' },
+          tr('Работает', 'Active'),
+        ),
+      );
+    }
+  } else {
+    valueChildren.push(
+      E(
+        'span',
+        { class: 'tachyon-service-pill tachyon-service-pill--stopped' },
+        tr('Остановлен', 'Stopped'),
+      ),
+    );
+    if (options.version) {
+      valueChildren.push(
+        E(
+          'span',
+          { class: 'tachyon-service-pill tachyon-service-pill--version' },
+          `v${options.version.replace(/^v/, '')}`,
+        ),
+      );
+    }
+  }
+
+  const valueEl = E('span', { class: 'tachyon-service-value' }, valueChildren);
+
+  return {
+    key: keyEl,
+    value: valueEl,
+    attributes: {
+      class: isRunning
+        ? 'tachyon_dashboard-page__widgets-section__item__row--success'
+        : 'tachyon_dashboard-page__widgets-section__item__row--error',
+      ...(options.tooltip ? { title: options.tooltip } : {}),
     },
-    'renderServicesInfoWidget',
-  );
+  };
 }
 
 let latestTailscalePeersRequestId = 0;
@@ -2374,7 +3573,9 @@ async function fetchTailscalePeers() {
 function peerRow(name: string, online: boolean) {
   return {
     key: name,
-    value: online ? _('✔ Online') : _('✘ Offline'),
+    value: online
+      ? tr('✔ В сети', '✔ Online')
+      : tr('✘ Не в сети', '✘ Offline'),
     attributes: {
       class: online
         ? 'tachyon_dashboard-page__widgets-section__item__row--success'
@@ -2402,18 +3603,21 @@ async function renderTailscaleWidget() {
   renderStoreWidget(
     'dashboard-widget-tailscale',
     'tailscaleWidget',
-    _('Tailscale'),
+    'Tailscale',
     (data) => {
       type WidgetItem = {
-        key: string;
-        value: string;
+        key: string | HTMLElement;
+        value: string | HTMLElement | (string | HTMLElement)[];
         attributes?: Record<string, string>;
       };
       if (!data || !data.configured) return [] as WidgetItem[];
       const items: WidgetItem[] = [
         {
-          key: _('State'),
-          value: data.backend_state || '—',
+          key: tr('Состояние', 'State'),
+          value:
+            data.backend_state === 'Running'
+              ? tr('Работает', 'Running')
+              : data.backend_state || '—',
           attributes: {
             class:
               data.backend_state === 'Running'
@@ -2423,7 +3627,10 @@ async function renderTailscaleWidget() {
         },
       ];
       if (data.self && data.self.ips.length) {
-        items.push({ key: _('This router'), value: data.self.ips[0] });
+        items.push({
+          key: tr('Этот роутер', 'This router'),
+          value: data.self.ips[0],
+        });
       }
       for (const peer of data.peers.slice(0, 5)) {
         if (!peer.online && !peer.name) continue;
@@ -2433,7 +3640,7 @@ async function renderTailscaleWidget() {
       }
       if (data.peers.length > 5) {
         items.push({
-          key: _('Other peers'),
+          key: tr('Другие пиры', 'Other peers'),
           value: `+${data.peers.length - 5}`,
         });
       }
@@ -2456,25 +3663,28 @@ async function onStoreUpdate(
       ) && updateLatencyProgressInline(next.sectionsWidget);
 
     if (!inlineUpdated) {
-      renderSectionsWidget();
+      const dataChanged =
+        prev.sectionsWidget.loading !== next.sectionsWidget.loading ||
+        prev.sectionsWidget.failed !== next.sectionsWidget.failed ||
+        JSON.stringify(prev.sectionsWidget.data) !==
+          JSON.stringify(next.sectionsWidget.data);
+
+      if (dataChanged) {
+        scheduleSectionsWidgetRender();
+        renderTrafficTotalWidget();
+      }
     }
   }
 
-  if (diff.bandwidthWidget) {
-    renderBandwidthWidget();
+  if (diff.bandwidthWidget || diff.trafficTotalWidget) {
+    scheduleSectionDashboardWidgetsRender();
   }
 
-  if (diff.trafficTotalWidget) {
-    renderTrafficTotalWidget();
-  }
-
-  if (diff.systemInfoWidget) {
-    renderSystemInfoWidget();
-  }
-
-  if (diff.servicesInfoWidget) {
-    syncDashboardServiceAvailability();
-    renderServicesInfoWidget();
+  if (diff.systemInfoWidget || diff.servicesInfoWidget) {
+    if (diff.servicesInfoWidget) {
+      syncDashboardServiceAvailability();
+    }
+    scheduleSystemServicesWidgetRender();
   }
 
   if (diff.tailscaleWidget) {
@@ -2512,6 +3722,10 @@ async function onPageMount() {
   void renderSystemInfoWidget();
   void renderServicesInfoWidget();
   void renderTailscaleWidget();
+  renderInboundServersDashboardWidget({
+    rawConnections: lastRawConnections,
+    hostnames: cachedHostnames,
+  });
   syncDashboardServiceAvailability();
   void fetchTailscalePeers();
 
@@ -2527,6 +3741,45 @@ function onPageUnmount() {
 
   directSocketsFailed = false;
   trafficRatesState = createInitialTrafficRatesState();
+
+  if (sectionWidgetsRenderFrame !== null) {
+    if (typeof cancelAnimationFrame !== 'undefined') {
+      cancelAnimationFrame(sectionWidgetsRenderFrame);
+    } else {
+      clearTimeout(sectionWidgetsRenderFrame);
+    }
+    sectionWidgetsRenderFrame = null;
+  }
+  if (systemServicesRenderFrame !== null) {
+    if (typeof cancelAnimationFrame !== 'undefined') {
+      cancelAnimationFrame(systemServicesRenderFrame);
+    } else {
+      clearTimeout(systemServicesRenderFrame);
+    }
+    systemServicesRenderFrame = null;
+  }
+  if (connectionsRenderFrame !== null) {
+    if (typeof cancelAnimationFrame !== 'undefined') {
+      cancelAnimationFrame(connectionsRenderFrame);
+    } else {
+      clearTimeout(connectionsRenderFrame);
+    }
+    connectionsRenderFrame = null;
+  }
+  if (connectionsHoverDeferredTimer !== null) {
+    clearTimeout(connectionsHoverDeferredTimer);
+    connectionsHoverDeferredTimer = null;
+  }
+  connectionsWidgetHovered = false;
+  connectionsWidgetListenersAttached = false;
+  if (sectionsRenderFrame !== null) {
+    if (typeof cancelAnimationFrame !== 'undefined') {
+      cancelAnimationFrame(sectionsRenderFrame);
+    } else {
+      clearTimeout(sectionsRenderFrame);
+    }
+    sectionsRenderFrame = null;
+  }
 
   stopDashboardDataUpdates();
   stopActionStateWatcher();

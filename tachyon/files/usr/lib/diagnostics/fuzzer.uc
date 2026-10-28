@@ -63,6 +63,8 @@ function get_zapret_bin() { return binaries.get_zapret_bin(); }
 
 function get_byedpi_bin() { return binaries.get_byedpi_bin(); }
 
+function get_desync_bin() { return binaries.get_desync_bin(); }
+
 function get_zapret2_lua_flags(args_str) { return binaries.get_zapret2_lua_flags(args_str); }
 
 let _has_timeout = null;
@@ -74,7 +76,7 @@ function wrap_cmd_timeout(cmd, sec, pid_file) { return binaries.wrap_cmd_timeout
 // binary is unavailable. Blocking forever on system()/pipe.read() wedges the
 // whole fuzzer worker (deadline checks in ucode never get to run), so every
 // blocking call must carry a hard wall-clock bound.
-const _WATCHDOG_SUBSHELL = "( %s & _bp=$!; ( sleep %d; kill -9 $_bp 2>/dev/null ) & _bw=$!; wait $_bp 2>/dev/null; kill $_bw 2>/dev/null; wait $_bw 2>/dev/null )";
+const _WATCHDOG_SUBSHELL = "( ( %s ) & _bp=$!; ( trap 'kill -9 $_bs 2>/dev/null; exit 0' TERM INT; sleep %d & _bs=$!; wait $_bs 2>/dev/null; kill -9 $_bp 2>/dev/null ) </dev/null >/dev/null 2>/dev/null & _bw=$!; wait $_bp 2>/dev/null; _rc=$?; kill -TERM $_bw 2>/dev/null; kill -9 $_bw 2>/dev/null; wait $_bw 2>/dev/null; exit $_rc )";
 
 function run_bounded(cmd, sec) { return binaries.run_bounded(cmd, sec); }
 
@@ -152,6 +154,8 @@ function generate_combinatorial_zapret() { return strategies.generate_combinator
 
 function generate_combinatorial_byedpi() { return strategies.generate_combinatorial_byedpi(); }
 
+function generate_combinatorial_desync() { return strategies.generate_combinatorial_desync(); }
+
 function generate_adaptive_strategies(engine, target) { return strategies.generate_adaptive_strategies(engine, target); }
 
 function get_strategies_for_engine(engine, mode, target) { return strategies.get_strategies_for_engine(engine, mode, target); }
@@ -191,7 +195,15 @@ function rerank_strategies_by_dpi(strategies, dpi_type) { return targets.rerank_
 
 function run_probe(engine, args_str, target_key, custom_url, job_id, opts) { return probe.run_probe(engine, args_str, target_key, custom_url, job_id, opts); }
 
-function synthesize_ai_strategies(engine, target, custom_url, user_prompt) { return ai.synthesize_ai_strategies(engine, target, custom_url, user_prompt); }
+function synthesize_ai_strategies(engine, target, custom_url, user_prompt, extra_arg) {
+    if (engine == "async" || engine == "--async")
+        return ai.start_ai_synthesize_async(target, custom_url, user_prompt, extra_arg);
+    if (engine == "status" || engine == "--status")
+        return ai.get_ai_synthesize_status();
+    if (engine == "worker" || engine == "--worker")
+        return ai.run_ai_synthesize_worker(target, custom_url, user_prompt, extra_arg, "");
+    return ai.synthesize_ai_strategies(engine, target, custom_url, user_prompt);
+}
 
 function run_fuzzer_worker(engine, target, custom_url, rule_section, custom_file, mode, job_id) {
     if (job_id && job_id != "") {
@@ -227,17 +239,27 @@ function run_fuzzer_worker(engine, target, custom_url, rule_section, custom_file
         save_fuzzer_state(state);
     }
 
-    if (custom_url && custom_url != "" && !fuzzer_runner.is_valid_url(custom_url)) {
-        state.running = false;
-        state.error = "Invalid custom URL: malformed or forbidden characters";
-        state.finished_at = clock()[0];
-        save_fuzzer_state(state);
-        cleanup_temp_daemons(state.job_id);
-        return;
+    if (custom_url && custom_url != "") {
+        let urls = split(custom_url, /[,\n]+/);
+        for (let u in urls) {
+            let trimmed = trim(as_string(u));
+            if (trimmed != "" && !fuzzer_runner.is_valid_url(trimmed)) {
+                state.running = false;
+                state.error = sprintf("Invalid custom URL: '%s' is malformed or contains forbidden characters", trimmed);
+                state.finished_at = clock()[0];
+                save_fuzzer_state(state);
+                cleanup_temp_daemons(state.job_id);
+                return;
+            }
+        }
     }
 
     // ── Pre-fuzz DPI detection ────────────────────────────────────────────
     let dpi_detection = detect_dpi_type(target, custom_url);
+    if (history.is_job_aborted(state.job_id)) {
+        cleanup_temp_daemons(state.job_id);
+        return;
+    }
     state.dpi_detection = dpi_detection;
     state.phase = "exploration";
     state.stage = 1;
@@ -305,6 +327,10 @@ function run_fuzzer_worker(engine, target, custom_url, rule_section, custom_file
         
         // ── Stage 1: Exploration (Single-probe scan) ──────────────────────
         for (let i = 0; i < total; i++) {
+            if (history.is_job_aborted(state.job_id)) {
+                cleanup_temp_daemons(state.job_id);
+                return;
+            }
             let strat = strategies[i];
             state.current_index = i + 1;
             state.current_strategy = strat;
@@ -341,15 +367,31 @@ function run_fuzzer_worker(engine, target, custom_url, rule_section, custom_file
                 };
             }
             
+            let compact_sub_probes = [];
+            for (let sp in array_or_empty(probe.sub_probes)) {
+                push(compact_sub_probes, {
+                    target_name: sp.target_name || "",
+                    url: sp.url || "",
+                    required: sp.required ? true : false,
+                    http_code: sp.http_code || 0,
+                    handshake_ms: sp.handshake_ms || 0,
+                    ttfb_ms: sp.ttfb_ms || 0,
+                    speed_kbps: sp.speed_kbps || 0,
+                    data_bytes: sp.data_bytes || 0,
+                    data_verified: sp.data_verified ? true : false,
+                    dpi_verdict: sp.dpi_verdict || "unknown",
+                    score: sp.score || 0,
+                    success: sp.success ? true : false,
+                    error: sp.error || ""
+                });
+            }
+
             let item_result = {
                 id: strat.id || sprintf("strat_%d", i + 1),
                 name: strat.name || sprintf("Strategy %d", i + 1),
                 engine: strat.engine || engine,
                 args: strat.args,
-                description: strat.description || "",
-                rationale: strat.rationale || "",
                 source: strat.source || "",
-                tags: type(strat.tags) == "array" ? strat.tags : [],
                 success: probe.success,
                 http_code: probe.http_code,
                 handshake_ms: probe.handshake_ms,
@@ -360,7 +402,7 @@ function run_fuzzer_worker(engine, target, custom_url, rule_section, custom_file
                 dpi_verdict: probe.dpi_verdict || "unknown",
                 score: probe.score,
                 error: probe.error,
-                sub_probes: probe.sub_probes || [],
+                sub_probes: compact_sub_probes,
                 stability_pct: probe.success ? 100 : 0,
                 reps: 1,
                 jitter_ms: 0,
@@ -408,6 +450,10 @@ function run_fuzzer_worker(engine, target, custom_url, rule_section, custom_file
             save_fuzzer_state(state);
 
             for (let v_idx = 0; v_idx < num_verify; v_idx++) {
+                if (history.is_job_aborted(state.job_id)) {
+                    cleanup_temp_daemons(state.job_id);
+                    return;
+                }
                 let cand = working_candidates[v_idx];
                 state.current_strategy = {
                     name: sprintf("[Stage 2: verifying %d/%d] %s", v_idx + 1, num_verify, cand.name),
@@ -586,13 +632,7 @@ function run_fuzzer_worker(engine, target, custom_url, rule_section, custom_file
 function stop_fuzzer(quiet) {
     let state = get_fuzzer_state();
     let job_id = state ? state.job_id : null;
-    let job_dir = get_job_dir(job_id);
-    if (job_dir) {
-        kill_pid_file(job_dir + "/worker.pid");
-    }
-    kill_pid_file(PID_FILE);
-    cleanup_temp_daemons(job_id);
-    
+
     state.running = false;
     state.aborted = true;
     state.phase = "finished";
@@ -613,7 +653,15 @@ function stop_fuzzer(quiet) {
             state.best_strategy = best_item;
         }
     }
+    state._force = true;
     save_fuzzer_state(state);
+
+    let job_dir = get_job_dir(job_id);
+    if (job_dir) {
+        kill_pid_file(job_dir + "/worker.pid");
+    }
+    kill_pid_file(PID_FILE);
+    cleanup_temp_daemons(job_id);
     
     if (!quiet)
         print(sprintf("%J\n", { success: true, message: "Fuzzer stopped" }));
@@ -639,7 +687,11 @@ function start_fuzzer(engine, target, custom_url, rule_section, custom_file, mod
         print(sprintf("%J\n", { success: false, error: "ByeDPI binary is not installed on the router" }));
         return;
     }
-    if (engine == "all" && !get_zapret2_bin() && !get_zapret_bin() && !get_byedpi_bin()) {
+    if (engine == "desync" && !get_desync_bin()) {
+        print(sprintf("%J\n", { success: false, error: "tachyon-core binary is not installed on the router" }));
+        return;
+    }
+    if (engine == "all" && !get_zapret2_bin() && !get_zapret_bin() && !get_byedpi_bin() && !get_desync_bin()) {
         print(sprintf("%J\n", { success: false, error: "No DPI bypass engines are installed on the router" }));
         return;
     }
@@ -658,10 +710,10 @@ function start_fuzzer(engine, target, custom_url, rule_section, custom_file, mod
     ensure_state_dir();
     let job_id = sprintf("fuzz_%d", clock()[0]);
     ensure_job_dir(job_id);
-    cleanup_temp_daemons(job_id);
 
     // Immediately write starting state to prevent race conditions during frontend polling
     let state = {
+        _force: true,
         running: true,
         job_id: job_id,
         engine: engine || "zapret2",
@@ -715,7 +767,8 @@ function get_available_engines() {
     return {
         zapret2: get_zapret2_bin() != null,
         zapret: get_zapret_bin() != null,
-        byedpi: get_byedpi_bin() != null
+        byedpi: get_byedpi_bin() != null,
+        desync: get_desync_bin() != null
     };
 }
 
@@ -762,24 +815,95 @@ function apply_strategy(engine, args_val, target_rule) {
         return;
     }
 
+    let sec_type = as_string(sec_obj[".type"] || "");
     let sec_action = as_string(sec_obj.action || "");
-    if (sec_action != "" && sec_action != engine) {
-        print(sprintf("%J\n", {
-            success: false,
-            error: sprintf("Cannot apply %s strategy to section '%s' configured for %s", engine, target_rule, sec_action)
-        }));
+    let write_strategy_fields = function(sid) {
+        if (engine == "zapret2")
+            uci.set(CONFIG_NAME, sid, "nfqws2_opt", args_val);
+        else if (engine == "zapret")
+            uci.set(CONFIG_NAME, sid, "nfqws_opt", args_val);
+        else if (engine == "byedpi")
+            uci.set(CONFIG_NAME, sid, "byedpi_cmd_opts", args_val);
+        else if (engine == "desync") {
+            let parsed_ds = fuzzer_runner.parse_desync_outbound(args_val, "desync-out");
+            uci.set(CONFIG_NAME, sid, "desync_opts", args_val);
+            if (parsed_ds) {
+                if (parsed_ds.preset) uci.set(CONFIG_NAME, sid, "desync_preset", as_string(parsed_ds.preset));
+                if (parsed_ds.mode) uci.set(CONFIG_NAME, sid, "desync_mode", as_string(parsed_ds.mode));
+                if (parsed_ds.split_pos != null) uci.set(CONFIG_NAME, sid, "desync_split_pos", as_string(parsed_ds.split_pos));
+                if (parsed_ds.fake_ttl != null) uci.set(CONFIG_NAME, sid, "desync_fake_ttl", as_string(parsed_ds.fake_ttl));
+                if (parsed_ds.fake_sni) uci.set(CONFIG_NAME, sid, "desync_fake_sni", as_string(parsed_ds.fake_sni));
+                if (parsed_ds.repeats != null) uci.set(CONFIG_NAME, sid, "desync_repeats", as_string(parsed_ds.repeats));
+                if (parsed_ds.split_delay_ms != null) uci.set(CONFIG_NAME, sid, "desync_split_delay_ms", as_string(parsed_ds.split_delay_ms));
+                if (parsed_ds.udp_fake != null) uci.set(CONFIG_NAME, sid, "desync_udp_fake", parsed_ds.udp_fake ? "1" : "0");
+                if (parsed_ds.udp_repeats != null) uci.set(CONFIG_NAME, sid, "desync_udp_repeats", as_string(parsed_ds.udp_repeats));
+                if (parsed_ds.udp_fake_ttl != null) uci.set(CONFIG_NAME, sid, "desync_udp_fake_ttl", as_string(parsed_ds.udp_fake_ttl));
+            }
+        }
+    };
+
+    if (engine != "zapret2" && engine != "zapret" && engine != "byedpi" && engine != "desync") {
+        print(sprintf("%J\n", { success: false, error: "Unsupported engine: " + engine }));
         return;
     }
 
-    if (engine == "zapret2")
-        uci.set(CONFIG_NAME, target_rule, "nfqws2_opt", args_val);
-    else if (engine == "zapret")
-        uci.set(CONFIG_NAME, target_rule, "nfqws_opt", args_val);
-    else if (engine == "byedpi")
-        uci.set(CONFIG_NAME, target_rule, "byedpi_cmd_opts", args_val);
-    else {
-        print(sprintf("%J\n", { success: false, error: "Unsupported engine: " + engine }));
-        return;
+    if (sec_type == "outbound_source") {
+        uci.set(CONFIG_NAME, target_rule, "source_type", engine);
+        write_strategy_fields(target_rule);
+    } else if (sec_action == "connection") {
+        let refs_raw = sec_obj.outbound_source_refs;
+        let refs = type(refs_raw) == "array" ? refs_raw : (refs_raw ? split(trim(as_string(refs_raw)), /[ \t]+/) : []);
+        let matched_src = "";
+        let any_dpi_src = "";
+        for (let r in refs) {
+            let r_str = trim(as_string(r));
+            if (r_str == "") continue;
+            let src_obj = uci.get_all(CONFIG_NAME, r_str);
+            if (!src_obj) continue;
+            let st = lc(trim(as_string(src_obj.source_type || "")));
+            if (st == engine) {
+                matched_src = r_str;
+                break;
+            }
+            if (any_dpi_src == "" && (st == "zapret2" || st == "zapret" || st == "byedpi" || st == "desync" || st == "wdtt" || st == "olcrtc")) {
+                any_dpi_src = r_str;
+            }
+        }
+        let target_src = matched_src != "" ? matched_src : any_dpi_src;
+        if (target_src != "") {
+            uci.set(CONFIG_NAME, target_src, "source_type", engine);
+            write_strategy_fields(target_src);
+        } else {
+            let new_src = sprintf("src_%s_%s", engine, replace(target_rule, /[^a-zA-Z0-9_]/g, "_"));
+            if (!uci.get_all(CONFIG_NAME, new_src)) {
+                uci.set(CONFIG_NAME, new_src, "outbound_source");
+                uci.set(CONFIG_NAME, new_src, "name", sprintf("%s (%s)", as_string(sec_obj.name || target_rule), engine));
+                uci.set(CONFIG_NAME, new_src, "enabled", "1");
+            }
+            uci.set(CONFIG_NAME, new_src, "source_type", engine);
+            write_strategy_fields(new_src);
+            if (index(refs, new_src) < 0) {
+                let next_refs = [ new_src ];
+                for (let r in refs)
+                    if (trim(as_string(r)) != "")
+                        push(next_refs, trim(as_string(r)));
+                uci.set(CONFIG_NAME, target_rule, "outbound_source_refs", next_refs);
+            }
+        }
+        write_strategy_fields(target_rule);
+    } else {
+        if (sec_action != "" && sec_action != engine) {
+            if (sec_action == "zapret2" || sec_action == "zapret" || sec_action == "byedpi" || sec_action == "desync") {
+                uci.set(CONFIG_NAME, target_rule, "action", engine);
+            } else {
+                print(sprintf("%J\n", {
+                    success: false,
+                    error: sprintf("Cannot apply %s strategy to section '%s' configured for %s", engine, target_rule, sec_action)
+                }));
+                return;
+            }
+        }
+        write_strategy_fields(target_rule);
     }
     
     uci.commit(CONFIG_NAME);
@@ -826,7 +950,57 @@ if (op == "start") {
 } else if (op == "worker") {
     run_fuzzer_worker(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]);
 } else if (op == "status") {
-    print(sprintf("%J\n", get_fuzzer_state()));
+    let st = get_fuzzer_state();
+    // OpenWrt rpcd aborts file.exec ("Operation not supported") whenever stdout
+    // exceeds 65536 bytes (64 KB). Slim every item's sub_probes to {success:bool}
+    // and cap total serialized results to keep stdout well below 35 KB.
+    if (st && type(st.results) == "array") {
+        let slim_item = function(r) {
+            if (!r || type(r) != "object") return null;
+            let copy = {};
+            for (let k, v in r) {
+                if (k == "sub_probes" || k == "description" || k == "rationale" || k == "tags")
+                    continue;
+                copy[k] = v;
+            }
+            if (type(r.sub_probes) == "array" && length(r.sub_probes) > 1) {
+                let sp_slim = [];
+                for (let sp in r.sub_probes)
+                    push(sp_slim, { success: (sp && sp.success) ? true : false });
+                copy.sub_probes = sp_slim;
+            }
+            return copy;
+        };
+        let all_slim = [];
+        for (let r in st.results) {
+            let s = slim_item(r);
+            if (s != null) push(all_slim, s);
+        }
+        if (length(all_slim) > 100) {
+            let working = [];
+            let failed = [];
+            for (let s in all_slim) {
+                if (s.success) push(working, s);
+                else push(failed, s);
+            }
+            sort(working, function(a, b) { return (b.score || 0) - (a.score || 0); });
+            if (length(working) > 65)
+                working = slice(working, 0, 65);
+            let max_failed = 100 - length(working);
+            if (max_failed > 0 && length(failed) > max_failed)
+                failed = slice(failed, length(failed) - max_failed);
+            else if (max_failed <= 0)
+                failed = [];
+            let capped = [];
+            for (let w in working) push(capped, w);
+            for (let f in failed) push(capped, f);
+            all_slim = capped;
+        }
+        st.results = all_slim;
+        if (st.best_strategy && type(st.best_strategy) == "object")
+            st.best_strategy = slim_item(st.best_strategy);
+    }
+    print(sprintf("%J\n", st));
 } else if (op == "stop") {
     stop_fuzzer();
 } else if (op == "apply") {
@@ -839,7 +1013,9 @@ if (op == "start") {
 } else if (op == "reset_patterns") {
     reset_patterns_config();
 } else if (op == "ai_synthesize" || op == "synthesize") {
-    synthesize_ai_strategies(ARGV[1], ARGV[2], ARGV[3], ARGV[4]);
+    synthesize_ai_strategies(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]);
+} else if (op == "ai_synthesize_worker") {
+    ai.run_ai_synthesize_worker(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]);
 } else if (op == "detect_dpi") {
     let detection = detect_dpi_type(ARGV[1], ARGV[2]);
     print(sprintf("%J\n", detection));
@@ -860,7 +1036,8 @@ if (op == "start") {
         patterns: get_patterns_config(),
         zapret2: get_strategies_for_engine("zapret2", strat_mode),
         zapret: get_strategies_for_engine("zapret", strat_mode),
-        byedpi: get_strategies_for_engine("byedpi", strat_mode)
+        byedpi: get_strategies_for_engine("byedpi", strat_mode),
+        desync: get_strategies_for_engine("desync", strat_mode)
     }));
 } else if (op == "presets_info") {
     print(sprintf("%J\n", get_presets_info()));

@@ -241,6 +241,8 @@ export namespace Tachyon {
     // parental
     PARENTAL_QUOTA_RESET = 'parental_quota_reset',
     PARENTAL_QUOTA_TICK = 'parental_quota_tick',
+    // probe
+    PROBE_OUTBOUND_URL = 'probe_outbound_url',
     // reconcile
     RECONCILE = 'reconcile',
     RECONCILE_PLAN = 'reconcile_plan',
@@ -306,6 +308,8 @@ export namespace Tachyon {
     TELEGRAM_STOP = 'telegram_stop',
     // toggle
     TOGGLE_CLIENT_BYPASS = 'toggle_client_bypass',
+    // trace
+    TRACE_RULES = 'trace_rules',
     // ui
     UI_ACTION_ACK = 'ui_action_ack',
     // uninstall
@@ -346,6 +350,8 @@ export namespace Tachyon {
     runtimeAvailable?: boolean;
     urlTestInfo?: UrlTestInfo;
     priorityInfo?: PriorityInfo;
+    sourceGroup?: string;
+    sourceTitle?: string;
   }
 
   export interface UrlTestMember {
@@ -400,7 +406,14 @@ export namespace Tachyon {
   }
 
   export interface ServiceStatus {
-    serviceType: 'zapret' | 'zapret2' | 'byedpi' | 'wdtt' | 'olcrtc' | 'fptn';
+    serviceType:
+      | 'zapret'
+      | 'zapret2'
+      | 'byedpi'
+      | 'wdtt'
+      | 'olcrtc'
+      | 'fptn'
+      | 'desync';
     configured: boolean;
     ready: boolean;
     conflict: boolean;
@@ -427,6 +440,13 @@ export namespace Tachyon {
     // sing-box rejected this section at start and the runtime quarantined it;
     // the section is not loaded and the reason is shown on the dashboard card.
     configError?: string;
+    dashboardSettings?: {
+      countryGrouping?: 'chips' | 'accordion' | 'none';
+      chipsGrouping?: 'regions' | 'smart_top' | 'latency' | 'alphabetical';
+      countryChipsLatencyMode?: 'min' | 'max';
+      sortMode?: 'latency' | 'country_latency' | 'country_alpha' | 'default';
+      hoverFreeze?: boolean;
+    };
     outbounds: Outbound[];
   }
 
@@ -478,6 +498,7 @@ export namespace Tachyon {
     | 'zapret'
     | 'zapret2'
     | 'byedpi'
+    | 'desync'
     | 'wdtt'
     | 'olcrtc'
     | 'fptn'
@@ -487,11 +508,17 @@ export namespace Tachyon {
     | 'snell'
     | 'mieru'
     | 'naive'
-    | 'sudoku'
     | 'masque'
+    | 'sudoku'
+    | 'shadowtls'
+    | 'trusttunnel'
+    | 'openconnect'
+    | 'tewfai'
+    | 'desync'
     | 'openvpn'
     | 'dns'
-    | 'hosts';
+    | 'hosts'
+    | 'group';
   type LegacyConnectionType = 'proxy' | 'vpn' | 'block' | 'exclusion';
   type ProxyConfigType =
     | 'urltest'
@@ -513,6 +540,9 @@ export namespace Tachyon {
       | 'subscription_url'
       | 'section_interface'
       | 'urltest'
+      | 'outbound_source'
+      | 'balancer'
+      | 'condition_rule'
       | 'priority_group'
       | 'priority_level';
     label?: string;
@@ -570,6 +600,7 @@ export namespace Tachyon {
     preferred_server?: string;
 
     selector_proxy_links?: string[];
+    selector_amnezia_configs?: string[];
     subscription_urls?: string[];
     interfaces?: string[];
     outbound_jsons?: string[];
@@ -578,6 +609,24 @@ export namespace Tachyon {
     urltest_settings?: string;
     priority_groups?: string[];
     priority_group_settings?: string;
+    condition_refs?: string | string[];
+    outbound_source_refs?: string | string[];
+    outbound_group_refs?: string | string[];
+    balancer_refs?: string | string[];
+    source_type?: string;
+    proxy_links?: string | string[];
+    proxy_links_text?: string;
+    amnezia_configs?: string | string[];
+    awg_private_key?: string;
+    awg_endpoint?: string;
+    interface_name?: string;
+    tor_socks_port?: string;
+    source_refs?: string | string[];
+    group_refs?: string | string[];
+    balancer_type?: 'urltest' | 'priority' | string;
+    outbound_group_levels?: string | string[];
+    include_prefixes?: string | string[];
+    exclude_prefixes?: string | string[];
     dashboard_filter_mode?: 'disabled' | 'exclude' | 'include' | 'mixed';
     dashboard_detect_server_country?: 'flag_emoji' | 'country_is';
     dashboard_include_countries?: string[];
@@ -599,6 +648,20 @@ export namespace Tachyon {
     dashboard_exclude_ports?: string[];
     dashboard_exclude_groups?: string[];
     dashboard_hide_na_servers?: '0' | '1';
+    dashboard_country_grouping?: 'chips' | 'accordion' | 'none';
+    dashboard_chips_grouping?:
+      | 'regions'
+      | 'smart_top'
+      | 'latency'
+      | 'alphabetical';
+    dashboard_country_chips_latency_mode?: 'min' | 'max';
+    dashboard_sort_mode?:
+      | 'latency'
+      | 'country_latency'
+      | 'country_alpha'
+      | 'default';
+    dashboard_hover_freeze?: '0' | '1';
+    dashboard_show_subscription_metadata?: '0' | '1';
     urltest_proxy_links?: string[];
     subscription_url?: string;
     subscription_user_agent?: string;
@@ -652,6 +715,7 @@ export namespace Tachyon {
     regex?: string[];
     outbound_detour_enabled?: '0' | '1';
     outbound_detour_section?: string;
+    group_members?: string | string[];
     download_via_proxy_enabled?: '0' | '1';
     download_via_proxy_section?: string;
     auto_user_agent?: '0' | '1';
@@ -672,6 +736,7 @@ export namespace Tachyon {
     node_prefix_color?: string;
     include_urltest_groups?: '0' | '1';
     hide_urltest_group_outbounds?: '0' | '1';
+    urltest_idle_timeout?: string;
     hide_detour_outbounds?: '0' | '1';
     yacd_secret_key?: string;
     fully_routed_ips?: string | string[];
@@ -840,6 +905,9 @@ export namespace Tachyon {
     status: string;
     dns_configured?: number;
     memory_rss_mb?: number;
+    pid?: number;
+    uptime_seconds?: number;
+    uptime_pretty?: string;
   }
 
   export interface GetOutboundMetadata {
@@ -851,6 +919,7 @@ export namespace Tachyon {
     ports?: Record<string, string>;
     details?: Record<string, string>;
     prefixes?: Record<string, string>;
+    sources?: Record<string, string>;
   }
 
   export interface GetSingBoxStatus {
@@ -858,6 +927,11 @@ export namespace Tachyon {
     enabled: number;
     status: string;
     memory_rss_mb?: number;
+    pid?: number;
+    uptime_seconds?: number;
+    uptime_pretty?: string;
+    engine_variant?: string;
+    engine_version?: string;
   }
 
   export interface GetEngineStatus {
@@ -993,6 +1067,8 @@ export namespace Tachyon {
     byedpi_installed: 0 | 1;
     wdtt_installed: 0 | 1;
     olcrtc_installed: 0 | 1;
+    i18n_ru_installed?: 0 | 1;
+    luci_lang?: string;
     server_inbounds_enabled_count: number;
   }
 
@@ -1038,12 +1114,18 @@ export namespace Tachyon {
       zapret2?: {
         running: number;
         memory_rss_mb?: number;
+        pid?: number;
+        uptime_seconds?: number;
+        uptime_pretty?: string;
       };
       dnsmasq?: {
         running: number;
         memory_rss_mb?: number;
         local_cache_enabled?: number;
         cache_size?: number;
+        pid?: number;
+        uptime_seconds?: number;
+        uptime_pretty?: string;
       };
     };
     capabilities: GetUiCapabilities;
@@ -1058,6 +1140,10 @@ export namespace Tachyon {
   export type ComponentName =
     | 'tachyon'
     | 'sing_box'
+    | 'tachyon-core'
+    | 'sing-box-lx'
+    | 'sing-box-extended'
+    | 'sing-box-extended-compressed'
     | 'steer'
     | 'steer-extended'
     | 'zapret'
@@ -1088,6 +1174,7 @@ export namespace Tachyon {
     | 'disable'
     | 'set_native_mode'
     | 'set_component_mode'
+    | 'set_language'
     | 'switch';
 
   export interface ComponentActionResult {
@@ -1338,6 +1425,8 @@ export namespace Tachyon {
   export interface GetClashApiProxyLatency {
     delay: number;
     message?: string;
+    /** what actually failed, next to the message */
+    reason?: string;
   }
 
   export interface GetClashApiProxyLatencies {
@@ -1348,7 +1437,7 @@ export namespace Tachyon {
 
   export type GetClashApiGroupLatency = Record<string, number>;
 
-  export type FuzzerEngine = 'zapret2' | 'zapret' | 'byedpi' | 'all';
+  export type FuzzerEngine = 'zapret2' | 'zapret' | 'byedpi' | 'desync' | 'all';
   export type FuzzerTarget =
     | 'youtube_suite'
     | 'youtube'
@@ -1372,7 +1461,7 @@ export namespace Tachyon {
   export interface FuzzerStrategyItem {
     id: string;
     name: string;
-    engine: 'zapret2' | 'zapret' | 'byedpi';
+    engine: 'zapret2' | 'zapret' | 'byedpi' | 'desync';
     args: string;
     description: string;
     rationale?: string;
@@ -1400,7 +1489,7 @@ export namespace Tachyon {
   export interface FuzzerStrategyResult {
     id: string;
     name: string;
-    engine: 'zapret2' | 'zapret' | 'byedpi';
+    engine: 'zapret2' | 'zapret' | 'byedpi' | 'desync';
     args: string;
     description: string;
     rationale?: string;
@@ -1501,7 +1590,7 @@ export namespace Tachyon {
   export interface FuzzerCustomStrategy {
     id?: string;
     name: string;
-    engine: 'zapret2' | 'zapret' | 'byedpi';
+    engine: 'zapret2' | 'zapret' | 'byedpi' | 'desync';
     args: string;
     description?: string;
   }
@@ -1532,6 +1621,15 @@ export namespace Tachyon {
       autos: string[];
       tlsrecs: string[];
       ipfrags: string[];
+    };
+    desync?: {
+      modes: string[];
+      split_poses: Array<string | number>;
+      fake_ttls: number[];
+      fake_snis: string[];
+      repeats: number[];
+      split_delays: number[];
+      udp_fakes?: boolean[];
     };
     custom_strategies: FuzzerCustomStrategy[];
   }

@@ -13,7 +13,10 @@ const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
 const DEFAULT_PENDING_RELOAD_FILE = getenv("TACHYON_PENDING_RELOAD_FILE") || "/var/run/tachyon/reload.pending";
 const DEFAULT_SERVICE_INIT = getenv("TACHYON_SERVICE_INIT") || "/etc/init.d/tachyon";
-const CORE_LOG_PATH = "/tmp/tachyon-core/sing-box.log";
+const RUNTIME_STATE_DIR = getenv("TACHYON_RUNTIME_STATE_DIR") || "/var/run/tachyon";
+const RELOAD_PREVIEW_FILE = getenv("TACHYON_RELOAD_PREVIEW_FILE") || RUNTIME_STATE_DIR + "/reload-preview.json";
+const SB_VARIANT_STATE_FILE = getenv("SB_VARIANT_STATE_FILE") || "/etc/tachyon/tachyon-core-variant";
+const CORE_LOG_PATH = getenv("TACHYON_CORE_LOG_PATH") || "/tmp/tachyon-core/sing-box.log";
 const ZAPRET_DEFAULT_NFQWS_OPT = getenv("ZAPRET_DEFAULT_NFQWS_OPT") || "";
 const ZAPRET2_DEFAULT_NFQWS2_OPT = getenv("ZAPRET2_DEFAULT_NFQWS2_OPT") || "";
 const BYEDPI_DEFAULT_CMD_OPTS = getenv("BYEDPI_DEFAULT_CMD_OPTS") || "";
@@ -462,8 +465,7 @@ function sing_box_service_pid_runtime() {
     // new procd pid file first, the previous release's paths after it: an
     // upgraded router can still be running under the old service name until
     // the managed init script is rewritten
-    for (let path in [ "/var/run/tachyon-core.pid", "/var/run/tachyon-core/tachyon-core.pid",
-        "/var/run/sing-box.pid", "/var/run/sing-box/sing-box.pid" ]) {
+    for (let path in process_identity.core_contract().pid_files) {
         let pid = int(trim(fs.readfile(path) || "0"));
         if (pid > 0 && pid_is_sing_box(pid))
             return pid;
@@ -503,64 +505,123 @@ function has_int(values, needle) {
     return false;
 }
 
-// Mixed-inbound ports the generated config declares. Read from the config
-// rather than hardcoded, so this stays in step with the generator and stands
-// down when no section enables the mixed proxy at all.
-function sing_box_mixed_ports() {
+// Inbound and endpoint ports the generated config declares. Read from the config
+// rather than hardcoded, so this stays in step with the generator and verifies
+// both mixed proxy ports and configured Server Inbounds after SIGHUP.
+function sing_box_expected_ports() {
     let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
     let config_path = trim(as_string(settings.config_path || "")) || "/etc/tachyon-core/config.json";
     let data = fs.readfile(config_path);
     if (data == null)
-        return [];
+        return { tcp: [], udp: [] };
 
     let parsed;
     try {
         parsed = json(data);
     }
     catch (e) {
-        return [];
+        return { tcp: [], udp: [] };
     }
-    if (parsed == null || parsed.inbounds == null)
-        return [];
+    if (parsed == null)
+        return { tcp: [], udp: [] };
 
-    let ports = [];
-    for (let inbound in parsed.inbounds) {
-        if (inbound.type != "mixed" || inbound.listen_port == null)
+    let tcp = [];
+    let udp = [];
+    for (let inbound in (parsed.inbounds || [])) {
+        if (type(inbound) != "object" || inbound.listen_port == null)
             continue;
         let port = int(inbound.listen_port, 10);
-        if (port > 0 && !has_int(ports, port))
-            push(ports, port);
-    }
-    return ports;
-}
-
-// Are the ports the config promises actually in LISTEN? /proc/net/tcp is
-// read directly: this runs inside the SIGHUP poll loop and a netstat fork per
-// iteration is exactly the kind of churn a reload should not add.
-function sing_box_mixed_ports_listening(ports) {
-    if (length(ports) == 0)
-        return true;
-
-    let listening = {};
-    for (let path in [ "/proc/net/tcp", "/proc/net/tcp6" ]) {
-        let content = fs.readfile(path);
-        if (content == null)
+        if (port <= 0)
             continue;
-        for (let line in split(content, "\n")) {
-            let fields = split(trim(line), /[ \t]+/);
-            if (length(fields) < 4 || (fields[3] != "0A" && fields[3] != "0a"))
-                continue;
-            let colon = index(fields[1], ":");
-            if (colon <= 0)
-                continue;
-            listening[int(substr(fields[1], colon + 1), 16)] = true;
+        let t = lc(as_string(inbound.type || ""));
+        if (t == "hysteria2" || t == "tuic" || t == "wireguard" || t == "awg") {
+            if (!has_int(udp, port))
+                push(udp, port);
+        }
+        else if (inbound.type != "mixed" &&
+                 t != "vless" && t != "vmess" && t != "trojan" &&
+                 t != "shadowsocks" && t != "socks" && t != "http" && t != "anytls" &&
+                 t != "naive" && t != "shadowtls" && t != "fptn" && t != "mtproxy") {
+            continue;
+        }
+        else {
+            if (!has_int(tcp, port))
+                push(tcp, port);
         }
     }
+    for (let endpoint in (parsed.endpoints || [])) {
+        if (type(endpoint) != "object" || endpoint.listen_port == null)
+            continue;
+        let port = int(endpoint.listen_port, 10);
+        if (port <= 0)
+            continue;
+        let t = lc(as_string(endpoint.type || ""));
+        if ((t == "wireguard" || t == "awg") && !has_int(udp, port))
+            push(udp, port);
+    }
+    return { tcp, udp };
+}
 
-    for (let port in ports)
-        if (!listening[int(port)])
-            return false;
+function sing_box_mixed_ports() {
+    return sing_box_expected_ports().tcp;
+}
+
+// Are the ports the config promises actually in LISTEN? /proc/net/tcp and
+// /proc/net/udp are read directly: this runs inside the SIGHUP poll loop and a
+// netstat fork per iteration is exactly the kind of churn a reload should not add.
+function sing_box_expected_ports_listening(expected) {
+    let tcp_ports = type(expected) == "array" ? expected : (expected.tcp || []);
+    let udp_ports = type(expected) == "object" ? (expected.udp || []) : [];
+    if (length(tcp_ports) == 0 && length(udp_ports) == 0)
+        return true;
+
+    if (length(tcp_ports) > 0) {
+        let listening_tcp = {};
+        for (let path in [ "/proc/net/tcp", "/proc/net/tcp6" ]) {
+            let content = fs.readfile(path);
+            if (content == null)
+                continue;
+            for (let line in split(content, "\n")) {
+                let fields = split(trim(line), /[ \t]+/);
+                if (length(fields) < 4 || (fields[3] != "0A" && fields[3] != "0a"))
+                    continue;
+                let colon = index(fields[1], ":");
+                if (colon <= 0)
+                    continue;
+                listening_tcp[int(substr(fields[1], colon + 1), 16)] = true;
+            }
+        }
+        for (let port in tcp_ports)
+            if (!listening_tcp[int(port)])
+                return false;
+    }
+
+    if (length(udp_ports) > 0) {
+        let listening_udp = {};
+        for (let path in [ "/proc/net/udp", "/proc/net/udp6" ]) {
+            let content = fs.readfile(path);
+            if (content == null)
+                continue;
+            for (let line in split(content, "\n")) {
+                let fields = split(trim(line), /[ \t]+/);
+                if (length(fields) < 4 || (fields[3] != "07" && fields[3] != "01"))
+                    continue;
+                let colon = index(fields[1], ":");
+                if (colon <= 0)
+                    continue;
+                listening_udp[int(substr(fields[1], colon + 1), 16)] = true;
+            }
+        }
+        for (let port in udp_ports)
+            if (!listening_udp[int(port)])
+                return false;
+    }
+
     return true;
+}
+
+function sing_box_mixed_ports_listening(ports) {
+    return sing_box_expected_ports_listening(ports);
 }
 
 // Read the core log from a byte offset and report whether the core emitted a
@@ -570,50 +631,210 @@ function sing_box_mixed_ports_listening(ports) {
 // liveness/port probe reads success while none of the new settings applied.
 // The core says so itself in its log ("keeping running configuration"); that
 // is the only reliable signal, so the tail written since the SIGHUP is scanned.
-function core_log_reload_failed(since_offset) {
-    let data = fs.readfile(CORE_LOG_PATH);
-    if (data == null)
-        return false;
-    data = as_string(data);
-    if (length(data) <= since_offset)
-        return false;
-    let tail = substr(data, since_offset);
-    return index(tail, "keeping running configuration") >= 0 ||
-        index(tail, "start error") >= 0 ||
-        index(tail, "reload failed") >= 0;
+function core_logread_tail() {
+    let out = command_output_from_args([ "logread", "-l", "80" ]);
+    if (out == "")
+        return "";
+    let lines = [];
+    for (let line in split(out, "\n")) {
+        if (index(line, "tachyon: [") >= 0)
+            continue;
+        if (index(line, "tachyon-core") >= 0 || index(line, "sing-box") >= 0)
+            push(lines, line);
+    }
+    return join("\n", lines);
 }
 
-// Send SIGHUP to the running sing-box process and wait for it to stay alive
-// AND to still be listening.
-// sing-box 1.10+ reloads its configuration in-place on SIGHUP without tearing
-// down the process, so existing TCP sessions are not disrupted.
-// A live pid is not evidence that the reload worked: on tachyon-core a SIGHUP
-// was observed to leave the process running and answering the clash API while
-// the mixed inbound silently never came back - every LAN client proxy and the
-// Telegram bot then dead-ended, and only the watchdog's two-strike mixed-port
-// watch noticed, ten minutes later. So the inbounds the config declares are
-// checked too; if they do not come back the caller escalates to a full restart
-// instead of logging a success that did not happen.
-// Returns true if the process accepted the reload and is still healthy;
-// returns false if the process died, was unreachable, or came back deaf
-// (caller should restart).
-function try_sighup_reload(pid) {
-    pid = int(pid || 0);
-    if (pid <= 0 || !pid_is_sing_box(pid))
+function text_has_reload_failure(text) {
+    text = as_string(text);
+    return index(text, "keeping running configuration") >= 0 ||
+        index(text, "rolled back to the configuration") >= 0 ||
+        index(text, "failed to start box after SIGHUP reload") >= 0 ||
+        index(text, "reload rejected by check") >= 0 ||
+        index(text, "in-place hot reload failed") >= 0 ||
+        index(text, "failed to load configuration on SIGHUP") >= 0 ||
+        index(text, "failed to parse configuration after SIGHUP") >= 0 ||
+        index(text, "start error") >= 0;
+}
+
+function core_log_reload_failed(since_offset, logread_before) {
+    let data = fs.readfile(CORE_LOG_PATH);
+    if (data != null) {
+        data = as_string(data);
+        if (length(data) > since_offset) {
+            let tail = substr(data, since_offset);
+            if (text_has_reload_failure(tail))
+                return true;
+        }
+    }
+    if (logread_before != null) {
+        let current_logread = core_logread_tail();
+        if (current_logread != "" && current_logread != logread_before) {
+            let new_part = current_logread;
+            if (logread_before != "") {
+                let before_lines = split(logread_before, "\n");
+                let last_before = before_lines[length(before_lines) - 1];
+                let idx = last_before != "" ? rindex(current_logread, last_before) : -1;
+                if (idx >= 0)
+                    new_part = substr(current_logread, idx + length(last_before));
+            }
+            if (text_has_reload_failure(new_part))
+                return true;
+        }
+    }
+    return false;
+}
+
+// In-place hot reload (SIGHUP) is exclusively supported on tachyon-core.
+// When sing-box (stable / tiny / extended / lx) is active, return false so the
+// caller always performs a clean restart instead of relying on sing-box SIGHUP.
+function pid_is_tachyon_core(pid) {
+    if (!pid_is_sing_box(pid))
         return false;
 
-    // Send SIGHUP; ignore the kill exit code — the process may have just
-    // finished a reload and the transient exit-code is unreliable.
+    let marker = trim(as_string(fs.readfile(SB_VARIANT_STATE_FILE) || ""));
+    if (marker == "" && getenv("SB_VARIANT_STATE_FILE") == null)
+        marker = trim(as_string(fs.readfile("/etc/tachyon/sing-box-variant") || ""));
+    if (marker == "tachyon-core")
+        return true;
+    if (getenv("SB_VARIANT_STATE_FILE") == null) {
+        let rt_prof = trim(command_output_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/tachyon_core/runtime.uc", "core-profile" ]));
+        if (rt_prof == "tachyon-core")
+            return true;
+    }
+    if (marker == "lx" || marker == "extended" || marker == "extended-compressed" || marker == "tiny" || marker == "stable")
+        return false;
+
+    let exe = process_identity.exe_basename(pid);
+    if (exe == "sing-box")
+        return false;
+    if (exe == "tachyon-core")
+        return true;
+
+    let comm = trim(as_string(fs.readfile("/proc/" + as_string(pid) + "/comm") || ""));
+    return comm == "tachyon-core";
+}
+
+function consume_reload_preview() {
+    let data = fs.readfile(RELOAD_PREVIEW_FILE);
+    if (data == null)
+        return null;
+    try {
+        let parsed = json(as_string(data));
+        return type(parsed) == "object" ? parsed : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function core_clash_api_info() {
+    let settings = object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
+    let config_path = trim(as_string(settings.config_path || "")) || "/etc/tachyon-core/config.json";
+    let data = fs.readfile(config_path);
+    if (data == null)
+        return null;
+    let parsed;
+    try {
+        parsed = json(as_string(data));
+    } catch (e) {
+        return null;
+    }
+    let clash_api = parsed?.experimental?.clash_api;
+    if (type(clash_api) != "object")
+        return null;
+    let ext = trim(as_string(clash_api.external_controller || ""));
+    if (ext == "")
+        return null;
+    let parts = split(ext, ":");
+    let ip = length(parts) > 1 ? parts[0] : "";
+    let port = length(parts) > 1 ? parts[length(parts) - 1] : "9090";
+    let host = (ip == "0.0.0.0" || ip == "") ? ("127.0.0.1:" + port) : ext;
+    return {
+        base_url: "http://" + host,
+        secret: trim(as_string(clash_api.secret || ""))
+    };
+}
+
+function fetch_tachyon_config_state(clash_info) {
+    if (type(clash_info) != "object" || clash_info.base_url == null)
+        return null;
+    let args = [ "curl", "-s", "-m", "2", "--connect-timeout", "1" ];
+    if (clash_info.secret != "") {
+        push(args, "-H");
+        push(args, "Authorization: Bearer " + clash_info.secret);
+    }
+    push(args, clash_info.base_url + "/tachyon/config-state");
+    let out = trim(command_output_from_args(args));
+    if (out == "")
+        return null;
+    try {
+        let parsed = json(out);
+        if (type(parsed) == "object" && (parsed.ready === true || parsed.ready === false))
+            return parsed;
+    } catch (e) {}
+    return null;
+}
+
+function trigger_tachyon_route_recheck(clash_info) {
+    if (type(clash_info) != "object" || clash_info.base_url == null)
+        return;
+    let args = [ "curl", "-s", "-m", "3", "--connect-timeout", "1", "-X", "POST" ];
+    if (clash_info.secret != "") {
+        push(args, "-H");
+        push(args, "Authorization: Bearer " + clash_info.secret);
+    }
+    push(args, clash_info.base_url + "/tachyon/route-recheck");
+    command_output_from_args(args);
+}
+
+function config_state_reload_confirmed(clash_info, before_state, preview) {
+    if (before_state == null)
+        return true;
+    let after_state = fetch_tachyon_config_state(clash_info);
+    if (after_state == null)
+        return false;
+    if (after_state.ready != true)
+        return false;
+    if (before_state.revision != null && after_state.revision != null &&
+        int(after_state.revision) <= int(before_state.revision))
+        return false;
+    let candidate_digest = type(preview) == "object" ? as_string(preview.candidate_digest || "") : "";
+    if (candidate_digest != "" && as_string(after_state.digest || "") != "")
+        return as_string(after_state.digest) == candidate_digest;
+    return true;
+}
+
+function finalize_sighup_success(clash_info, has_state_probe) {
+    common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
+    if (has_state_probe)
+        trigger_tachyon_route_recheck(clash_info);
+    return true;
+}
+
+// Send SIGHUP to the running tachyon-core process and wait for it to stay alive
+// AND to still be listening.
+// In-place hot reload is only enabled for tachyon-core: reload-preview checks
+// structural compatibility before SIGHUP, /tachyon/config-state confirms the new
+// config revision/digest is ready, and /tachyon/route-recheck re-evaluates live
+// TCP/UDP sessions against the updated routing table.
+function try_sighup_reload(pid) {
+    pid = int(pid || 0);
+    let preview = consume_reload_preview();
+    if (pid <= 0 || !pid_is_tachyon_core(pid))
+        return false;
+    if (type(preview) == "object" && preview.in_place === false)
+        return false;
+
+    let clash_info = core_clash_api_info();
+    let before_state = fetch_tachyon_config_state(clash_info);
     let log_offset = 0;
     let log_stat = fs.stat(CORE_LOG_PATH);
     if (log_stat != null)
         log_offset = int(log_stat.size || 0);
+    let logread_before = core_logread_tail();
     command_success_from_args([ "kill", "-HUP", as_string(pid) ]);
 
-    // Give sing-box up to 15 s to ingest the new config and bring its inbounds
-    // back. We poll every 500 ms and only call it a success when the process
-    // is alive AND every mixed port the config declares is listening again.
-    let ports = sing_box_mixed_ports();
+    let ports = sing_box_expected_ports();
     let deadline = 30;
     while (deadline > 0) {
         command_success_from_args([ "sleep", "0.5" ]);
@@ -621,31 +842,25 @@ function try_sighup_reload(pid) {
         let current_pid = sing_box_service_pid_runtime();
         if (current_pid <= 0)
             return false;   // process died — caller must restart
-        // PID unchanged, or procd replaced it (e.g. MTProxy restart path): both
-        // mean "something is running". That alone is not enough - the inbounds
-        // have to be back before this counts as a working reload.
-        let process_ok = current_pid == pid || pid_is_sing_box(current_pid);
+        let process_ok = current_pid == pid || pid_is_tachyon_core(current_pid);
         if (process_ok && sing_box_mixed_ports_listening(ports)) {
-            // The old config also has these ports up, so a still-listening
-            // probe is not proof the new config loaded. The core's own log is.
-            if (core_log_reload_failed(log_offset))
+            if (core_log_reload_failed(log_offset, logread_before))
                 return false;
-            common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
-            return true;
+            if (!config_state_reload_confirmed(clash_info, before_state, preview))
+                continue;
+            return finalize_sighup_success(clash_info, before_state != null);
         }
     }
 
-    // Timed out: verify at least that a sing-box is still up, and that it is
+    // Timed out: verify at least that tachyon-core is still up, and that it is
     // not running deaf.
     let final_pid = sing_box_service_pid_runtime();
-    if (final_pid <= 0 || !pid_is_sing_box(final_pid))
+    if (final_pid <= 0 || !pid_is_tachyon_core(final_pid))
         return false;
-    if (core_log_reload_failed(log_offset))
+    if (core_log_reload_failed(log_offset, logread_before))
         return false;
-    if (sing_box_mixed_ports_listening(ports)) {
-        common.write_file(RUNTIME_STATE_DIR + "/sing-box-reload.timestamp", as_string(time()) + "\n");
-        return true;
-    }
+    if (sing_box_mixed_ports_listening(ports) && config_state_reload_confirmed(clash_info, before_state, preview))
+        return finalize_sighup_success(clash_info, before_state != null);
     return false;
 }
 
@@ -826,10 +1041,10 @@ function reload_sing_box_runtime(previous_pid, config_hash_before, config_hash_a
         return;
     }
 
-    // Try graceful SIGHUP reload first: sing-box 1.10+ reloads config in-place
-    // without terminating the process, so active TCP sessions are preserved.
+    // Try graceful SIGHUP reload first when tachyon-core is running: it reloads
+    // config in-place without terminating the process, preserving active sessions.
     let active_pid = sing_box_service_pid_runtime();
-    if (active_pid > 0 && as_string(force) != "restart") {
+    if (active_pid > 0 && as_string(force) != "restart" && pid_is_tachyon_core(active_pid)) {
         command_success_from_args([ "logger", "-t", "tachyon", "[info] Reloading sing-box runtime via SIGHUP (graceful)" ]);
         if (try_sighup_reload(active_pid)) {
             command_success_from_args([ "logger", "-t", "tachyon", "[info] sing-box graceful reload succeeded" ]);
@@ -873,7 +1088,7 @@ function tachyon_runtime_network_configured(rt_table, nft_table, mark) {
     if (network_check_cache.key == key && network_check_cache.result && (now - network_check_cache.checked_at) < 5)
         return true;
 
-    let result = command_success_from_args([ "nft", "list", "table", "inet", nft_table ]) &&
+    let result = command_success_from_args([ "nft", "-t", "list", "table", "inet", nft_table ]) &&
         command_success_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/nft/apply.uc", "tproxy-route-rule-present", rt_table, mark ]);
 
     network_check_cache.key = key;
@@ -1168,8 +1383,21 @@ function settings_component_update_check_interval(settings) {
     return value != "" ? value : "1d";
 }
 
-function section_rule_ports_csv(section) {
+function single_rule_ports_csv(section) {
     return rule_config.rule_ports_csv_value(option(section, "ports", ""), option(section, "ports_text", ""));
+}
+
+function section_rule_ports_csv(section) {
+    let parts = [];
+    let base_ports = single_rule_ports_csv(section);
+    if (base_ports != "")
+        push(parts, base_ports);
+    for (let cond in connections.section_leaf_conditions(section)) {
+        let cond_ports = single_rule_ports_csv(cond);
+        if (cond_ports != "")
+            push(parts, cond_ports);
+    }
+    return join(",", parts);
 }
 
 function combined_domain_condition_text(section) {
@@ -1182,7 +1410,7 @@ function combined_domain_condition_text(section) {
     return option(section, "domain_suffix_text", "");
 }
 
-function section_rule_condition_csv(section, key, kind) {
+function single_rule_condition_csv(section, key, kind) {
     return rule_config.rule_condition_csv_value(
         key,
         kind,
@@ -1193,6 +1421,35 @@ function section_rule_condition_csv(section, key, kind) {
         combined_domain_condition_text(section),
         option(section, "domain_suffix", "")
     );
+}
+
+function section_rule_condition_csv(section, key, kind) {
+    let parts = [];
+    let base_csv = single_rule_condition_csv(section, key, kind);
+    if (base_csv != "")
+        push(parts, base_csv);
+    for (let cond in connections.section_leaf_conditions(section)) {
+        let cond_csv = single_rule_condition_csv(cond, key, kind);
+        if (cond_csv != "")
+            push(parts, cond_csv);
+    }
+    return join(",", parts);
+}
+
+function section_leaf_option_text(section, key) {
+    let conds = connections.section_leaf_conditions(section);
+    if (length(conds) == 0)
+        return option(section, key, "");
+    let parts = [];
+    let base = option(section, key, "");
+    if (base != "")
+        push(parts, base);
+    for (let cond in conds) {
+        let val = option(cond, key, "");
+        if (val != "")
+            push(parts, val);
+    }
+    return join(" ", parts);
 }
 
 function nft_schedule_signature_body(body, schedule) {
@@ -1303,14 +1560,14 @@ function nft_runtime_signature_body(settings, sections, schedules, profiles, gue
         if (action == "dns") {
             body = signature_add_value(body, "rule." + name + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
             body = signature_add_value(body, "rule." + name + ".source_aware_dns", connections.has_dns_matchers(section) ? "1" : "0");
-            body = signature_add_value(body, "rule." + name + ".fully_routed_ips", option(section, "fully_routed_ips", ""));
+            body = signature_add_value(body, "rule." + name + ".fully_routed_ips", section_leaf_option_text(section, "fully_routed_ips"));
             continue;
         }
         body = signature_add_value(body, "rule." + name + ".ip_cidr", section_rule_condition_csv(section, "ip_cidr", "subnets"));
         body = signature_add_value(body, "rule." + name + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
         body = signature_add_value(body, "rule." + name + ".source_aware_dns", connections.has_dns_matchers(section) ? "1" : "0");
         body = signature_add_value(body, "rule." + name + ".ports", section_rule_ports_csv(section));
-        body = signature_add_value(body, "rule." + name + ".fully_routed_ips", option(section, "fully_routed_ips", ""));
+        body = signature_add_value(body, "rule." + name + ".fully_routed_ips", section_leaf_option_text(section, "fully_routed_ips"));
         body = signature_add_value(body, "rule." + name + ".excluded_ips", option(section, "excluded_ips", ""));
         body = signature_add_value(body, "rule." + name + ".excluded_protocol", option(section, "excluded_protocol", ""));
         body = signature_add_value(body, "rule." + name + ".routed_dns_enabled", bool_option(section, "routed_dns_enabled", false) ? "1" : "0");
@@ -1322,7 +1579,7 @@ function nft_runtime_signature_body(settings, sections, schedules, profiles, gue
 
         body = signature_add_value(body, "rule." + name + ".remote_subnet_lists", option(section, "remote_subnet_lists", ""));
         body = signature_add_value(body, "rule." + name + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
-        body = signature_add_value(body, "rule." + name + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
+        body = signature_add_value(body, "rule." + name + ".domain_ip_lists", section_leaf_option_text(section, "domain_ip_lists"));
         body = signature_add_value(body, "rule." + name + ".dscp", connections.dscp_value(section));
         let fail_policy = lc(trim(option(section, "fail_policy", "keep")));
         if (fail_policy == "block" || fail_policy == "direct") {
@@ -1766,6 +2023,22 @@ function append_sing_box_rule_signature_body(body, section, sections) {
         body = signature_add_value(body, prefix + ".hosts_list_disabled", option(section, "hosts_list_disabled", ""));
         body = signature_add_value(body, prefix + ".dns_hosts", option(section, "dns_hosts", ""));
     }
+    else if (action == "group") {
+        body = signature_add_value(body, prefix + ".group_members", join(" ", list_option(section, "group_members")));
+        body = signature_add_value(body, prefix + ".urltests", urltests_signature(section));
+        body = signature_add_value(body, prefix + ".priority_groups", priority_groups_signature(section));
+        body = signature_add_value(body, prefix + ".urltest_check_interval", section_urltest_check_interval(section));
+        body = signature_add_value(body, prefix + ".urltest_tolerance", option(section, "urltest_tolerance", "50"));
+        body = signature_add_value(body, prefix + ".urltest_testing_url", option(section, "urltest_testing_url", "https://www.gstatic.com/generate_204"));
+        body = signature_add_outbound_detour_body(body, section, prefix);
+        body = signature_add_mixed_proxy_body(body, section, prefix);
+    }
+
+    if (connections.routed_dns_enabled(section)) {
+        body = signature_add_value(body, prefix + ".routed_dns_enabled", "1");
+        body = signature_add_value(body, prefix + ".routed_dns_type", connections.routed_dns_type(section));
+        body = signature_add_value(body, prefix + ".routed_dns_server", join(" ", connections.routed_dns_servers(section)));
+    }
 
     body = signature_add_value(body, prefix + ".domain", section_rule_condition_csv(section, "domain", "domains"));
     body = signature_add_value(body, prefix + ".domain_suffix", section_rule_condition_csv(section, "domain_suffix", "domains"));
@@ -1776,7 +2049,7 @@ function append_sing_box_rule_signature_body(body, section, sections) {
     body = signature_add_value(body, prefix + ".source_ip_cidr", section_rule_condition_csv(section, "source_ip_cidr", "subnets"));
     if (action != "dns")
         body = signature_add_value(body, prefix + ".ports", section_rule_ports_csv(section));
-    body = signature_add_value(body, prefix + ".fully_routed_ips", option(section, "fully_routed_ips", ""));
+    body = signature_add_value(body, prefix + ".fully_routed_ips", section_leaf_option_text(section, "fully_routed_ips"));
     if (action != "dns") {
         body = signature_add_value(body, prefix + ".excluded_ips", option(section, "excluded_ips", ""));
         body = signature_add_value(body, prefix + ".excluded_protocol", option(section, "excluded_protocol", ""));
@@ -1787,7 +2060,22 @@ function append_sing_box_rule_signature_body(body, section, sections) {
     body = signature_add_value(body, prefix + ".rule_set", connections.rule_sets_value(section));
     if (action != "dns")
         body = signature_add_value(body, prefix + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
-    body = signature_add_value(body, prefix + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
+    body = signature_add_value(body, prefix + ".domain_ip_lists", section_leaf_option_text(section, "domain_ip_lists"));
+    let user_doms = section_leaf_option_text(section, "user_domains");
+    let user_doms_txt = section_leaf_option_text(section, "user_domains_text");
+    if (user_doms != "" || user_doms_txt != "")
+        body = signature_add_value(body, prefix + ".user_domains", user_doms + "|" + user_doms_txt);
+    if (length(list_option(section, "condition_refs")) > 0 || option(section, "condition_expression", "") != "")
+        body = signature_add_value(body, prefix + ".condition_clauses", sprintf("%J", connections.section_effective_clauses(section)));
+    if (length(list_option(section, "outbound_source_refs")) > 0 ||
+        length(list_option(section, "outbound_group_refs")) > 0 ||
+        length(list_option(section, "balancer_refs")) > 0) {
+        body = signature_add_value(body, prefix + ".modular_outbounds", sprintf("%J", {
+            sources: connections.section_effective_outbound_sources(section),
+            groups: list_option(section, "outbound_group_refs"),
+            balancers: list_option(section, "balancer_refs")
+        }));
+    }
     let fail_policy = lc(trim(option(section, "fail_policy", "keep")));
     if (fail_policy == "block" || fail_policy == "direct") {
         body = signature_add_value(body, prefix + ".fail_policy", fail_policy);
@@ -1875,7 +2163,59 @@ function append_sing_box_server_signature_body(body, server) {
         [ "tailscale_use_exit_node", "0" ],
         [ "tailscale_accept_routes", "" ],
         [ "tailscale_advertise_routes", "" ],
-        [ "tailscale_advertise_exit_node", "" ]
+        [ "tailscale_advertise_exit_node", "" ],
+        [ "shadowtls_handshake_server", "" ],
+        [ "shadowtls_handshake_server_port", "" ],
+        [ "shadowtls_version", "" ],
+        [ "awg_local_address", "" ],
+        [ "awg_private_key", "" ],
+        [ "awg_mtu", "" ],
+        [ "awg_server_address", "" ],
+        [ "awg_server_port", "" ],
+        [ "awg_peer_public_key", "" ],
+        [ "awg_peer_allowed_ips", "" ],
+        [ "awg_allowed_ips", "" ],
+        [ "awg_client_address", "" ],
+        [ "awg_preshared_key", "" ],
+        [ "awg_keepalive", "" ],
+        [ "awg_jc", "" ],
+        [ "awg_jmin", "" ],
+        [ "awg_jmax", "" ],
+        [ "awg_s1", "" ],
+        [ "awg_s2", "" ],
+        [ "awg_s3", "" ],
+        [ "awg_s4", "" ],
+        [ "awg_h1", "" ],
+        [ "awg_h2", "" ],
+        [ "awg_h3", "" ],
+        [ "awg_h4", "" ],
+        [ "awg_i1", "" ],
+        [ "awg_i2", "" ],
+        [ "awg_i3", "" ],
+        [ "awg_i4", "" ],
+        [ "awg_i5", "" ],
+        [ "awg_j1", "" ],
+        [ "awg_j2", "" ],
+        [ "awg_j3", "" ],
+        [ "awg_itime", "" ],
+        [ "awg_version", "" ],
+        [ "awg_header_protection_key", "" ],
+        [ "awg_content_padding_addition", "" ],
+        [ "awg_rekey_after_time", "" ],
+        [ "awg_rekey_timeout", "" ],
+        [ "awg_reject_after_time", "" ],
+        [ "awg_keepalive_timeout", "" ],
+        [ "awg_max_handshake_attempts", "" ],
+        [ "awg_random_trailers", "" ],
+        [ "awg_disable_cookies", "" ],
+        [ "isolate_lan_for_users", "" ],
+        [ "block_private_for_users", "" ],
+        [ "isolated_users", "" ],
+        [ "blocked_users", "" ],
+        [ "isolated_subnets", "" ],
+        [ "custom_route_rules", "" ],
+        [ "custom_rules_json", "" ],
+        [ "open_firewall_port", "" ]
     ];
 
     for (let field in fields)
@@ -1996,10 +2336,34 @@ function sing_box_signature_body(settings, sections, servers, mwan3_active, sche
     return body;
 }
 
+function section_provider_for_action(section, action) {
+    if (section_name(section) == "" || !bool_option(section, "enabled", true))
+        return null;
+    action = as_string(action);
+    if (option(section, "action", "") == action)
+        return section;
+    if (connections.is_connections_action(option(section, "action", ""))) {
+        let target_type = lc(trim(action));
+        for (let src in connections.section_effective_outbound_sources(section)) {
+            if (lc(trim(option(src, "source_type", ""))) == target_type) {
+                let merged = {};
+                for (let k, v in object_or_empty(section))
+                    merged[k] = v;
+                for (let k, v in object_or_empty(src)) {
+                    if (substr(k, 0, 1) == "." || k == "name" || k == "enabled" || k == "source_type")
+                        continue;
+                    if (merged[k] == null || merged[k] == "")
+                        merged[k] = v;
+                }
+                return merged;
+            }
+        }
+    }
+    return null;
+}
+
 function section_action_is_enabled(section, action) {
-    return section_name(section) != "" &&
-        bool_option(section, "enabled", true) &&
-        option(section, "action", "") == as_string(action);
+    return section_provider_for_action(section, action) != null;
 }
 
 function action_queue_signature_body(sections, action, signature_key) {
@@ -2018,9 +2382,9 @@ function section_user_domains_for_list_type(section) {
     let list_type = option(section, "user_domain_list_type", "disabled");
 
     if (list_type == "dynamic")
-        return option(section, "user_domains", "");
+        return section_leaf_option_text(section, "user_domains");
     if (list_type == "text")
-        return option(section, "user_domains_text", "");
+        return section_leaf_option_text(section, "user_domains_text");
     return "";
 }
 
@@ -2034,10 +2398,10 @@ function append_zapret_runtime_signature_body(body, section, signature_prefix, o
     body = signature_add_value(body, signature_prefix + "." + name + ".community_lists", connections.community_lists_value(section));
     body = signature_add_value(body, signature_prefix + "." + name + ".rule_set", connections.rule_sets_value(section));
     body = signature_add_value(body, signature_prefix + "." + name + ".rule_set_with_subnets", connections.rule_sets_with_subnets_value(section));
-    body = signature_add_value(body, signature_prefix + "." + name + ".domain_ip_lists", option(section, "domain_ip_lists", ""));
+    body = signature_add_value(body, signature_prefix + "." + name + ".domain_ip_lists", section_leaf_option_text(section, "domain_ip_lists"));
     body = signature_add_value(body, signature_prefix + "." + name + ".user_domain_list_type", user_domain_list_type);
-    body = signature_add_value(body, signature_prefix + "." + name + ".local_domain_lists", option(section, "local_domain_lists", ""));
-    body = signature_add_value(body, signature_prefix + "." + name + ".remote_domain_lists", option(section, "remote_domain_lists", ""));
+    body = signature_add_value(body, signature_prefix + "." + name + ".local_domain_lists", section_leaf_option_text(section, "local_domain_lists"));
+    body = signature_add_value(body, signature_prefix + "." + name + ".remote_domain_lists", section_leaf_option_text(section, "remote_domain_lists"));
     body = signature_add_value(body, signature_prefix + "." + name + ".user_domains", section_user_domains_for_list_type(section));
 
     return body;
@@ -2046,9 +2410,9 @@ function append_zapret_runtime_signature_body(body, section, signature_prefix, o
 function zapret_runtime_signature_body(sections) {
     let body = "";
 
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "zapret"))
+    for (let raw_section in sections) {
+        let section = section_provider_for_action(object_or_empty(raw_section), "zapret");
+        if (section == null)
             continue;
 
         body = append_zapret_runtime_signature_body(
@@ -2066,10 +2430,13 @@ function zapret_runtime_signature_body(sections) {
 function zapret2_runtime_signature_body(sections) {
     let body = "";
 
-    for (let section in sections) {
+    // Use active_provider_sections so that both legacy action=zapret2 sections
+    // and modern action=connection sections with a zapret2 outbound_source are
+    // included. Without this, switching Discord from zapret2 to Desync would not
+    // change the signature, so needs_zapret2_restart would stay false and the
+    // stale nfqws2 worker would keep running until the next full tachyon restart.
+    for (let section in connections.active_provider_sections("zapret2", sections)) {
         section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "zapret2"))
-            continue;
 
         body = append_zapret_runtime_signature_body(
         body,
@@ -2104,9 +2471,9 @@ function enabled_action_index(sections, target_section, action) {
 function byedpi_runtime_signature_body(sections) {
     let body = "";
 
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "byedpi"))
+    for (let raw_section in sections) {
+        let section = section_provider_for_action(object_or_empty(raw_section), "byedpi");
+        if (section == null)
             continue;
 
         let name = section_name(section);
@@ -2120,9 +2487,9 @@ function byedpi_runtime_signature_body(sections) {
 function wdtt_runtime_signature_body(sections) {
     let body = "";
 
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "wdtt"))
+    for (let raw_section in sections) {
+        let section = section_provider_for_action(object_or_empty(raw_section), "wdtt");
+        if (section == null)
             continue;
 
         let name = section_name(section);
@@ -2138,7 +2505,7 @@ function wdtt_runtime_signature_body(sections) {
         body = signature_add_value(body, "wdtt." + name + ".block_doh", bool_option(section, "block_doh", false) ? "1" : "0");
         body = signature_add_value(body, "wdtt." + name + ".block_ipv6", bool_option(section, "block_ipv6", false) ? "1" : "0");
         body = signature_add_value(body, "wdtt." + name + ".subscription_links", join(" ", list_option(section, "subscription_links")));
-        body = signature_add_value(body, "wdtt." + name + ".community_lists", join(" ", list_option(section, "community_lists")));
+        body = signature_add_value(body, "wdtt." + name + ".community_lists", connections.community_lists_value(section));
         body = signature_add_value(body, "wdtt." + name + ".remote_domain_list", join(" ", list_option(section, "remote_domain_list")));
         body = signature_add_value(body, "wdtt." + name + ".qwdtt_mode", option(section, "qwdtt_mode", ""));
     }
@@ -2149,9 +2516,9 @@ function wdtt_runtime_signature_body(sections) {
 function olcrtc_runtime_signature_body(sections) {
     let body = "";
 
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "olcrtc"))
+    for (let raw_section in sections) {
+        let section = section_provider_for_action(object_or_empty(raw_section), "olcrtc");
+        if (section == null)
             continue;
 
         let name = section_name(section);
@@ -2171,9 +2538,9 @@ function olcrtc_runtime_signature_body(sections) {
 function fptn_runtime_signature_body(sections) {
     let body = "";
 
-    for (let section in sections) {
-        section = object_or_empty(section);
-        if (!section_action_is_enabled(section, "fptn"))
+    for (let raw_section in sections) {
+        let section = section_provider_for_action(object_or_empty(raw_section), "fptn");
+        if (section == null)
             continue;
 
         let name = section_name(section);
