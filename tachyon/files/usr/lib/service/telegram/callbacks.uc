@@ -23,6 +23,7 @@ let i18n = require("service.i18n");
 let rendering = require("service.telegram.rendering");
 let transport = require("service.telegram.transport");
 let commands = require("service.telegram.commands");
+let update_jobs = require("service.telegram.update_jobs");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 
@@ -61,6 +62,9 @@ let format_bytes = rendering.format_bytes;
 let escape_html = rendering.escape_html;
 let get_schema_label = rendering.get_schema_label;
 let is_boolean_key = rendering.is_boolean_key;
+let NOTIFICATION_KEYS = rendering.NOTIFICATION_KEYS;
+let effective_bool_value = rendering.effective_bool_value;
+let toggle_feature_reload_mode = rendering.toggle_feature_reload_mode;
 let is_list_key = rendering.is_list_key;
 let cidr_match_v4 = rendering.cidr_match_v4;
 let build_label = rendering.build_label;
@@ -88,6 +92,10 @@ let backup_extract_dir = rendering.backup_extract_dir;
 let config_sane_preview = rendering.config_sane_preview;
 
 let view_settings_menu = commands.view_settings_menu;
+let view_notifications = commands.view_notifications;
+let view_toggles = commands.view_toggles;
+let view_profiles = commands.view_profiles;
+let view_schedules = commands.view_schedules;
 let view_set_list = commands.view_set_list;
 let view_set_cat = commands.view_set_cat;
 let view_set_arr = commands.view_set_arr;
@@ -108,9 +116,14 @@ let exec_backup = commands.exec_backup;
 let exec_support_bundle = commands.exec_support_bundle;
 let exec_close_connections = commands.exec_close_connections;
 let exec_check_updates = commands.exec_check_updates;
+let exec_run_check_updates = commands.exec_run_check_updates;
 let view_instances = commands.view_instances;
 let exec_speedtest = commands.exec_speedtest;
 let view_ping = commands.view_ping;
+let exec_ping_group = commands.exec_ping_group;
+let exec_ping_all_groups = commands.exec_ping_all_groups;
+let exec_update_subs = commands.exec_update_subs;
+let exec_update_lists = commands.exec_update_lists;
 let view_quick_test = commands.view_quick_test;
 let view_logs = commands.view_logs;
 let view_system_info = commands.view_system_info;
@@ -131,18 +144,139 @@ let view_qos = commands.view_qos;
 
 let t = i18n.bind("en");
 
-function handle_set_tog(token, chat_id, msg_id, stype, sname, key, page) {
+function refresh_uci() {
     let c = uci_core.cursor();
-    c.load(CONFIG_NAME);
-    let s = c.get_all(CONFIG_NAME, sname);
+    if (c) {
+        try { c.unload(CONFIG_NAME); } catch (e) {}
+        try { c.load(CONFIG_NAME); } catch (e) {}
+    }
+}
+
+function handle_set_tog(token, chat_id, msg_id, stype, sname, key, page) {
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, sname);
     if (!s) return;
-    let b = (s[key] == "1" || s[key] == "true");
-    c.set(CONFIG_NAME, sname, key, b ? "0" : "1");
-    c.commit(CONFIG_NAME);
+    let b = effective_bool_value(s, stype, key);
+    uci_core.set(CONFIG_NAME, sname, key, b ? "0" : "1");
+    uci_core.commit(CONFIG_NAME);
     if (key == "enabled") {
         command_status(command_from_args(["/usr/bin/tachyon", "reload", "force"]));
     }
     return view_set_cat(token, chat_id, msg_id, stype, sname, page);
+}
+
+function is_allowed_notif_key(key) {
+    if (key == "daily_report_enabled" || key == "quiet_hours_enabled") return true;
+    for (let nk in NOTIFICATION_KEYS) {
+        if (nk == key) return true;
+    }
+    return false;
+}
+
+function handle_notif_toggle(token, chat_id, msg_id, key, from_view) {
+    if (!is_allowed_notif_key(key)) return view_notifications(token, chat_id, msg_id);
+    refresh_uci();
+    if (!uci_core.get_all(CONFIG_NAME, "telegram"))
+        uci_core.set(CONFIG_NAME, "telegram", "telegram");
+    let s = uci_core.get_all(CONFIG_NAME, "telegram");
+    let cur = effective_bool_value(s, "telegram", key);
+    uci_core.set(CONFIG_NAME, "telegram", key, cur ? "0" : "1");
+    uci_core.commit(CONFIG_NAME);
+    if (from_view == "watchdog")
+        return view_watchdog(token, chat_id, msg_id);
+    return view_notifications(token, chat_id, msg_id);
+}
+
+function handle_notif_all(token, chat_id, msg_id, val) {
+    let target_val = (val == "0") ? "0" : "1";
+    refresh_uci();
+    if (!uci_core.get_all(CONFIG_NAME, "telegram"))
+        uci_core.set(CONFIG_NAME, "telegram", "telegram");
+    for (let nk in NOTIFICATION_KEYS) {
+        uci_core.set(CONFIG_NAME, "telegram", nk, target_val);
+    }
+    uci_core.commit(CONFIG_NAME);
+    return view_notifications(token, chat_id, msg_id);
+}
+
+function apply_toggle_reload(mode, enabled_now) {
+    if (mode == "firewall") {
+        command_status(common.background_command(command_from_args(["/usr/bin/tachyon", "reload_firewall"])));
+    } else if (mode == "reload") {
+        command_status(common.background_command(command_from_args(["/usr/bin/tachyon", "reload"])));
+    } else if (mode == "watchdog") {
+        let wd_cmd = enabled_now ? "watchdog_start" : "watchdog_stop";
+        command_status(common.background_command(command_from_args(["/usr/bin/tachyon", wd_cmd])));
+    }
+}
+
+function handle_feature_toggle(token, chat_id, msg_id, group, key) {
+    let reload_mode = toggle_feature_reload_mode(key);
+    if (reload_mode == null) {
+        return (group == "watchdog") ? view_watchdog(token, chat_id, msg_id) : view_toggles(token, chat_id, msg_id, group);
+    }
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, "settings");
+    if (s) {
+        let cur = effective_bool_value(s, "settings", key);
+        let nxt = cur ? "0" : "1";
+        uci_core.set(CONFIG_NAME, "settings", key, nxt);
+        uci_core.commit(CONFIG_NAME);
+        apply_toggle_reload(reload_mode, !cur);
+    }
+    if (group == "watchdog")
+        return view_watchdog(token, chat_id, msg_id);
+    return view_toggles(token, chat_id, msg_id, group);
+}
+
+function handle_sd_mode_toggle(token, chat_id, msg_id) {
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, "settings");
+    if (s) {
+        let nxt = (option(s, "smart_detect_mode", "default") == "plus") ? "default" : "plus";
+        uci_core.set(CONFIG_NAME, "settings", "smart_detect_mode", nxt);
+        uci_core.commit(CONFIG_NAME);
+    }
+    return view_toggles(token, chat_id, msg_id, "core");
+}
+
+function handle_quic_cycle(token, chat_id, msg_id) {
+    refresh_uci();
+    let s = uci_core.get_all(CONFIG_NAME, "settings");
+    if (s) {
+        let cur = option(s, "disable_quic", "0");
+        let nxt = (cur == "0" || cur == "") ? "tunneled" : ((cur == "tunneled") ? "all" : "0");
+        uci_core.set(CONFIG_NAME, "settings", "disable_quic", nxt);
+        uci_core.commit(CONFIG_NAME);
+        apply_toggle_reload("reload", nxt != "0");
+    }
+    return view_toggles(token, chat_id, msg_id, "net");
+}
+
+function handle_profile_toggle(token, chat_id, msg_id, pname) {
+    refresh_uci();
+    let p = uci_core.get_all(CONFIG_NAME, pname);
+    if (p && p[".type"] == "profile") {
+        let cur = effective_bool_value(p, "profile", "enabled");
+        uci_core.set(CONFIG_NAME, pname, "enabled", cur ? "0" : "1");
+        uci_core.commit(CONFIG_NAME);
+        apply_toggle_reload("firewall", !cur);
+    }
+    return view_profiles(token, chat_id, msg_id);
+}
+
+function handle_schedule_toggle(token, chat_id, msg_id, sname, field) {
+    let key = (field == "notify") ? "notify" : "enabled";
+    refresh_uci();
+    let sc = uci_core.get_all(CONFIG_NAME, sname);
+    if (sc && sc[".type"] == "schedule") {
+        let cur = (key == "notify") ? (option(sc, "notify", "0") == "1") : effective_bool_value(sc, "schedule", "enabled");
+        uci_core.set(CONFIG_NAME, sname, key, cur ? "0" : "1");
+        uci_core.commit(CONFIG_NAME);
+        if (key == "enabled")
+            apply_toggle_reload("reload", !cur);
+    }
+    return view_schedules(token, chat_id, msg_id);
 }
 
 function handle_set_del(token, chat_id, msg_id, stype, sname) {
@@ -188,16 +322,6 @@ function handle_fptn_token_update(token, chat_id, raw_input, target_sec) {
 
     c.commit(CONFIG_NAME);
 
-    try {
-        let fc = uci_core.cursor();
-        if (fc.load("fptn")) {
-            if (fc.get_all("fptn", "config")) {
-                fc.set("fptn", "config", "access_token", clean_tok);
-                fc.commit("fptn");
-            }
-        }
-    } catch (e) {}
-
     let masked = mask_fptn_token(clean_tok);
 
     if (fptn_count == 0) {
@@ -210,27 +334,10 @@ function handle_fptn_token_update(token, chat_id, raw_input, target_sec) {
 
     send_message(token, chat_id, "⏳ <b>" + t("fptn_token_saved_connecting") + "</b>\nToken: <code>" + escape_html(masked) + "</code>", "HTML");
 
-    // Restart FPTN runtime
-    command_status(command_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/providers/fptn/runtime.uc", "restart-runtime" ]));
-
-    // Poll up to 5 seconds for tun-fptn and table 4249 routing
-    let connected = false;
-    for (let i = 0; i < 5; i++) {
-        let out = command_output_from_args([ "ucode", "-L", LIB_DIR, LIB_DIR + "/providers/fptn/runtime.uc", "status" ]);
-        try {
-            let st = json(out);
-            if (st && st.running && st.tun_up && st.route_installed) {
-                connected = true;
-                break;
-            }
-        } catch (e) {}
-        command_status(command_from_args([ "sleep", "1" ]));
-    }
-
-    if (connected) {
+    let rc = command_status(command_from_args([ "/usr/bin/tachyon", "reload", "force" ]));
+    if (rc == 0) {
         let msg = "✅ <b>" + t("fptn_token_updated_title") + "</b>\n" +
-                  "Token: <code>" + escape_html(masked) + "</code>\n" +
-                  "Status: 🟢 Connected (tun-fptn & routing ready)";
+                  "Token: <code>" + escape_html(masked) + "</code>";
         send_message(token, chat_id, msg, "HTML", [
             [{ text: "⬅️ " + t("nav_menu"), callback_data: "/menu" }]
         ]);
@@ -616,7 +723,8 @@ function handle_sec_sub_add(token, chat_id, msg_id, sec_name, url) {
     }
     c.commit(CONFIG_NAME);
     set_tg_state(chat_id, null);
-    send_message(token, chat_id, "✅ " + t("sub_added") + " <code>" + sec_name + "</code>!", "HTML");
+    send_message(token, chat_id, "✅ " + t("sub_added") + " <code>" + sec_name + "</code>!\n" + t("updating_subs_wait"), "HTML");
+    command_status(command_from_args(["/usr/bin/tachyon", "subscription_update", sec_name]));
     view_sec_subs(token, chat_id, null, sec_name);
 }
 
@@ -818,9 +926,60 @@ function dispatch_command(token, chat_id, text, msg_id) {
     }
     if (cmd == "/qos") return view_qos(token, chat_id, msg_id);
     if (cmd == "/qos_toggle") return handle_qos_toggle(token, chat_id, msg_id);
+    if (cmd == "/notifications" || cmd == "/notify") return view_notifications(token, chat_id, msg_id);
+    if (match(cmd, /^\/notif_tog /)) {
+        let parts = split(trim(substr(cmd, 11)), " ");
+        if (length(parts) >= 1)
+            return handle_notif_toggle(token, chat_id, msg_id, parts[0], parts[1] || "");
+    }
+    if (match(cmd, /^\/notif_all /)) {
+        return handle_notif_all(token, chat_id, msg_id, trim(substr(cmd, 11)));
+    }
+    if (cmd == "/toggles" || cmd == "/features") return view_toggles(token, chat_id, msg_id, "core");
+    if (match(cmd, /^\/(toggles|features) /)) {
+        let grp = trim(replace(cmd, /^\/(toggles|features)[ \t]+/, ""));
+        return view_toggles(token, chat_id, msg_id, grp);
+    }
+    if (match(cmd, /^\/tog /)) {
+        let parts = split(trim(substr(cmd, 5)), " ");
+        if (length(parts) >= 2)
+            return handle_feature_toggle(token, chat_id, msg_id, parts[0], parts[1]);
+    }
+    if (cmd == "/tog_sd_mode") return handle_sd_mode_toggle(token, chat_id, msg_id);
+    if (cmd == "/tog_quic") return handle_quic_cycle(token, chat_id, msg_id);
+    if (cmd == "/profiles") return view_profiles(token, chat_id, msg_id);
+    if (match(cmd, /^\/prof_tog /)) {
+        return handle_profile_toggle(token, chat_id, msg_id, trim(substr(cmd, 10)));
+    }
+    if (cmd == "/schedules") return view_schedules(token, chat_id, msg_id);
+    if (match(cmd, /^\/sched_tog /)) {
+        return handle_schedule_toggle(token, chat_id, msg_id, trim(substr(cmd, 11)), "enabled");
+    }
+    if (match(cmd, /^\/sched_notif /)) {
+        return handle_schedule_toggle(token, chat_id, msg_id, trim(substr(cmd, 13)), "notify");
+    }
 
     if (cmd == "/speed") return exec_speedtest(token, chat_id, msg_id);
     if (cmd == "/ping") return view_ping(token, chat_id, msg_id);
+    if (cmd == "/ping_all") return exec_ping_all_groups(token, chat_id, msg_id, "ping");
+    if (cmd == "/ping_all_groups") return exec_ping_all_groups(token, chat_id, msg_id, "outbounds");
+    if (match(cmd, /^\/ping_group /)) {
+        let parts = split(cmd, " ");
+        let rest = slice(parts, 1);
+        let page = 0;
+        if (length(rest) > 1 && match(trim(rest[0]), /^[0-9]+$/) != null) {
+            page = int(trim(rest[0]));
+            rest = slice(rest, 1);
+        }
+        let grp = trim(join(" ", rest));
+        return exec_ping_group(token, chat_id, msg_id, page, grp);
+    }
+    if (cmd == "/update_subs") return exec_update_subs(token, chat_id, msg_id, null);
+    if (match(cmd, /^\/update_subs /)) {
+        let grp = trim(substr(cmd, 13));
+        return exec_update_subs(token, chat_id, msg_id, grp);
+    }
+    if (cmd == "/update_lists") return exec_update_lists(token, chat_id, msg_id);
     if (cmd == "/test") return view_quick_test(token, chat_id, msg_id);
     if (cmd == "/info") return view_system_info(token, chat_id, msg_id);
     if (cmd == "/help") return view_help(token, chat_id, msg_id);
@@ -929,6 +1088,7 @@ function dispatch_command(token, chat_id, text, msg_id) {
     if (cmd == "/close_connections") return exec_close_connections(token, chat_id);
     if (cmd == "/instances") return view_instances(token, chat_id, msg_id);
     if (cmd == "/check_updates") return exec_check_updates(token, chat_id, msg_id);
+    if (cmd == "/run_check_updates") return exec_run_check_updates(token, chat_id, msg_id);
     
     if (match(cmd, /^\/update_component /)) {
         let comp = trim(substr(cmd, 17));
@@ -937,9 +1097,25 @@ function dispatch_command(token, chat_id, text, msg_id) {
             return;
         }
         let comp_title = rendering.component_display_title(comp);
-        if (msg_id) edit_message(token, chat_id, msg_id, "⏳ <b>" + t("update_component_title") + " " + escape_html(comp_title) + "...</b>\n" + t("update_bg_hint"), "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
-        else send_message(token, chat_id, "⏳ <b>" + t("update_component_title") + " " + escape_html(comp_title) + "...</b>\n" + t("update_bg_hint"), "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
-        command_status(command_from_args(["/usr/bin/tachyon", "component_action_async", comp, "install"]));
+        let res = command_capture(command_from_args(["/usr/bin/tachyon", "component_action_async", comp, "install"]));
+        let parsed = null;
+        if (res && res.output != "") {
+            try { parsed = json(res.output); } catch (e) {}
+        }
+        if (res && res.status == 0 && parsed && parsed.success === true) {
+            // The job runs in the background; remember it so the worker loop can
+            // report the final version (or the error) to this chat.
+            if (parsed.job_id != null && as_string(parsed.job_id) != "")
+                update_jobs.register(parsed.job_id, comp, chat_id, msg_id);
+            let ok_text = "⏳ <b>" + t("update_component_title") + " " + escape_html(comp_title) + "...</b>\n" + t("update_bg_hint");
+            if (msg_id) edit_message(token, chat_id, msg_id, ok_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
+            else send_message(token, chat_id, ok_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
+            return;
+        }
+        let err_msg = (parsed && parsed.message) ? parsed.message : "Failed to start update job";
+        let fail_text = "❌ <b>" + t("update_component_title") + " " + escape_html(comp_title) + ": " + t("action_failed") + "</b>\n" + escape_html(err_msg);
+        if (msg_id) edit_message(token, chat_id, msg_id, fail_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
+        else send_message(token, chat_id, fail_text, "HTML", [[{text:"⬅️ " + t("nav_menu"), callback_data:"/menu"}]]);
         return;
     }
     
@@ -1260,6 +1436,13 @@ function dispatch_command(token, chat_id, text, msg_id) {
 
 return {
     handle_set_tog,
+    handle_notif_toggle,
+    handle_notif_all,
+    handle_feature_toggle,
+    handle_sd_mode_toggle,
+    handle_quic_cycle,
+    handle_profile_toggle,
+    handle_schedule_toggle,
     handle_set_del,
     handle_fptn_token_update,
     handle_switch,

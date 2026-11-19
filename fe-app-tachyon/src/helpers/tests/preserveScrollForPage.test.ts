@@ -170,4 +170,106 @@ describe('preserveScrollForPage', () => {
     // maincontent scrollTop should be restored
     expect(mainContentEl.scrollTop).toBe(350);
   });
+
+  it('locks documentElement minHeight at scrollY=0 when #maincontent exists but is not a scrollable container', () => {
+    const mainContentEl = {
+      scrollTop: 0,
+      scrollHeight: 1500,
+      style: {},
+    };
+    (globalThis as any).document.getElementById = (id: string) =>
+      id === 'maincontent' ? mainContentEl : null;
+    (globalThis as any).window.getComputedStyle = () => ({
+      overflowY: 'visible',
+    });
+
+    let docMinHeightDuringRender = '';
+    preserveScrollForPage(() => {
+      docMinHeightDuringRender =
+        (globalThis as any).document.documentElement.style.minHeight || '';
+    });
+
+    expect(docMinHeightDuringRender).toBe('1000px');
+    vi.advanceTimersByTime(20);
+    expect((globalThis as any).document.documentElement.style.minHeight).toBe(
+      '',
+    );
+  });
+
+  it('does NOT lock documentElement minHeight at scrollTop=0 when #maincontent has overflow-y: auto (Footstrap desktop)', () => {
+    const mainContentEl = {
+      scrollTop: 0,
+      scrollHeight: 1500,
+      style: {},
+    };
+    (globalThis as any).document.getElementById = (id: string) =>
+      id === 'maincontent' ? mainContentEl : null;
+    (globalThis as any).window.getComputedStyle = () => ({
+      overflowY: 'auto',
+    });
+
+    preserveScrollForPage(() => {});
+
+    expect(
+      (globalThis as any).document.documentElement.style.minHeight,
+    ).toBeUndefined();
+  });
+
+  it('suppresses Footstrap fsAnchor on init and restores on pagehide', () => {
+    const store: Record<string, string> = {};
+    const origStorage = (globalThis as any).localStorage;
+    (globalThis as any).localStorage = {
+      getItem: (k: string) => (k in store ? store[k] : null),
+      setItem: (k: string, v: string) => {
+        store[k] = v;
+      },
+      removeItem: (k: string) => {
+        delete store[k];
+      },
+    };
+    try {
+      _resetUserScrollTrackingForTest();
+      ensureUserScrollTracking();
+      expect(store.fsAnchor).toBe('off');
+
+      (globalThis as any).window.dispatchEvent({ type: 'pagehide' });
+      expect(store.fsAnchor).toBeUndefined();
+
+      (globalThis as any).window.dispatchEvent({ type: 'pageshow' });
+      expect(store.fsAnchor).toBe('off');
+      expect(store.fsFit).toBe('off');
+    } finally {
+      _resetUserScrollTrackingForTest();
+      (globalThis as any).localStorage = origStorage;
+    }
+  });
+
+  it('restores scroll position even when DOM replacement fires a synthetic scroll event during render', () => {
+    const scrollToMock = (globalThis as any).window.scrollTo;
+    (globalThis as any).window.scrollY = 480;
+
+    preserveScrollForPage(() => {
+      // Simulate iOS WebKit / Footstrap clamping scrollY to 0 and dispatching a 'scroll' event
+      (globalThis as any).window.scrollY = 0;
+      (globalThis as any).window.dispatchEvent({ type: 'scroll' });
+    });
+
+    vi.advanceTimersByTime(20);
+    expect(scrollToMock).toHaveBeenCalledWith({ top: 480 });
+    expect(isUserActivelyScrolling()).toBe(false);
+  });
+
+  it('clears Footstrap [data-fs-floor] minHeight locks before rendering', () => {
+    const floorEl: any = {
+      style: { minHeight: '1400px' },
+      removeAttribute: vi.fn(),
+    };
+    (globalThis as any).document.querySelectorAll = (sel: string) =>
+      sel === '[data-fs-floor]' ? [floorEl] : [];
+
+    preserveScrollForPage(() => {});
+
+    expect(floorEl.style.minHeight).toBe('');
+    expect(floorEl.removeAttribute).toHaveBeenCalledWith('data-fs-floor');
+  });
 });

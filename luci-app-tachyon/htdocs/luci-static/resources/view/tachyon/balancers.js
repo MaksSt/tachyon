@@ -7,6 +7,7 @@
 
 const UCI_PACKAGE = main.TACHYON_UCI_PACKAGE || "tachyon";
 const SECTION_CACHE_DIR = "/var/run/tachyon/section-cache";
+const SUB_CACHE_DIR = "/etc/tachyon/subscription-cache";
 
 const COMMON_COUNTRIES = [
   ["NL", "🇳🇱 Netherlands (NL)"],
@@ -53,6 +54,12 @@ const PROTOCOL_CHOICES = [
   ["shadowtls", "ShadowTLS"],
   ["snell", "Snell"],
   ["sudoku", "Sudoku"],
+  ["warp", "WARP"],
+  ["tewfai", "TewFai"],
+  ["csqtt", "CSQTT"],
+  ["tailscale", "Tailscale"],
+  ["tor", "Tor"],
+  ["desync", "Native Desync"],
   ["socks", "SOCKS5 / Tor"],
   ["http", "HTTP"],
   ["direct", "Direct"],
@@ -92,7 +99,7 @@ const URLTEST_URL_CHOICES = [
   "https://captive.apple.com/hotspot-detect.html",
 ];
 
-const DPI_SOURCE_TYPES = new Set(["zapret", "zapret2", "byedpi", "desync"]);
+const DPI_SOURCE_TYPES = new Set(["desync"]);
 
 let cachedPoolChoices = null;
 let cachedPoolFetchedAt = 0;
@@ -117,112 +124,236 @@ function loadGlobalPoolChoices() {
     .filter((n) => n && /^[A-Za-z0-9_-]+$/.test(n));
   if (!secNames.includes("Main")) secNames.unshift("Main");
 
-  const readCache = (secName) => {
-    const path = `${SECTION_CACHE_DIR}/${secName}.json`;
-    return fs
+  const isNotFoundErr = (err) => {
+    const msg = `${String((err && err.name) || "")} ${String((err && err.message) || err || "")}`;
+    return /NotFoundError|ENOENT|No such file or directory|Object not found|-32000/i.test(
+      msg,
+    );
+  };
+
+  const readJsonFile = (path, allowDirect = true) =>
+    fs
       .read(path)
-      .catch(() =>
+      .catch((err) =>
+        allowDirect &&
+        !isNotFoundErr(err) &&
         typeof fs.read_direct === "function"
           ? fs.read_direct(path, "text")
           : Promise.resolve("{}"),
       )
       .then((raw) => JSON.parse(raw || "{}"))
       .catch(() => ({}));
-  };
 
-  return Promise.all(secNames.map(readCache)).then((caches) => {
-    const serverMap = new Map();
-    const countrySet = new Set();
-    const prefixSet = new Set();
-
-    (uci.sections(UCI_PACKAGE, "outbound_source") || []).forEach((src) => {
-      if (src.node_prefix) prefixSet.add(String(src.node_prefix).trim());
-      const stype = String(src.source_type || "subscription").toLowerCase();
-      if (DPI_SOURCE_TYPES.has(stype)) return;
-      const sname = String(src.name || src[".name"] || "").trim();
-      asArray(src.proxy_links || src.selector_proxy_links).forEach((link) => {
-        const lname =
-          (typeof main.getProxyUrlName === "function" &&
-            main.getProxyUrlName(link)) ||
-          link;
-        if (lname && !serverMap.has(lname)) {
-          serverMap.set(lname, lname);
-        }
-      });
-      if (stype !== "subscription" && stype !== "proxy_links" && sname) {
-        const badge = stype.toUpperCase();
-        if (!serverMap.has(sname)) {
-          serverMap.set(sname, `${sname} [${badge}]`);
-        }
-      }
-    });
-
-    caches.forEach((c) => {
-      const meta = (c && c.outboundMetadata) || {};
-      const groups = (c && c.urltestGroups) || {};
-      const pgroups = (c && c.priorityGroups) || {};
-      const rawHidden = (c && c.hiddenOutboundTags) || {};
-      const hiddenSet = new Set(
-        Array.isArray(rawHidden) ? rawHidden : Object.keys(rawHidden),
+  const readSectionCaches = () =>
+    (typeof fs.list === "function"
+      ? fs
+          .list(SECTION_CACHE_DIR)
+          .then((entries) =>
+            Array.isArray(entries)
+              ? new Set(
+                  entries
+                    .map((e) => String((e && e.name) || ""))
+                    .filter(Boolean),
+                )
+              : null,
+          )
+          .catch(() => null)
+      : Promise.resolve(null)
+    ).then((existingFiles) => {
+      const candidates =
+        existingFiles !== null
+          ? secNames.filter((secName) => existingFiles.has(`${secName}.json`))
+          : secNames;
+      const allowDirect = existingFiles !== null;
+      return Promise.all(
+        candidates.map((secName) =>
+          readJsonFile(`${SECTION_CACHE_DIR}/${secName}.json`, allowDirect),
+        ),
       );
-      const names = meta.names || {};
-      const countries = meta.countries || {};
-      const protocols = meta.protocols || {};
-      const transports = meta.transports || {};
-      const prefixes = meta.prefixes || {};
+    });
 
-      Object.entries(names).forEach(([tag, rawName]) => {
-        if (groups[tag] || pgroups[tag] || hiddenSet.has(tag)) return;
-        const name = String(rawName || "").trim();
-        if (!name) return;
-        const proto = String(protocols[tag] || "").toUpperCase();
-        if (proto === "URLTEST" || proto === "SELECTOR") return;
-        const trans = String(transports[tag] || "").toUpperCase();
-        const badge =
-          proto && trans && proto !== trans
-            ? `${proto}+${trans}`
-            : proto || trans;
-        const label = badge ? `${name} [${badge}]` : name;
-        if (!serverMap.has(name)) {
-          serverMap.set(name, label);
+  const readSubCaches = () =>
+    fs
+      .list(SUB_CACHE_DIR)
+      .catch(() => [])
+      .then((entries) => {
+        const list = Array.isArray(entries) ? entries : [];
+        const jsonFiles = list
+          .map((e) => String((e && e.name) || ""))
+          .filter(
+            (n) =>
+              n.endsWith(".json") &&
+              !n.endsWith(".metadata.json") &&
+              n.includes("-subscription-"),
+          );
+        return Promise.all(
+          jsonFiles.map((fname) => readJsonFile(`${SUB_CACHE_DIR}/${fname}`)),
+        );
+      })
+      .catch(() => []);
+
+  return Promise.all([readSectionCaches(), readSubCaches()]).then(
+    ([caches, subCaches]) => {
+      const serverMap = new Map();
+      const countrySet = new Set();
+      const prefixSet = new Set();
+
+      (uci.sections(UCI_PACKAGE, "outbound_source") || []).forEach((src) => {
+        if (src.node_prefix) prefixSet.add(String(src.node_prefix).trim());
+        const stype = String(src.source_type || "subscription").toLowerCase();
+        const sname = String(src.name || src[".name"] || "").trim();
+        const rawLinks = [
+          ...asArray(src.proxy_links),
+          ...asArray(src.selector_proxy_links),
+          ...String(src.proxy_links_text || "")
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean),
+          ...String(src.selector_proxy_links_text || "")
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean),
+        ];
+        Array.from(new Set(rawLinks)).forEach((link) => {
+          const lname =
+            (typeof main.getProxyUrlName === "function" &&
+              main.getProxyUrlName(link)) ||
+            link;
+          if (lname && !serverMap.has(lname)) {
+            serverMap.set(lname, lname);
+          }
+        });
+        if (stype === "amnezia_config" || stype === "awg") {
+          const awgList = asArray(
+            src.amnezia_configs || src.selector_amnezia_configs,
+          );
+          if (awgList.length > 0) {
+            awgList.forEach((entry) => {
+              let cname = sname;
+              try {
+                const parsed = JSON.parse(entry);
+                if (
+                  parsed &&
+                  typeof parsed.name === "string" &&
+                  parsed.name.trim()
+                ) {
+                  cname = parsed.name.trim();
+                }
+              } catch (_e) {}
+              if (cname && !serverMap.has(cname)) {
+                serverMap.set(cname, `${cname} [AMNEZIAWG]`);
+              }
+            });
+          } else if (sname && !serverMap.has(sname)) {
+            serverMap.set(sname, `${sname} [AMNEZIAWG]`);
+          }
+        } else if (
+          stype !== "subscription" &&
+          stype !== "proxy_links" &&
+          sname
+        ) {
+          const badge = stype.toUpperCase();
+          if (!serverMap.has(sname)) {
+            serverMap.set(sname, `${sname} [${badge}]`);
+          }
         }
       });
 
-      Object.values(countries).forEach((cc) => {
-        const code = String(cc || "")
-          .trim()
-          .toUpperCase();
-        if (code.length === 2) countrySet.add(code);
+      (subCaches || []).forEach((sc) => {
+        const outbounds = Array.isArray(sc && sc.outbounds) ? sc.outbounds : [];
+        outbounds.forEach((ob) => {
+          if (!ob || typeof ob !== "object") return;
+          const name = String(ob.tag || ob.name || "").trim();
+          if (!name) return;
+          const proto = String(ob.type || "").toUpperCase();
+          if (proto === "URLTEST" || proto === "SELECTOR" || proto === "DIRECT")
+            return;
+          const trans = String(
+            (ob.transport && ob.transport.type) || "",
+          ).toUpperCase();
+          const badge =
+            proto && trans && proto !== trans
+              ? `${proto}+${trans}`
+              : proto || trans;
+          const label = badge ? `${name} [${badge}]` : name;
+          if (!serverMap.has(name)) {
+            serverMap.set(name, label);
+          }
+        });
       });
 
-      Object.values(prefixes).forEach((p) => {
-        const pfx = String(p || "").trim();
-        if (pfx) prefixSet.add(pfx);
+      caches.forEach((c) => {
+        const meta = (c && c.outboundMetadata) || {};
+        const groups = (c && c.urltestGroups) || {};
+        const pgroups = (c && c.priorityGroups) || {};
+        const rawHidden = (c && c.hiddenOutboundTags) || {};
+        const hiddenSet = new Set(
+          Array.isArray(rawHidden) ? rawHidden : Object.keys(rawHidden),
+        );
+        const names = meta.names || {};
+        const countries = meta.countries || {};
+        const protocols = meta.protocols || {};
+        const transports = meta.transports || {};
+        const prefixes = meta.prefixes || {};
+
+        Object.entries(names).forEach(([tag, rawName]) => {
+          if (groups[tag] || pgroups[tag] || hiddenSet.has(tag)) return;
+          const name = String(rawName || "").trim();
+          if (!name) return;
+          const proto = String(protocols[tag] || "").toUpperCase();
+          if (proto === "URLTEST" || proto === "SELECTOR") return;
+          const trans = String(transports[tag] || "").toUpperCase();
+          const pfx = String(prefixes[tag] || "").trim();
+          const val =
+            pfx && !name.startsWith(`${pfx}: `) && !name.startsWith(`[${pfx}]`)
+              ? `[${pfx}] ${name}`
+              : name;
+          const badge =
+            proto && trans && proto !== trans
+              ? `${proto}+${trans}`
+              : proto || trans;
+          const label = badge ? `${val} [${badge}]` : val;
+          if (!serverMap.has(val)) {
+            serverMap.set(val, label);
+          }
+        });
+
+        Object.values(countries).forEach((cc) => {
+          const code = String(cc || "")
+            .trim()
+            .toUpperCase();
+          if (code.length === 2) countrySet.add(code);
+        });
+
+        Object.values(prefixes).forEach((p) => {
+          const pfx = String(p || "").trim();
+          if (pfx) prefixSet.add(pfx);
+        });
       });
-    });
 
-    const servers = Array.from(serverMap.entries())
-      .map(([value, label]) => ({ value, label }))
-      .sort((a, b) => a.label.localeCompare(b.label));
+      const servers = Array.from(serverMap.entries())
+        .map(([value, label]) => ({ value, label }))
+        .sort((a, b) => a.label.localeCompare(b.label));
 
-    const countryMap = new Map(COMMON_COUNTRIES);
-    countrySet.forEach((cc) => {
-      if (!countryMap.has(cc)) {
-        countryMap.set(cc, `${isoToFlagEmoji(cc)} ${cc}`);
-      }
-    });
-    const countries = Array.from(countryMap.entries()).map(
-      ([value, label]) => ({ value, label }),
-    );
+      const countryMap = new Map(COMMON_COUNTRIES);
+      countrySet.forEach((cc) => {
+        if (!countryMap.has(cc)) {
+          countryMap.set(cc, `${isoToFlagEmoji(cc)} ${cc}`);
+        }
+      });
+      const countries = Array.from(countryMap.entries()).map(
+        ([value, label]) => ({ value, label }),
+      );
 
-    const prefixes = Array.from(prefixSet)
-      .filter(Boolean)
-      .map((p) => ({ value: p, label: p }));
+      const prefixes = Array.from(prefixSet)
+        .filter(Boolean)
+        .map((p) => ({ value: p, label: p }));
 
-    cachedPoolChoices = { servers, countries, prefixes };
-    cachedPoolFetchedAt = Date.now();
-    return cachedPoolChoices;
-  });
+      cachedPoolChoices = { servers, countries, prefixes };
+      cachedPoolFetchedAt = Date.now();
+      return cachedPoolChoices;
+    },
+  );
 }
 
 function asArray(val) {
@@ -233,6 +364,24 @@ function asArray(val) {
     .split(/[\s,]+/)
     .map((v) => v.trim())
     .filter(Boolean);
+}
+
+function parsePriorityLevelsList(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw))
+    return raw.map((v) => String(v || "").trim()).filter(Boolean);
+  const str = String(raw || "").trim();
+  if (!str) return [];
+  if (str.startsWith("srv:")) return [str];
+  return asArray(str);
+}
+
+function asServerList(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw))
+    return raw.map((v) => String(v || "").trim()).filter(Boolean);
+  const str = String(raw || "").trim();
+  return str ? [str] : [];
 }
 
 function sectionsUsingRef(refKey, targetId) {
@@ -268,42 +417,69 @@ function summarizeBalancer(sectionId) {
   const btype = (
     uci.get(UCI_PACKAGE, sectionId, "balancer_type") || "urltest"
   ).toLowerCase();
-  const resolveEntityName = (id) =>
-    id === "direct"
-      ? _("Direct Connection (Fallback)")
-      : uci.get(UCI_PACKAGE, id, "name") ||
-        uci.get(UCI_PACKAGE, id, "label") ||
-        id;
+  const resolveEntityName = (id) => {
+    if (id === "direct") return _("Direct Connection (Fallback)");
+    if (String(id).startsWith("srv:")) return String(id).slice(4);
+    return (
+      uci.get(UCI_PACKAGE, id, "name") ||
+      uci.get(UCI_PACKAGE, id, "label") ||
+      id
+    );
+  };
   if (btype === "priority") {
-    const levels = asArray(
-      uci.get(UCI_PACKAGE, sectionId, "outbound_group_levels"),
-    ).map(resolveEntityName);
+    let levelList = [];
+    for (const sid of sectionsUsingRef("balancer_refs", sectionId)) {
+      const secLevels = parsePriorityLevelsList(
+        uci.get(UCI_PACKAGE, sid, "outbound_group_levels"),
+      );
+      if (secLevels.length) {
+        levelList = secLevels;
+        break;
+      }
+    }
+    if (!levelList.length) {
+      levelList = parsePriorityLevelsList(
+        uci.get(UCI_PACKAGE, sectionId, "outbound_group_levels"),
+      );
+    }
+    const levels = levelList.map(resolveEntityName);
     const interval =
-      uci.get(UCI_PACKAGE, sectionId, "active_check_interval") || "5s";
-    return `${_("Priority Failover")} (${_("Tiers")}: ${levels.length ? levels.join(" → ") : _("Section Pool")}, ${_("Check")}: ${interval})`;
+      uci.get(UCI_PACKAGE, sectionId, "active_check_interval") || "15s";
+    const extraUrls = asArray(uci.get(UCI_PACKAGE, sectionId, "health_urls"));
+    const multiPart = extraUrls.length
+      ? `, +${extraUrls.length} URL (${uci.get(UCI_PACKAGE, sectionId, "multi_url_strategy") || "worst_case"})`
+      : "";
+    return `${_("Priority Failover")} (${_("Tiers")}: ${levels.length ? levels.join(" → ") : _("Section Pool")}, ${_("Check")}: ${interval}${multiPart})`;
   }
   const url =
     uci.get(UCI_PACKAGE, sectionId, "testing_url") ||
     "https://www.gstatic.com/generate_204";
   const interval = uci.get(UCI_PACKAGE, sectionId, "check_interval") || "3m";
   const tol = uci.get(UCI_PACKAGE, sectionId, "tolerance") || "50";
+  const activeCheck =
+    uci.get(UCI_PACKAGE, sectionId, "urltest_active_check_interval") ||
+    uci.get(UCI_PACKAGE, sectionId, "active_check_interval") ||
+    "";
+  const extraUrls = asArray(uci.get(UCI_PACKAGE, sectionId, "testing_urls"));
+  const activePart = activeCheck
+    ? `, ${_("Active Check")}: ${activeCheck}`
+    : "";
+  const multiPart = extraUrls.length
+    ? `, +${extraUrls.length} URL (${uci.get(UCI_PACKAGE, sectionId, "multi_url_strategy") || "worst_case"})`
+    : "";
   const parts = [
-    `URLTest (${_("Interval")}: ${interval}, ${_("Tolerance")}: ${tol} ms)`,
+    `URLTest (${_("Interval")}: ${interval}, ${_("Tolerance")}: ${tol} ms${activePart}${multiPart})`,
   ];
-  const srcRefs = asArray(uci.get(UCI_PACKAGE, sectionId, "source_refs")).map(
-    resolveEntityName,
-  );
-  const grpRefs = asArray(uci.get(UCI_PACKAGE, sectionId, "group_refs")).map(
-    resolveEntityName,
-  );
   const fmode = uci.get(UCI_PACKAGE, sectionId, "filter_mode") || "disabled";
-  if (srcRefs.length) parts.push(`${_("Sources")}: ${srcRefs.join(", ")}`);
-  if (grpRefs.length) parts.push(`${_("Groups")}: ${grpRefs.join(", ")}`);
   if (fmode !== "disabled") {
     const incC = asArray(uci.get(UCI_PACKAGE, sectionId, "include_countries"));
     const excC = asArray(uci.get(UCI_PACKAGE, sectionId, "exclude_countries"));
-    const incO = asArray(uci.get(UCI_PACKAGE, sectionId, "include_outbounds"));
-    const excO = asArray(uci.get(UCI_PACKAGE, sectionId, "exclude_outbounds"));
+    const incO = asServerList(
+      uci.get(UCI_PACKAGE, sectionId, "include_outbounds"),
+    );
+    const excO = asServerList(
+      uci.get(UCI_PACKAGE, sectionId, "exclude_outbounds"),
+    );
     const incR = asArray(uci.get(UCI_PACKAGE, sectionId, "include_regex"));
     const excR = asArray(uci.get(UCI_PACKAGE, sectionId, "exclude_regex"));
     if (incC.length) parts.push(`+${incC.join(",")}`);
@@ -375,17 +551,13 @@ function escapeHtml(str) {
 }
 
 function createBalancersContent(section) {
-  section.tab("general", _("Policy Settings"));
-  section.tab("pool", _("Server Pool & Filters"));
-
-  let o = section.taboption("general", form.Flag, "enabled", _("Enable"));
+  let o = section.option(form.Flag, "enabled", _("Enable"));
   o.default = "1";
   o.rmempty = false;
   o.editable = true;
   o.width = "5rem";
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.Value,
     "name",
     _("Balancer Name"),
@@ -400,8 +572,7 @@ function createBalancersContent(section) {
     return uci.get(UCI_PACKAGE, sectionId, "name") || sectionId;
   };
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.ListValue,
     "balancer_type",
     _("Balancer Type"),
@@ -414,12 +585,77 @@ function createBalancersContent(section) {
   o.value("urltest", _("URLTest (Lowest Latency)"));
   o.value("priority", _("Priority (Ordered Failover Tiers)"));
 
-  o = section.taboption(
-    "general",
-    form.DummyValue,
-    "_used_in",
-    _("Used in Sections"),
+  o = section.option(
+    form.ListValue,
+    "mode",
+    _("Selection Algorithm"),
+    _(
+      "Native Rust kernel balancing mode for URLTest pools: Stability filters out jittery/lossy nodes, Sticky pins flows via Rendezvous HRW hashing, Least Load spreads concurrent streams, Weighted distributes proportionally to 1/RTT², Passive quarantines nodes dropping streams early (< 64 KiB), and Hedged races a backup node when handshake stalls.",
+    ),
   );
+  o.modalonly = true;
+  o.default = "least_test";
+  o.value("least_test", _("Fastest (Lowest RTT)"));
+  o.value("stability", _("Stability (EWMA + RFC 3550 Jitter + Loss Penalty)"));
+  o.value("sticky", _("Sticky Flow (Rendezvous HRW by Client / Domain)"));
+  o.value("least_load", _("Least Load (Active Connections × RTT)"));
+  o.value("weighted", _("Weighted (Smooth WRR by 1/RTT²)"));
+  o.value("passive", _("Passive Circuit Breaker (Early-Abort Quarantine)"));
+  o.value("hedged", _("Hedged (Happy Eyeballs Parallel Backup)"));
+  o.value("throughput", _("Throughput (Active Bandwidth Decay)"));
+  o.value("quota", _("Quota (Traffic Quota Balancer)"));
+  o.value("round_robin", _("Round-Robin Pool"));
+  o.value("failover", _("Failover (Pin Current Until Failure)"));
+  o.depends("balancer_type", "urltest");
+
+  o = section.option(
+    form.DynamicList,
+    "sticky_hash",
+    _("Sticky Hash Components"),
+    _(
+      "Flow fields combined for Rendezvous HRW stickiness (domain is automatically normalized to eTLD+1 so subdomains stay on the same exit IP).",
+    ),
+  );
+  o.modalonly = true;
+  o.value("source_ip", _("Client LAN IP (source_ip)"));
+  o.value("domain", _("Registrable Domain eTLD+1 (domain)"));
+  o.value("dest_ip", _("Destination IP (dest_ip)"));
+  o.value("dest_port", _("Destination Port (dest_port)"));
+  o.value("process", _("Local Process (process)"));
+  o.depends({ balancer_type: "urltest", mode: "sticky" });
+  o.depends({ balancer_type: "urltest", mode: "round_robin" });
+
+  o = section.option(
+    form.Value,
+    "balancer_pool",
+    _("Active Pool Size (Top N Nodes)"),
+    _(
+      "Maximum number of fastest healthy nodes included in the active balancing pool (0 or empty = all healthy nodes within tolerance).",
+    ),
+  );
+  o.modalonly = true;
+  o.placeholder = "4";
+  o.depends({ balancer_type: "urltest", mode: "sticky" });
+  o.depends({ balancer_type: "urltest", mode: "round_robin" });
+  o.depends({ balancer_type: "urltest", mode: "least_load" });
+  o.depends({ balancer_type: "urltest", mode: "weighted" });
+  o.depends({ balancer_type: "urltest", mode: "hedged" });
+  o.depends({ balancer_type: "urltest", mode: "throughput" });
+  o.depends({ balancer_type: "urltest", mode: "quota" });
+
+  o = section.option(
+    form.Value,
+    "quota_mib",
+    _("Traffic Quota per Node (MiB)"),
+    _(
+      "Soft traffic cap per node in MiB before shifting new streams to remaining under-quota nodes.",
+    ),
+  );
+  o.modalonly = true;
+  o.placeholder = "10240";
+  o.depends({ balancer_type: "urltest", mode: "quota" });
+
+  o = section.option(form.DummyValue, "_used_in", _("Used in Sections"));
   o.modalonly = false;
   o.cfgvalue = function (sectionId) {
     const used = sectionsUsingRef("balancer_refs", sectionId).map(
@@ -431,8 +667,7 @@ function createBalancersContent(section) {
     return used.length ? used.join(", ") : "—";
   };
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.DynamicList,
     "_target_sections",
     _("Used in Sections"),
@@ -461,12 +696,7 @@ function createBalancersContent(section) {
     updateSectionsRef("balancer_refs", sectionId, []);
   };
 
-  o = section.taboption(
-    "general",
-    form.DummyValue,
-    "_summary",
-    _("Policy Summary"),
-  );
+  o = section.option(form.DummyValue, "_summary", _("Policy Summary"));
   o.modalonly = false;
   o.rawhtml = true;
   o.cfgvalue = function (sectionId) {
@@ -477,16 +707,73 @@ function createBalancersContent(section) {
     return this.cfgvalue(sectionId);
   };
 
-  // URLTest fields
-  o = section.taboption("general", form.Value, "testing_url", _("Testing URL"));
+  // URLTest & Priority URL fields
+  o = section.option(form.Value, "testing_url", _("Testing URL"));
   o.modalonly = true;
   o.default = "https://www.gstatic.com/generate_204";
   o.placeholder = "https://www.gstatic.com/generate_204";
   o.depends("balancer_type", "urltest");
   URLTEST_URL_CHOICES.forEach((u) => o.value(u));
 
-  o = section.taboption(
-    "general",
+  o = section.option(
+    form.DynamicList,
+    "testing_urls",
+    _("Additional Testing URLs (Multi-URL)"),
+    _(
+      "Optional additional URLs to probe simultaneously with Testing URL. A server is considered fully healthy only when all configured URLs succeed (unless fallback activates).",
+    ),
+  );
+  o.modalonly = true;
+  o.placeholder = "https://cp.cloudflare.com/generate_204";
+  o.depends("balancer_type", "urltest");
+  URLTEST_URL_CHOICES.forEach((u) => o.value(u));
+
+  o = section.option(form.Value, "health_url", _("Health Check URL"));
+  o.modalonly = true;
+  o.default = "https://www.gstatic.com/generate_204";
+  o.placeholder = "https://www.gstatic.com/generate_204";
+  o.depends("balancer_type", "priority");
+  URLTEST_URL_CHOICES.forEach((u) => o.value(u));
+
+  o = section.option(
+    form.DynamicList,
+    "health_urls",
+    _("Additional Health Check URLs (Multi-URL)"),
+    _(
+      "Optional additional URLs to probe simultaneously with Health Check URL. If no server passes 100% of URLs, Fallback mode selects the server with the highest number of reachable URLs (> 0).",
+    ),
+  );
+  o.modalonly = true;
+  o.placeholder = "https://cp.cloudflare.com/generate_204";
+  o.depends("balancer_type", "priority");
+  URLTEST_URL_CHOICES.forEach((u) => o.value(u));
+
+  o = section.option(
+    form.ListValue,
+    "multi_url_strategy",
+    _("Multi-URL Evaluation Strategy"),
+    _(
+      "How combined latency is calculated across multiple URLs when selecting the best server. Note: background probe count scales with URL count (N servers × M URLs); if no server passes 100% of URLs, automatic partial-match Fallback is activated.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "worst_case";
+  o.value(
+    "worst_case",
+    _("Worst-case (Max latency across URLs — penalizes slow routes)"),
+  );
+  o.value("best_case", _("Best-case (Min latency across URLs)"));
+  o.value(
+    "best_case_target",
+    _(
+      "Best-case + Target check (100% URLs must pass, latency measured by primary URL #1)",
+    ),
+  );
+  o.value("average", _("Average (Mean latency across all URLs)"));
+  o.depends("balancer_type", "urltest");
+  o.depends("balancer_type", "priority");
+
+  o = section.option(
     form.Value,
     "check_interval",
     _("Check Interval"),
@@ -497,8 +784,52 @@ function createBalancersContent(section) {
   o.placeholder = "3m";
   o.depends("balancer_type", "urltest");
 
-  o = section.taboption(
-    "general",
+  o = section.option(
+    form.Value,
+    "check_interval_jitter",
+    _("Check Interval Randomization (Jitter)"),
+    _(
+      "Randomize the URLTest interval across groups and reboots (e.g. 15%, 25%, or 30s) to avoid synchronized periodic probe bursts.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "";
+  o.placeholder = _("Disabled (Exact interval)");
+  o.value("", _("Disabled (Exact interval)"));
+  o.value("15%", _("±15% (Recommended — spreads probe intervals)"));
+  o.value("25%", _("±25% (Medium randomization)"));
+  o.value("40%", _("±40% (High randomization)"));
+  o.depends("balancer_type", "urltest");
+
+  o = section.option(
+    form.Value,
+    "urltest_active_check_interval",
+    _("Active Check Interval"),
+    _(
+      "Optional fast background health check interval for the currently active server ONLY (e.g. 10s or 15s). Triggers an immediate failover check if the active server stops responding, without pinging the entire pool every few seconds.",
+    ),
+  );
+  o.modalonly = true;
+  o.placeholder = _("Disabled (e.g. 10s)");
+  o.depends("balancer_type", "urltest");
+  o.cfgvalue = function (sectionId) {
+    return (
+      uci.get(UCI_PACKAGE, sectionId, "urltest_active_check_interval") || ""
+    );
+  };
+  o.write = function (sectionId, value) {
+    const trimmed = String(value || "").trim();
+    if (trimmed) {
+      uci.set(UCI_PACKAGE, sectionId, "urltest_active_check_interval", trimmed);
+    } else {
+      uci.unset(UCI_PACKAGE, sectionId, "urltest_active_check_interval");
+    }
+  };
+  o.remove = function (sectionId) {
+    uci.unset(UCI_PACKAGE, sectionId, "urltest_active_check_interval");
+  };
+
+  o = section.option(
     form.Value,
     "tolerance",
     _("Latency Tolerance (ms)"),
@@ -509,76 +840,29 @@ function createBalancersContent(section) {
   o.placeholder = "50";
   o.depends("balancer_type", "urltest");
 
-  o = section.taboption(
-    "general",
-    form.Value,
-    "idle_timeout",
-    _("Idle Timeout"),
-  );
+  o = section.option(form.Value, "idle_timeout", _("Idle Timeout"));
   o.modalonly = true;
   o.default = "30m";
   o.placeholder = "30m";
   o.depends("balancer_type", "urltest");
 
-  // Priority fields
-  o = section.taboption(
-    "general",
-    form.DynamicList,
-    "outbound_group_levels",
-    _("Priority Tiers (Outbound Groups)"),
-    _(
-      "Ordered list of Outbound Group IDs (or 'direct' for direct fallback). Tier 1 is tried first, then Tier 2, etc.",
-    ),
-  );
-  o.modalonly = true;
-  o.depends("balancer_type", "priority");
-  o.load = function () {
-    this.keylist = [];
-    this.vallist = [];
-    (uci.sections(UCI_PACKAGE, "outbound_group") || []).forEach((g) => {
-      const gid = g[".name"];
-      if (gid) this.value(gid, g.name || g.label || gid);
-    });
-    this.value("direct", _("Direct Connection (Fallback)"));
-    return form.DynamicList.prototype.load.apply(this, arguments);
-  };
-
-  o = section.taboption(
-    "general",
-    form.Value,
-    "health_url",
-    _("Health Check URL"),
-  );
-  o.modalonly = true;
-  o.default = "https://www.gstatic.com/generate_204";
-  o.placeholder = "https://www.gstatic.com/generate_204";
-  o.depends("balancer_type", "priority");
-  URLTEST_URL_CHOICES.forEach((u) => o.value(u));
-
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.Value,
     "active_check_interval",
     _("Active Check Interval"),
   );
   o.modalonly = true;
-  o.default = "5s";
-  o.placeholder = "5s";
+  o.default = "15s";
+  o.placeholder = "15s";
   o.depends("balancer_type", "priority");
 
-  o = section.taboption(
-    "general",
-    form.Value,
-    "check_timeout",
-    _("Check Timeout"),
-  );
+  o = section.option(form.Value, "check_timeout", _("Check Timeout"));
   o.modalonly = true;
   o.default = "3s";
   o.placeholder = "3s";
   o.depends("balancer_type", "priority");
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.Value,
     "recovery_check_interval",
     _("Recovery Check Interval"),
@@ -588,8 +872,7 @@ function createBalancersContent(section) {
   o.placeholder = "30s";
   o.depends("balancer_type", "priority");
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.Flag,
     "pick_fastest",
     _("Select the fastest node"),
@@ -601,8 +884,7 @@ function createBalancersContent(section) {
   o.default = "1";
   o.depends("balancer_type", "priority");
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.Flag,
     "switch_to_faster_same_priority",
     _("Pick Fastest Server Within Active Tier"),
@@ -614,368 +896,58 @@ function createBalancersContent(section) {
   o.default = "0";
   o.depends("balancer_type", "priority");
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.Value,
     "fastest_check_interval",
     _("Faster server search interval"),
-    _("Use sing-box duration format like 1d, 12h or 30m"),
+    _("Use duration format like 1d, 12h or 30m"),
   );
   o.modalonly = true;
   o.default = "3m";
   o.placeholder = "3m";
   o.depends({ balancer_type: "priority", switch_to_faster_same_priority: "1" });
 
-  o = section.taboption(
-    "general",
+  o = section.option(
     form.Flag,
     "interrupt_exist_connections",
     _("Interrupt Existing Connections on Switch"),
+    _(
+      "Close active TCP/UDP sessions routed through the previous node when the balancer switches to a new server so traffic immediately moves to the new route instead of staying on the old or stalled connection.",
+    ),
   );
   o.modalonly = true;
   o.default = "1";
-
-  o = section.taboption(
-    "general",
-    form.Flag,
-    "pin_dashboard",
-    _("Pin to Dashboard"),
-  );
-  o.modalonly = true;
-  o.default = "1";
-
-  // Tab 2: Server Pool & Filters (subscriptions, groups, countries, regex)
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "source_refs",
-    _("Subscriptions / Outbound Sources"),
-    _(
-      "Select subscriptions or sources from the Outbounds tab. Leave empty to use all servers available in the attached Section.",
-    ),
-  );
-  o.modalonly = true;
-  o.load = function () {
-    this.keylist = [];
-    this.vallist = [];
-    (uci.sections(UCI_PACKAGE, "outbound_source") || []).forEach((src) => {
-      const sid = src[".name"];
-      if (!sid) return;
-      const stypeLower = String(
-        src.source_type || "subscription",
-      ).toLowerCase();
-      if (DPI_SOURCE_TYPES.has(stypeLower)) return;
-      const stype = stypeLower.toUpperCase();
-      const pfx = src.node_prefix ? ` [${src.node_prefix}]` : ` [${stype}]`;
-      this.value(sid, `${src.name || src.label || sid}${pfx}`);
-    });
-    return form.DynamicList.prototype.load.apply(this, arguments);
+  o.cfgvalue = function (sectionId) {
+    const explicit = uci.get(
+      UCI_PACKAGE,
+      sectionId,
+      "interrupt_exist_connections",
+    );
+    if (explicit !== null && explicit !== undefined && explicit !== "") {
+      return explicit;
+    }
+    const btype = String(
+      uci.get(UCI_PACKAGE, sectionId, "balancer_type") || "urltest",
+    ).toLowerCase();
+    const bmode = String(
+      uci.get(UCI_PACKAGE, sectionId, "mode") || "least_test",
+    ).toLowerCase();
+    if (
+      btype === "urltest" &&
+      [
+        "stability",
+        "sticky",
+        "least_load",
+        "weighted",
+        "hedged",
+        "throughput",
+        "round_robin",
+      ].includes(bmode)
+    ) {
+      return "0";
+    }
+    return "1";
   };
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "group_refs",
-    _("Reusable Outbound Server Groups"),
-    _(
-      "Optionally select pre-filtered Outbound Server Groups from the Outbounds tab.",
-    ),
-  );
-  o.modalonly = true;
-  o.depends("balancer_type", "urltest");
-  o.load = function () {
-    this.keylist = [];
-    this.vallist = [];
-    (uci.sections(UCI_PACKAGE, "outbound_group") || []).forEach((grp) => {
-      const gid = grp[".name"];
-      if (!gid) return;
-      this.value(gid, grp.name || grp.label || gid);
-    });
-    return form.DynamicList.prototype.load.apply(this, arguments);
-  };
-
-  o = section.taboption(
-    "pool",
-    form.ListValue,
-    "filter_mode",
-    _("Filter Mode"),
-    _(
-      "Filter which servers from the pool participate in this URLTest balancer.",
-    ),
-  );
-  o.modalonly = true;
-  o.default = "disabled";
-  o.value("disabled", _("Disabled (Use all servers in pool)"));
-  o.value("include", _("Include Only Matching"));
-  o.value("exclude", _("Exclude Matching"));
-  o.value("mixed", _("Mixed (Include AND Exclude)"));
-  o.depends("balancer_type", "urltest");
-
-  o = section.taboption(
-    "pool",
-    form.ListValue,
-    "detect_server_country",
-    _("Detect server country"),
-  );
-  o.modalonly = true;
-  o.default = "flag_emoji";
-  o.value("flag_emoji", _("By flag emoji from name"));
-  o.value("country_is", _("Via country.is"));
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_prefixes",
-    _("Include Subscription Prefixes"),
-  );
-  o.modalonly = true;
-  o.placeholder = _("e.g. Unlim");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  o.load = function (sectionId) {
-    return loadGlobalPoolChoices().then((pool) => {
-      this.keylist = [];
-      this.vallist = [];
-      pool.prefixes.forEach((c) => this.value(c.value, c.label));
-      return form.DynamicList.prototype.load.call(this, sectionId);
-    });
-  };
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_prefixes",
-    _("Exclude Subscription Prefixes"),
-  );
-  o.modalonly = true;
-  o.placeholder = _("e.g. Backup");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  o.load = function (sectionId) {
-    return loadGlobalPoolChoices().then((pool) => {
-      this.keylist = [];
-      this.vallist = [];
-      pool.prefixes.forEach((c) => this.value(c.value, c.label));
-      return form.DynamicList.prototype.load.call(this, sectionId);
-    });
-  };
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_countries",
-    _("Include Country Flags (ISO)"),
-    _(
-      "Select countries from the dropdown or enter 2-letter ISO codes (NL, DE, FI, RU).",
-    ),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select country --");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  o.load = function (sectionId) {
-    return loadGlobalPoolChoices().then((pool) => {
-      this.keylist = [];
-      this.vallist = [];
-      pool.countries.forEach((c) => this.value(c.value, c.label));
-      return form.DynamicList.prototype.load.call(this, sectionId);
-    });
-  };
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_countries",
-    _("Exclude Country Flags (ISO)"),
-    _("Select countries to exclude from auto-selection."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select country --");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  o.load = function (sectionId) {
-    return loadGlobalPoolChoices().then((pool) => {
-      this.keylist = [];
-      this.vallist = [];
-      pool.countries.forEach((c) => this.value(c.value, c.label));
-      return form.DynamicList.prototype.load.call(this, sectionId);
-    });
-  };
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_outbounds",
-    _("Include Servers"),
-    _(
-      "Select specific servers from the pool to include in this auto-selection.",
-    ),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select server --");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  o.load = function (sectionId) {
-    return loadGlobalPoolChoices().then((pool) => {
-      this.keylist = [];
-      this.vallist = [];
-      pool.servers.forEach((s) => this.value(s.value, s.label));
-      return form.DynamicList.prototype.load.call(this, sectionId);
-    });
-  };
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_outbounds",
-    _("Exclude Servers"),
-    _(
-      "Select specific servers from the pool to exclude from this auto-selection.",
-    ),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select server --");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  o.load = function (sectionId) {
-    return loadGlobalPoolChoices().then((pool) => {
-      this.keylist = [];
-      this.vallist = [];
-      pool.servers.forEach((s) => this.value(s.value, s.label));
-      return form.DynamicList.prototype.load.call(this, sectionId);
-    });
-  };
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_protocols",
-    _("Include Protocols"),
-    _("Filter servers by protocol (e.g. VLESS, Hysteria2, AmneziaWG)."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select protocol --");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  PROTOCOL_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_protocols",
-    _("Exclude Protocols"),
-    _("Exclude servers with specified protocols."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select protocol --");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  PROTOCOL_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_transports",
-    _("Include Transports"),
-    _("Only servers with one of the selected transports."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select transport --");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  TRANSPORT_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_transports",
-    _("Exclude Transports"),
-    _("Do not test servers with one of the selected transports."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select transport --");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  TRANSPORT_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_securities",
-    _("Include Security Types"),
-    _("Only servers with one of the selected security types."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select security --");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  SECURITY_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_securities",
-    _("Exclude Security Types"),
-    _("Do not test servers with one of the selected security types."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select security --");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  SECURITY_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_ports",
-    _("Include Ports"),
-    _(
-      "Test only servers with one of the selected ports or port ranges (e.g. 443, 8443, 2000-3000).",
-    ),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select or type port/range --");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  PORT_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_ports",
-    _("Exclude Ports"),
-    _("Do not test servers with one of the selected ports or port ranges."),
-  );
-  o.modalonly = true;
-  o.placeholder = _("-- Select or type port/range --");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-  PORT_CHOICES.forEach(([val, label]) => o.value(val, label));
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "include_regex",
-    _("Include Name Regex"),
-  );
-  o.modalonly = true;
-  o.placeholder = _("e.g. Amsterdam|Frankfurt");
-  o.depends({ balancer_type: "urltest", filter_mode: "include" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
-
-  o = section.taboption(
-    "pool",
-    form.DynamicList,
-    "exclude_regex",
-    _("Exclude Name Regex"),
-  );
-  o.modalonly = true;
-  o.placeholder = _("e.g. \\|WL\\| or Bypass");
-  o.depends({ balancer_type: "urltest", filter_mode: "exclude" });
-  o.depends({ balancer_type: "urltest", filter_mode: "mixed" });
 }
 
 return baseclass.extend({

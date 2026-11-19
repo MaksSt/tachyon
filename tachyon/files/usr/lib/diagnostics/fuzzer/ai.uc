@@ -272,7 +272,7 @@ function query_llm(provider, api_key, custom_url, prompt_text, model_override) {
         let body = {
             model: target_model,
             messages: [
-                { role: "system", content: "You are a network censorship and DPI bypass expert. Always return responses formatted strictly as requested." },
+                { role: "system", content: "You are a network protocol and packet desynchronization expert. Always return responses formatted strictly as requested." },
                 { role: "user", content: prompt_text }
             ]
         };
@@ -446,7 +446,7 @@ function run_baseline_probe(target_url) {
         let rc = res ? res.status : -1;
         if (rc == 28) err_str = "Connection or TLS handshake timeout (curl exit 28)";
         else if (rc == 35) err_str = "TLS/SSL handshake reset or blocked by DPI (curl exit 35)";
-        else if (rc == 56) err_str = "TCP connection reset by peer / TSPU RST injection (curl exit 56)";
+        else if (rc == 56) err_str = "TCP connection reset by peer / transit filter RST injection (curl exit 56)";
         else if (rc == 7) err_str = "Failed to connect to host (curl exit 7)";
         else if (rc == 6) err_str = "Could not resolve host / DNS blocked (curl exit 6)";
         else err_str = sprintf("Direct probe failed (curl exit %d)", rc);
@@ -460,61 +460,49 @@ function run_baseline_probe(target_url) {
 }
 
 function sanitize_strategy_args(engine, raw_args) {
-    engine = lc(trim(as_string(engine || "zapret2")));
+    engine = lc(trim(as_string(engine || "desync")));
     let s = trim(as_string(raw_args || ""));
     if (s == "")
         return "";
     s = replace(s, /^`+|`+$/g, "");
     s = replace(s, /^["']+|["']+$/g, "");
     s = replace(s, /[\r\n\t]+/g, " ");
-    s = replace(s, /^[ \t]*(\/usr\/(sbin|bin)\/|\/opt\/zapret2?\/nfq2?\/)?(nfqws2|nfqws|ciadpi|byedpi)[ \t]+/, "");
-
     let raw_tokens = split(s, /[ \t]+/);
     let filtered = [];
-    for (let i = 0; i < length(raw_tokens); i++) {
-        let tok = trim(as_string(raw_tokens[i]));
+    for (let tok in raw_tokens) {
+        tok = trim(as_string(tok));
         if (tok == "" || tok == "\\") continue;
-        let base = split(tok, "=")[0];
-        if (base == "--qnum" || base == "--pidfile" || base == "--fwmark" ||
-            base == "--dpi-desync-fwmark" || base == "--hostlist" || base == "--hostlist-domains" ||
-            base == "--hostlist-exclude" || base == "--hostlist-auto" || base == "--ipset" ||
-            base == "--ipset-ip" || base == "--ip" || base == "--port") {
-            if (base == tok && (i + 1) < length(raw_tokens) && substr(as_string(raw_tokens[i + 1]), 0, 1) != "-")
-                i++;
-            continue;
-        }
-        if (tok == "--daemon" || tok == "--dry-run" || tok == "--version" ||
-            tok == "<HOSTLIST>" || tok == "<HOSTLIST_NOAUTO>")
-            continue;
-        if (engine == "byedpi" && (tok == "-i" || tok == "-p" || tok == "-D" || tok == "-E" || tok == "-w")) {
-            if ((tok == "-i" || tok == "-p" || tok == "-w") && (i + 1) < length(raw_tokens) && substr(as_string(raw_tokens[i + 1]), 0, 1) != "-")
-                i++;
-            continue;
-        }
         push(filtered, tok);
     }
+    return trim(join(" ", filtered));
+}
 
-    let cleaned = trim(join(" ", filtered));
-    if (engine == "zapret2" && index(cleaned, "--dpi-desync") >= 0 && index(cleaned, "--lua-desync") < 0) {
-        let has_fake = index(cleaned, "fake") >= 0;
-        let has_disorder = index(cleaned, "disorder") >= 0;
-        let pos_m = match(cleaned, /--dpi-desync-split-pos=([^ \t]+)/);
-        let pos = (pos_m && pos_m[1]) ? pos_m[1] : "1,midsld";
-        let ttl_m = match(cleaned, /--dpi-desync-ttl=([0-9]+)/);
-        let ttl = (ttl_m && ttl_m[1]) ? ttl_m[1] : "4";
-        let fool_m = match(cleaned, /--dpi-desync-fooling=([^ \t]+)/);
-        let fool = (fool_m && fool_m[1]) ? replace(fool_m[1], /,/g, ":") : "tcp_seq=1000000";
-        fool = replace(fool, /\bbadseq\b/g, "tcp_seq=1000000");
-        fool = replace(fool, /\bmd5sig\b/g, "tcp_md5");
-        fool = replace(fool, /\bbadack\b/g, "tcp_ack=-66000");
-        fool = replace(fool, /\bdatanoack\b/g, "tcp_flags_unset=ack");
-        let z2_parts = [];
-        if (has_fake)
-            push(z2_parts, sprintf("--lua-desync=fake:blob=tls_max:ip_ttl=%s:fooling=%s", ttl, fool));
-        push(z2_parts, sprintf("--lua-desync=%s:pos=%s", has_disorder ? "multidisorder" : "multisplit", pos));
-        cleaned = join(" ", z2_parts);
+let _fuzzer_sb_mod = null;
+function fuzzer_sb_mod() {
+    if (_fuzzer_sb_mod == null) {
+        try { _fuzzer_sb_mod = require("service.support_bundle"); } catch(e) { _fuzzer_sb_mod = false; }
     }
-    return cleaned;
+    return _fuzzer_sb_mod || null;
+}
+
+function redact_for_ai(str) {
+    if (str == null || str == "")
+        return "";
+    let s = as_string(str);
+    let sb = fuzzer_sb_mod();
+    if (sb && sb.redact_for_llm)
+        s = sb.redact_for_llm(s);
+    else if (sb && sb.redact_string)
+        s = sb.redact_string(s);
+    s = replace(s, /[0-9]{8,12}:[-_a-zA-Z0-9]{35}/g, "[REDACTED_TELEGRAM_TOKEN]");
+    s = replace(s, /Bearer[ \t]+[-_a-zA-Z0-9.+=]{16,}/gi, "Bearer [REDACTED_TOKEN]");
+    s = replace(s, /(sk-(or-v1-|ant-|proj-)?[-_a-zA-Z0-9]{16,}|AIza[-_a-zA-Z0-9]{20,}|gsk_[-_a-zA-Z0-9]{16,}|xai-[-_a-zA-Z0-9]{16,})/g, "[REDACTED_API_KEY]");
+    s = replace(s, /(vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic|fptns?|warp|wireguard|wg|awg):\/\/[^ \t\r\n'"]+/gi, "$1://[REDACTED]");
+    s = replace(s, /:\/\/([^:@[ \t\r\n]+)(:[^@ \t\r\n]+)?@/g, "://[REDACTED]@");
+    s = replace(s, /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, "[REDACTED_UUID]");
+    s = replace(s, /([?&](password|pass|secret|key|api_key|apikey|token|access_token|auth|auth_token|uuid|id|sub|hash|sig|signature|hwid)=)[^& \t\r\n'"]+/gi, "$1[REDACTED]");
+    s = replace(s, /([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/g, "[REDACTED_MAC]");
+    return s;
 }
 
 function compute_ai_strategies_result(engine, target, custom_url, user_prompt) {
@@ -523,12 +511,16 @@ function compute_ai_strategies_result(engine, target, custom_url, user_prompt) {
         return { success: false, error: "Fuzzer is currently running a benchmark" };
     }
 
-    engine = lc(as_string(engine || "zapret2"));
+    engine = lc(as_string(engine || "desync"));
+    if (engine == "" || engine == "all")
+        engine = "desync";
     target = trim(as_string(target || "youtube_suite"));
-    user_prompt = trim(as_string(user_prompt || ""));
+    user_prompt = redact_for_ai(trim(as_string(user_prompt || "")));
     let target_url = binaries.resolve_target_url(target, custom_url);
 
     let baseline = run_baseline_probe(target_url);
+    let safe_target_url = redact_for_ai(target_url);
+    let safe_probe_error = redact_for_ai(baseline.error != "" ? baseline.error : "none");
 
     let uci = uci_core.cursor();
     let cfg = uci != null ? (uci.get_all(CONFIG_NAME, "settings") || {}) : {};
@@ -538,13 +530,16 @@ function compute_ai_strategies_result(engine, target, custom_url, user_prompt) {
     let ai_custom_url = cfg.ai_doctor_custom_url || ai_sec.custom_url || "";
     let model_override = cfg.ai_doctor_model || ai_sec.model || "";
 
-    let query_text = sprintf("%s %s %s", engine, target, user_prompt);
+    let query_text = redact_for_ai(sprintf("%s %s %s", engine, target, user_prompt));
     let rag_docs = rag.retrieve(query_text, provider, api_key, ai_custom_url, model_override, 4);
 
-    let target_engines = (engine == "all") ? "zapret2, zapret, byedpi, and desync" : engine;
+    let target_engines = "desync";
     let prompt = sprintf(
-        "You are an expert DPI Bypass Engineer specializing in OpenWrt, Zapret, Zapret2 (nfqws2), ByeDPI (ciadpi), and Tachyon Native Desync.\n" +
-        "We need to bypass censorship / TSPU blocking for target service '%s' (%s) using engine '%s'.\n\n" +
+        "You are an expert Packet Desynchronization & Network Optimization Engineer specializing in OpenWrt and Tachyon Native Desync (Adaptive 2.0 in tachyon-core).\n" +
+        "We need to optimize packet delivery and overcome transit middlebox filtering for target service '%s' (%s) using engine '%s'.\n\n" +
+        "TACHYON ENGINE CONTEXT & PRIVACY RULES:\n" +
+        "- `desync` runs natively inside `tachyon-core` outbound dialer (Adaptive 2.0 with TLS record split, TCP split/disorder, fooling, and UDP QUIC/STUN fake).\n" +
+        "- PRIVACY RULE: Inputs are pre-redacted. Never request or output private keys, tokens, passwords, UUIDs, or private URLs.\n\n" +
         "LIVE PROBE DIAGNOSTICS:\n" +
         "- Direct HTTP Code: %d\n" +
         "- Connect Time: %d ms\n" +
@@ -553,34 +548,31 @@ function compute_ai_strategies_result(engine, target, custom_url, user_prompt) {
         "- User Notes / ISP Context: %s\n\n" +
         "TECHNICAL KNOWLEDGE BASE FRAGMENTS:\n%s\n\n" +
         "TASK:\n" +
-        "1. Analyze why this target is blocked or throttled.\n" +
-        "2. Formulate 3 to 5 highly effective, syntactically valid DPI desync strategies for '%s'.\n" +
+        "1. Analyze why this target experiences connection degradation or packet resets.\n" +
+        "2. Formulate 3 to 5 highly effective, syntactically valid native desync strategies for '%s'.\n" +
         "3. Output MUST be strictly valid JSON matching this schema:\n" +
         "{\n" +
-        '  "analysis": "Brief 1-2 sentence diagnosis of the blocking pattern",\n' +
+        '  "analysis": "Brief 1-2 sentence diagnosis of the filtering pattern",\n' +
         '  "strategies": [\n' +
         '    {\n' +
         '      "id": "ai_strat_1",\n' +
         '      "name": "Human-readable descriptive strategy name",\n' +
         '      "engine": "%s",\n' +
-        '      "args": "Exact command-line arguments string for the engine",\n' +
-        '      "description": "Why this combination should bypass the block"\n' +
+        '      "args": "Space-separated key=value arguments string for tachyon-core desync",\n' +
+        '      "description": "Why this combination restores handshake delivery"\n' +
         '    }\n' +
         '  ]\n' +
         "}\n\n" +
         "RULES FOR STRATEGY ARGS:\n" +
-        "- For zapret2 (nfqws2): ONLY use '--lua-desync=...' syntax (NEVER use zapret1 '--dpi-desync' flags!). Examples: '--lua-desync=multisplit:pos=1,midsld:seqovl=1' or '--lua-desync=fake:blob=tls_max:ip_ttl=4:fooling=tcp_seq=1000000 --lua-desync=multidisorder:pos=1,midsld'. DO NOT include binary name, --qnum, --fwmark, or --hostlist.\n" +
-        "- For zapret (nfqws v1): ONLY use '--dpi-desync=...' syntax like '--dpi-desync=fake,split2 --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq --dpi-desync-ttl=4'. DO NOT include binary name, --qnum, or --hostlist.\n" +
-        "- For byedpi (ciadpi): ONLY use valid ciadpi flags like '-s 1 -d 1 --auto=t,r,s -o 1' or '--split 1 --disorder 3+s --tlsrec 1+s'. DO NOT include binary name, -i, or -p.\n" +
-        "- For desync (tachyon-core native): ONLY use space-separated key=value pairs from: preset=(fake_split|tlsrec|disorder|split|fake|oob|auto), mode=(fake_split|tlsrec|disorder|split|fake|oob), split_pos=(1|2|midsld|sni), fake_ttl=(2..12), fake_sni=(max.ru|www.google.com|gosuslugi.ru|sberbank.ru), repeats=(1..12), split_delay_ms=(0..50), udp_fake=(true|false), udp_repeats=(1..12), udp_fake_ttl=(2..12). Example: 'mode=fake_split split_pos=midsld fake_ttl=4 fake_sni=max.ru repeats=6'.\n\n" +
+        "- For desync (tachyon-core native): ONLY use space-separated key=value pairs from: preset=(auto|fake_split|fake_disorder|multi_disorder|multi_split|tlsrec|disorder|split|fake|oob), mode=(fake_split|fake_disorder|multi_disorder|multi_split|tlsrec|disorder|split|fake|oob), split_pos=(1|2|midsld|sni|sniext+1|host+1|midsld-2|endhost-1|1,midsld), fooling=(md5|md5_badack|badack|datanoack|autottl|timestamp|badseq|badsum|badseq_badack_badsum|hopbyhop), fake_ttl=(2..12), fake_sni=(max.ru|www.google.com|gosuslugi.ru|sberbank.ru|rzd.ru|ozon.ru|padencap|rndsni), repeats=(1..12), seqovl=(1..16), tlsrec_first=(true|false), split_delay_ms=(0..50), udp_fake=(true|false), udp_repeats=(1..12), udp_fake_ttl=(2..12), udplen=(1..1472). Example: 'mode=fake_split split_pos=midsld fake_ttl=4 fake_sni=max.ru repeats=6'.\n\n" +
         "JSON OUTPUT:",
-        target, target_url, target_engines,
+        target, safe_target_url, target_engines,
         baseline.http_code, baseline.handshake_ms, baseline.ttfb_ms,
-        baseline.error != "" ? baseline.error : "none",
+        safe_probe_error,
         user_prompt != "" ? user_prompt : "None provided",
         rag_docs,
         target_engines,
-        engine == "all" ? "zapret2" : engine
+        "desync"
     );
 
     let raw_reply = query_llm(provider, api_key, ai_custom_url, prompt, model_override);
@@ -607,8 +599,7 @@ function compute_ai_strategies_result(engine, target, custom_url, user_prompt) {
     for (let i = 0; i < length(parsed_json.strategies); i++) {
         let st = parsed_json.strategies[i];
         if (!st || !st.args) continue;
-        let st_engine = (engine == "all" && st.engine) ? lc(trim(as_string(st.engine))) : engine;
-        if (st_engine == "all") st_engine = "zapret2";
+        let st_engine = "desync";
         let clean_args = sanitize_strategy_args(st_engine, st.args);
         if (clean_args != "" && strategies.validate_strategy_args(st_engine, clean_args)) {
             push(valid_strategies, {
@@ -678,7 +669,7 @@ function start_ai_synthesize_async(engine, target, custom_url, user_prompt) {
     let init_state = {
         running: true,
         job_id: job_id,
-        engine: lc(as_string(engine || "zapret2")),
+        engine: "desync",
         target: trim(as_string(target || "youtube_suite")),
         started_at: time()
     };
@@ -692,7 +683,7 @@ function start_ai_synthesize_async(engine, target, custom_url, user_prompt) {
         argv: [
             "ucode", "-L", LIB_DIR, fuzzer_bin,
             "ai_synthesize_worker",
-            as_string(engine || "zapret2"),
+            "desync",
             as_string(target || "youtube_suite"),
             as_string(custom_url || ""),
             as_string(user_prompt || ""),

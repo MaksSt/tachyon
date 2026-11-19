@@ -1,4 +1,5 @@
 import { svgEl } from '../../../../helpers';
+import { renderGlobeIcon } from '../../../../icons';
 import { prettyBytes } from '../../../../helpers/prettyBytes';
 import { tr } from '../../../helpers/i18n';
 import { ITopDomain } from '../connections';
@@ -16,14 +17,21 @@ export function renderConnections(
   isCollapsed: boolean,
   onToggleCollapse: () => void,
   topDomains?: ITopDomain[],
+  viewMode: string = 'collapsible',
 ) {
+  const effectiveCollapsed =
+    viewMode === 'expanded' ||
+    viewMode === 'domains_focus' ||
+    viewMode === 'client_cards'
+      ? false
+      : isCollapsed;
   const topDomainsSection =
-    topDomains && topDomains.length > 0
+    !effectiveCollapsed && topDomains && topDomains.length > 0
       ? E('div', { class: 'tachyon_dashboard-page__top-domains-container' }, [
           E(
             'div',
             { class: 'tachyon_dashboard-page__top-domains-header' },
-            tr('Популярные домены в обходе:', 'Top active domains in bypass:'),
+            tr('Популярные домены:', 'Popular domains:'),
           ),
           E(
             'div',
@@ -39,7 +47,7 @@ export function renderConnections(
                   E(
                     'span',
                     { class: 'tachyon_dashboard-page__top-domain-chip__icon' },
-                    '🌐',
+                    [renderGlobeIcon(12)],
                   ),
                   E('b', {}, item.domain),
                   E(
@@ -55,56 +63,63 @@ export function renderConnections(
       : '';
 
   if (connections.length === 0 && (!topDomains || topDomains.length === 0)) {
-    return E('div', { class: 'tachyon_dashboard-page__outbound-section' }, [
-      E(
-        'div',
-        {
-          class:
-            'tachyon_dashboard-page__outbound-section__title-section tachyon-collapsible-title',
-          click: onToggleCollapse,
-        },
-        [
-          E(
-            'div',
-            {
-              class:
-                'tachyon_dashboard-page__outbound-section__title-section__title',
-              style: 'display: flex; align-items: center; gap: 8px;',
-            },
-            [
-              svgEl(
-                'svg',
-                {
-                  width: '16',
-                  height: '16',
-                  viewBox: '0 0 24 24',
-                  fill: 'none',
-                  stroke: 'currentColor',
-                  'stroke-width': '2',
-                  'stroke-linecap': 'round',
-                  'stroke-linejoin': 'round',
-                  style: `transition: transform 0.2s; transform: rotate(${isCollapsed ? '-90deg' : '0deg'})`,
-                },
-                [svgEl('polyline', { points: '6 9 12 15 18 9' })],
-              ),
-              tr('Активные клиенты', 'Active Clients'),
-            ],
-          ),
-        ],
-      ),
-      isCollapsed
-        ? ''
-        : E(
-            'div',
-            {
-              class: 'tachyon-clients-empty',
-            },
-            tr('Нет активных клиентов', 'No active clients'),
-          ),
-    ]);
+    return E(
+      'div',
+      {
+        class: 'tachyon_dashboard-page__outbound-section',
+        'data-clients-view': viewMode,
+      },
+      [
+        E(
+          'div',
+          {
+            class:
+              'tachyon_dashboard-page__outbound-section__title-section tachyon-collapsible-title',
+            click: onToggleCollapse,
+          },
+          [
+            E(
+              'div',
+              {
+                class:
+                  'tachyon_dashboard-page__outbound-section__title-section__title',
+                style: 'display: flex; align-items: center; gap: 8px;',
+              },
+              [
+                svgEl(
+                  'svg',
+                  {
+                    width: '16',
+                    height: '16',
+                    viewBox: '0 0 24 24',
+                    fill: 'none',
+                    stroke: 'currentColor',
+                    'stroke-width': '2',
+                    'stroke-linecap': 'round',
+                    'stroke-linejoin': 'round',
+                    style: `transition: transform 0.2s; transform: rotate(${effectiveCollapsed ? '-90deg' : '0deg'})`,
+                  },
+                  [svgEl('polyline', { points: '6 9 12 15 18 9' })],
+                ),
+                tr('Активные клиенты', 'Active Clients'),
+              ],
+            ),
+          ],
+        ),
+        effectiveCollapsed
+          ? ''
+          : E(
+              'div',
+              {
+                class: 'tachyon-clients-empty',
+              },
+              tr('Нет активных клиентов', 'No active clients'),
+            ),
+      ],
+    );
   }
 
-  const rows = connections.map((c) => {
+  const rows = (effectiveCollapsed ? [] : connections).map((c) => {
     const infoChildren: HTMLElement[] = [];
 
     if (c.name) {
@@ -225,54 +240,85 @@ export function renderConnections(
     );
   });
 
-  return E('div', { class: 'tachyon_dashboard-page__outbound-section' }, [
-    E(
-      'div',
-      {
-        class:
-          'tachyon_dashboard-page__outbound-section__title-section tachyon-collapsible-title',
-        click: onToggleCollapse,
-      },
-      [
-        E(
-          'div',
-          {
-            class:
-              'tachyon_dashboard-page__outbound-section__title-section__title',
-            style: 'display: flex; align-items: center; gap: 8px;',
-          },
-          [
-            svgEl(
-              'svg',
-              {
-                width: '16',
-                height: '16',
-                viewBox: '0 0 24 24',
-                fill: 'none',
-                stroke: 'currentColor',
-                'stroke-width': '2',
-                'stroke-linecap': 'round',
-                'stroke-linejoin': 'round',
-                style: `transition: transform 0.2s; transform: rotate(${isCollapsed ? '-90deg' : '0deg'})`,
-              },
-              [svgEl('polyline', { points: '6 9 12 15 18 9' })],
-            ),
-            tr('Активные клиенты', 'Active Clients'),
-          ],
-        ),
-      ],
-    ),
-    isCollapsed
-      ? ''
-      : E(
-          'div',
-          {
-            class:
-              'tachyon_dashboard-page__outbound-grid tachyon-clients-container',
-          },
-          [...rows, topDomainsSection],
-        ),
-  ]);
+  const bodyItems =
+    viewMode === 'domains_focus'
+      ? [topDomainsSection, ...rows]
+      : viewMode === 'client_cards'
+        ? [
+            E('div', { class: 'tachyon-client-cards-grid' }, rows),
+            topDomainsSection,
+          ]
+        : [...rows, topDomainsSection];
+
+  return E(
+    'div',
+    {
+      class: [
+        'tachyon_dashboard-page__outbound-section',
+        viewMode === 'domains_focus'
+          ? 'tachyon-clients-section--domains-focus'
+          : '',
+        viewMode === 'client_cards'
+          ? 'tachyon-clients-section--client-cards'
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+      'data-clients-view': viewMode,
+    },
+    [
+      E(
+        'div',
+        {
+          class:
+            'tachyon_dashboard-page__outbound-section__title-section tachyon-collapsible-title',
+          click: onToggleCollapse,
+        },
+        [
+          E(
+            'div',
+            {
+              class:
+                'tachyon_dashboard-page__outbound-section__title-section__title',
+              style: 'display: flex; align-items: center; gap: 8px;',
+            },
+            [
+              svgEl(
+                'svg',
+                {
+                  width: '16',
+                  height: '16',
+                  viewBox: '0 0 24 24',
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  'stroke-width': '2',
+                  'stroke-linecap': 'round',
+                  'stroke-linejoin': 'round',
+                  style: `transition: transform 0.2s; transform: rotate(${effectiveCollapsed ? '-90deg' : '0deg'})`,
+                },
+                [svgEl('polyline', { points: '6 9 12 15 18 9' })],
+              ),
+              tr('Активные клиенты', 'Active Clients'),
+            ],
+          ),
+        ],
+      ),
+      effectiveCollapsed
+        ? ''
+        : E(
+            'div',
+            {
+              class:
+                `tachyon_dashboard-page__outbound-grid tachyon-clients-container ${
+                  viewMode === 'domains_focus'
+                    ? 'tachyon-clients-container--domains-focus'
+                    : ''
+                }`.trim(),
+            },
+            bodyItems,
+          ),
+    ],
+  );
 }
 
 export function patchClientRowValues(rowEl: HTMLElement, c: IConnection): void {
@@ -304,11 +350,24 @@ export function patchConnections(
   connections: IConnection[],
   isCollapsed: boolean,
   topDomains?: ITopDomain[],
+  viewMode: string = 'collapsible',
 ): boolean {
   const sectionEl = container.querySelector<HTMLElement>(
     '.tachyon_dashboard-page__outbound-section',
   );
   if (!sectionEl) return false;
+  if (
+    sectionEl.getAttribute &&
+    (sectionEl.getAttribute('data-clients-view') || 'collapsible') !== viewMode
+  ) {
+    return false;
+  }
+  const effectiveCollapsed =
+    viewMode === 'expanded' ||
+    viewMode === 'domains_focus' ||
+    viewMode === 'client_cards'
+      ? false
+      : isCollapsed;
 
   const emptyEl = container.querySelector<HTMLElement>(
     '.tachyon-clients-empty',
@@ -317,7 +376,7 @@ export function patchConnections(
     '.tachyon-clients-container',
   );
 
-  if (isCollapsed) {
+  if (effectiveCollapsed) {
     return !clientsContainer && !emptyEl;
   }
 

@@ -1,6 +1,7 @@
 import { TachyonShellMethods } from './methods/shell';
 import { showToast } from '../helpers/showToast';
 import { isTransientRpcError } from './helpers/isTransientRpcError';
+import { renderCheckIcon } from '../icons';
 
 export interface TachyonLanguageOption {
   code: string;
@@ -78,15 +79,23 @@ let outsideClickBound = false;
 
 export function mountLanguageSelector(
   capabilities?: UiLanguageCapabilities,
+  targetContainer?: HTMLElement | null,
 ): void {
   if (typeof document === 'undefined') return;
 
   const mapHeader =
+    targetContainer ||
+    document.querySelector<HTMLElement>('.tachyon-topbar__lang-slot') ||
     document.querySelector<HTMLElement>('#cbi-tachyon > h2') ||
     document.querySelector<HTMLElement>('.cbi-map > h2');
   if (!mapHeader) return;
 
-  mapHeader.classList.add('tachyon-map-header');
+  if (
+    !targetContainer &&
+    !mapHeader.classList.contains('tachyon-topbar__lang-slot')
+  ) {
+    mapHeader.classList.add('tachyon-map-header');
+  }
 
   let wrapper = mapHeader.querySelector<HTMLElement>('.tachyon-lang-selector');
   if (!wrapper) {
@@ -113,7 +122,11 @@ export function mountLanguageSelector(
         const isCurrent = lang.code === activeOption.code;
         const needsInstall =
           lang.code === 'ru' && lang.requiresPackage && !ruInstalled;
-        const badgeText = isCurrent ? '✓' : needsInstall ? _('Install') : '';
+        const badgeText = isCurrent
+          ? renderCheckIcon(12).outerHTML
+          : needsInstall
+            ? _('Install')
+            : '';
         const badgeClass = isCurrent
           ? 'tachyon-lang-option__badge--active'
           : needsInstall

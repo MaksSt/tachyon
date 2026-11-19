@@ -2,6 +2,7 @@ let fs = require("fs");
 let uci_core = require("core.uci");
 let common = require("core.common");
 let constants = require("core.constants");
+let network_mod = require("diagnostics.network");
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const PAUSE_FILE = "/tmp/tachyon_paused_until";
@@ -14,19 +15,29 @@ let core_binary_running = common.core_binary_running;
 let command_from_args = common.command_from_args;
 let command_output = common.command_output;
 
-function read_active_core_config() {
+let cached_clash_path = "";
+let cached_clash_mtime = null;
+let cached_clash_size = null;
+let cached_clash_info = null;
+
+function resolve_active_core_config_path() {
     let cfg_path = uci_core.get(CONFIG_NAME, "settings", "config_path");
-    if (cfg_path && cfg_path != "") {
-        let d = fs.readfile(cfg_path);
-        if (d) return d;
-    }
-    return fs.readfile("/etc/tachyon-core/config.json") || fs.readfile("/etc/sing-box/config.json");
+    if (cfg_path && cfg_path != "" && fs.stat(cfg_path) != null)
+        return cfg_path;
+    if (fs.stat("/etc/tachyon-core/config.json") != null)
+        return "/etc/tachyon-core/config.json";
+    return "";
 }
 
-// Helper to get clash url
-function get_clash_url(endpoint) {
-    let host = "127.0.0.1:9090"; // default fallback
-    let config_data = read_active_core_config();
+function get_clash_client_info() {
+    let cfg_path = resolve_active_core_config_path();
+    let st = cfg_path != "" ? fs.stat(cfg_path) : null;
+    if (st && cached_clash_path == cfg_path && cached_clash_mtime == st.mtime && cached_clash_size == st.size && cached_clash_info != null)
+        return cached_clash_info;
+
+    let host = "127.0.0.1:9090";
+    let secret = "";
+    let config_data = cfg_path != "" ? fs.readfile(cfg_path) : null;
     if (config_data) {
         try {
             let sb_cfg = json(config_data);
@@ -35,32 +46,32 @@ function get_clash_url(endpoint) {
                 let parts = split(ext, ":");
                 let ip = (length(parts) > 1) ? parts[0] : "";
                 let port = (length(parts) > 1) ? parts[length(parts) - 1] : "9090";
-                if (ip == "0.0.0.0" || ip == "") {
-                    host = "127.0.0.1:" + port;
-                } else {
-                    host = ext;
-                }
+                host = (ip == "0.0.0.0" || ip == "") ? ("127.0.0.1:" + port) : ext;
             }
-        }
-        catch (e) {
-            // Falls through to the default host below. The clash API is optional
-            // and every caller already treats an unreachable one as "no data".
-        }
+            let cfg_secret = sb_cfg.experimental?.clash_api?.secret;
+            if (cfg_secret && cfg_secret != "")
+                secret = cfg_secret;
+        } catch (e) {}
     }
-    return "http://" + host + "/" + endpoint;
+    let info = { host: host, secret: secret };
+    if (st) {
+        cached_clash_path = cfg_path;
+        cached_clash_mtime = st.mtime;
+        cached_clash_size = st.size;
+        cached_clash_info = info;
+    }
+    return info;
+}
+
+// Helper to get clash url
+function get_clash_url(endpoint) {
+    return "http://" + get_clash_client_info().host + "/" + endpoint;
 }
 
 function get_clash_secret() {
-    let config_data = read_active_core_config();
-    if (config_data) {
-        try {
-            let sb_cfg = json(config_data);
-            let secret = sb_cfg.experimental?.clash_api?.secret;
-            if (secret && secret != "")
-                return secret;
-        }
-        catch (e) {}
-    }
+    let secret = get_clash_client_info().secret;
+    if (secret != "")
+        return secret;
     let uci_secret = uci_core.get(CONFIG_NAME, "settings", "yacd_secret_key");
     if (uci_secret && uci_secret != "")
         return uci_secret;
@@ -92,6 +103,137 @@ function process_running_by_pidfile(pidfile) {
            command_success_from_args(["kill", "-0", pid]);
 }
 
+function country_code_to_flag(cc) {
+    cc = uc(trim(as_string(cc || "")));
+    if (length(cc) != 2)
+        return "";
+    let c0 = ord(cc, 0);
+    let c1 = ord(cc, 1);
+    if (c0 < 65 || c0 > 90 || c1 < 65 || c1 > 90)
+        return "";
+    // UTF-8 Regional Indicator Symbols: U+1F1E6 ('A') .. U+1F1FF ('Z')
+    // U+1F1E6 in UTF-8 is 0xF0 0x9F 0x87 (0xA6 + offset)
+    return chr(0xF0, 0x9F, 0x87, 0xA6 + (c0 - 65), 0xF0, 0x9F, 0x87, 0xA6 + (c1 - 65));
+}
+
+function get_outbound_display_metadata() {
+    let meta = {
+        names: {},
+        countries: {},
+        protocols: {},
+        details: {},
+        section_labels: {},
+        group_labels: {}
+    };
+
+    try {
+        let c = uci_core.cursor();
+        if (c) {
+            c.load(CONFIG_NAME);
+            c.foreach(CONFIG_NAME, "section", function(s) {
+                let sname = as_string(s[".name"] || "");
+                if (sname == "") return;
+                let slabel = trim(as_string(s.label || s.name || sname));
+                meta.section_labels[sname] = slabel;
+                meta.group_labels[sname + "-out"] = slabel;
+                meta.group_labels[uc(sname) + "-out"] = slabel;
+            });
+            c.foreach(CONFIG_NAME, "balancer", function(b) {
+                let bname = as_string(b[".name"] || "");
+                if (bname == "") return;
+                let blabel = trim(as_string(b.label || b.name || bname));
+                meta.group_labels[bname] = blabel;
+                meta.group_labels[bname + "-out"] = blabel;
+            });
+        }
+    } catch (e) {}
+
+    let cache_dir = getenv("TACHYON_SECTION_CACHE_DIR") || "/var/run/tachyon/section-cache";
+    for (let path in (fs.glob(cache_dir + "/*.json") || [])) {
+        let cache = common.read_json_file(path);
+        if (type(cache) != "object")
+            continue;
+        let sec_name = as_string(cache.section || "");
+        let om = common.object_or_empty(cache.outboundMetadata);
+        let names = common.object_or_empty(om.names);
+        let countries = common.object_or_empty(om.countries);
+        let protocols = common.object_or_empty(om.protocols);
+        let details = common.object_or_empty(om.details);
+        for (let tag, dname in names) {
+            if (as_string(dname) != "")
+                meta.names[tag] = as_string(dname);
+        }
+        for (let tag, cc in countries) {
+            if (as_string(cc) != "")
+                meta.countries[tag] = as_string(cc);
+        }
+        for (let tag, proto in protocols) {
+            if (as_string(proto) != "")
+                meta.protocols[tag] = as_string(proto);
+        }
+        for (let tag, det in details) {
+            if (as_string(det) != "")
+                meta.details[tag] = as_string(det);
+        }
+        let ug = common.object_or_empty(cache.urltestGroups);
+        for (let gtag, ginfo in ug) {
+            if (type(ginfo) == "object" && as_string(ginfo.displayName || "") != "")
+                meta.group_labels[gtag] = as_string(ginfo.displayName);
+        }
+        if (sec_name != "" && meta.section_labels[sec_name]) {
+            meta.group_labels[sec_name + "-out"] = meta.section_labels[sec_name];
+        }
+    }
+
+    return meta;
+}
+
+function format_outbound_display_name(tag, meta) {
+    tag = as_string(tag || "");
+    if (tag == "")
+        return "";
+    if (!meta)
+        meta = get_outbound_display_metadata();
+    let dname = as_string((meta.names && meta.names[tag]) || (meta.group_labels && meta.group_labels[tag]) || tag);
+    let cc = as_string((meta.countries && meta.countries[tag]) || "");
+    let flag = country_code_to_flag(cc);
+    if (flag != "" && index(dname, flag) < 0)
+        dname = flag + " " + dname;
+    return dname;
+}
+
+function format_group_display_name(group_tag, meta) {
+    group_tag = as_string(group_tag || "");
+    if (group_tag == "")
+        return "";
+    if (!meta)
+        meta = get_outbound_display_metadata();
+    let base = replace(group_tag, /-out$/, "");
+    let label = (meta.group_labels && (meta.group_labels[group_tag] || meta.group_labels[base])) ||
+                (meta.section_labels && meta.section_labels[base]) || "";
+    if (label != "" && label != group_tag && label != base)
+        return label + " (" + group_tag + ")";
+    return group_tag;
+}
+
+function url_encode_component(str) {
+    str = as_string(str || "");
+    let out = "";
+    for (let i = 0; i < length(str); i++) {
+        let ch = substr(str, i, 1);
+        let code = ord(ch, 0);
+        if ((code >= 48 && code <= 57) ||
+            (code >= 65 && code <= 90) ||
+            (code >= 97 && code <= 122) ||
+            ch == "-" || ch == "_" || ch == "." || ch == "~") {
+            out += ch;
+        } else {
+            out += sprintf("%%%02X", code);
+        }
+    }
+    return out;
+}
+
 function get_clash_proxies_data() {
     let args = [ "curl", "-s", "-m", "5", "--connect-timeout", "3" ];
     for (let h in get_clash_auth_args()) push(args, h);
@@ -105,6 +247,41 @@ function get_clash_proxies_data() {
         }
     }
     return null;
+}
+
+function probe_group_delay(group_name, timeout_ms) {
+    group_name = as_string(group_name || "");
+    if (group_name == "")
+        return null;
+    timeout_ms = int(timeout_ms || 3000);
+    if (timeout_ms < 500) timeout_ms = 3000;
+    let encoded_group = url_encode_component(group_name);
+    let endpoint = "group/" + encoded_group + "/delay?url=" +
+        url_encode_component("https://www.gstatic.com/generate_204") +
+        "&timeout=" + as_string(timeout_ms);
+    let args = [ "curl", "-s", "-m", "8", "--connect-timeout", "3" ];
+    for (let h in get_clash_auth_args()) push(args, h);
+    push(args, get_clash_url(endpoint));
+    let res = command_capture(command_from_args(args));
+    if (res && res.status == 0 && res.output != "") {
+        try { return json(res.output); } catch (e) {}
+    }
+    return null;
+}
+
+function probe_all_groups_delay(timeout_ms) {
+    let data = get_clash_proxies_data();
+    if (!data || !data.proxies)
+        return false;
+    let probed = 0;
+    for (let gname in keys(data.proxies)) {
+        let p = data.proxies[gname];
+        if (p && (p.type == "Selector" || p.type == "URLTest" || p.type == "Fallback")) {
+            probe_group_delay(gname, timeout_ms);
+            probed++;
+        }
+    }
+    return probed > 0;
 }
 
 function get_system_status() {
@@ -138,33 +315,34 @@ function get_system_status() {
 
     // Routing engine status
     let engine_name = "tachyon-core";
-    try { engine_name = require("core.engine").get_active(); } catch (e) {}
     status_obj.engine_name = engine_name;
-    let sb_running = core_binary_running();
-    status_obj.singbox_running = sb_running;
-    status_obj.singbox = sb_running ? "🟢 running" : "🔴 stopped";
-    if (engine_name == "sing-box") {
-        let sb_variant = trim(as_string(fs.readfile("/etc/tachyon/sing-box-variant") || fs.readfile("/etc/tachyon/tachyon-core-variant") || ""));
-        if (sb_variant != "" && sb_variant != "tachyon-core")
-            status_obj.singbox_variant = sb_variant;
-    }
+    let core_running = core_binary_running();
+    status_obj.tachyon_core_running = core_running;
+    status_obj.tachyon_core = core_running ? "🟢 running" : "🔴 stopped";
 
-    // zapret2 status
-    let z2_installed = fs.stat("/opt/zapret2/nfq2/nfqws2") != null ||
-                       fs.stat("/opt/zapret2/nfq/nfqws2") != null ||
-                       fs.stat("/opt/zapret2/nfqws2") != null ||
-                       fs.stat("/usr/bin/nfqws2") != null;
-    status_obj.zapret2_installed = z2_installed;
-    if (z2_installed) {
-        let z2_running = command_success_from_args(["pidof", "nfqws2"]);
-        status_obj.zapret2_running = z2_running;
-        status_obj.zapret2 = z2_running ? "🟢 running" : "🔴 stopped";
-    }
+    // Eco / Lite mode
+    let eco_mode = uci_core.get(CONFIG_NAME, "settings", "eco_mode") == "1" ||
+                   uci_core.get(CONFIG_NAME, "settings", "lite_mode") == "1";
+    status_obj.eco_mode = eco_mode;
+
+    // Count available component updates in cache
+    let updates_available_count = 0;
+    try {
+        for (let upath in (fs.glob("/var/run/tachyon/component-update-checks/*.json") || [])) {
+            let uc_obj = common.read_json_file(upath);
+            if (type(uc_obj) == "object" && uc_obj.success === true &&
+                (uc_obj.status == "outdated" || uc_obj.status == "outdated_same_release")) {
+                updates_available_count++;
+            }
+        }
+    } catch (e) {}
+    status_obj.updates_available_count = updates_available_count;
 
     status_obj.tachyon_running = command_success_from_args(["/etc/init.d/tachyon", "status"]);
 
     // Active servers for all Selector groups
     status_obj.active_servers = {};
+    let meta = get_outbound_display_metadata();
     
     let pdata = get_clash_proxies_data();
     if (pdata && pdata.proxies) {
@@ -178,8 +356,21 @@ function get_system_status() {
                     if (srv && type(srv.history) == "array" && length(srv.history) > 0) {
                         let last = srv.history[length(srv.history) - 1];
                         if (last && last.delay) latency = last.delay;
+                    } else if (srv && (srv.type == "URLTest" || srv.type == "Selector" || srv.type == "Fallback") && srv.now) {
+                        let inner_srv = pdata.proxies[srv.now];
+                        if (inner_srv && type(inner_srv.history) == "array" && length(inner_srv.history) > 0) {
+                            let last = inner_srv.history[length(inner_srv.history) - 1];
+                            if (last && last.delay) latency = last.delay;
+                        }
                     }
-                    status_obj.active_servers[gname] = { server: srv_name, latency: latency };
+                    let total_nodes = type(p.all) == "array" ? length(p.all) : 0;
+                    status_obj.active_servers[gname] = {
+                        server: srv_name,
+                        display_name: format_outbound_display_name(srv_name, meta),
+                        group_label: format_group_display_name(gname, meta),
+                        latency: latency,
+                        total_nodes: total_nodes
+                    };
                 }
             }
         }
@@ -194,6 +385,29 @@ function get_system_status() {
     // IPs
     status_obj.lan_ip = as_string(common.command_output("uci -q get network.lan.ipaddr"));
     status_obj.wan_ip = as_string(common.command_output("ip route get 8.8.8.8 2>/dev/null | grep -Eo 'src [0-9.]+' | awk '{print $2}'"));
+
+    let settings_cfg = uci_core.get_all(CONFIG_NAME, "settings") || {};
+    let v6_info = network_mod.get_ipv6_runtime_telemetry(settings_cfg);
+    let wan_ipv6 = as_string(v6_info.wan_ipv6 || "");
+    if (wan_ipv6 == "") {
+        let route6_src = as_string(common.command_output("ip -6 route get 2001:4860:4860::8888 2>/dev/null"));
+        let m6 = match(route6_src, /\bsrc[ \t]+([0-9a-fA-F:]+)/);
+        if (m6 && m6[1] && network_mod.is_non_local_ipv6(m6[1]) && !network_mod.is_ula_ipv6(m6[1]))
+            wan_ipv6 = m6[1];
+    }
+    status_obj.router_hostname = v6_info.router_hostname;
+    status_obj.wan_ipv6 = wan_ipv6;
+    status_obj.lan_ipv6 = v6_info.lan_ipv6;
+    status_obj.wan6_available = v6_info.wan6_available;
+    status_obj.wan6_iface = v6_info.wan6_iface;
+    status_obj.wan6_prefix = v6_info.wan6_prefix;
+    status_obj.wan6_pd = v6_info.wan6_pd;
+    status_obj.ipv6_effective_state = v6_info.ipv6_effective_state;
+    status_obj.ipv6_mode = v6_info.ipv6_mode;
+    status_obj.ipv6_leak_guard = v6_info.ipv6_leak_guard;
+    status_obj.dns_strategy = v6_info.dns_strategy;
+    status_obj.runtime_dns_strategy = v6_info.runtime_dns_strategy;
+    status_obj.fakeip_enabled = v6_info.fakeip_enabled;
     
     // Tachyon Version
     let ver = "unknown";
@@ -274,16 +488,22 @@ function get_clash_connections() {
 }
 
 function get_clash_traffic() {
-    let args = [ "curl", "-s", "-m", "2", "--connect-timeout", "2" ];
+    let args = [ "curl", "-s", "-N", "-m", "2", "--connect-timeout", "2" ];
     for (let h in get_clash_auth_args()) push(args, h);
     push(args, get_clash_url("traffic"));
     let res = command_capture(command_from_args(args));
-    if (res && res.status == 0 && res.output != "") {
-        try {
-            let first_line = split(trim(res.output), "\n")[0];
-            return json(first_line);
+    if (res && (res.status == 0 || res.status == 28) && trim(res.output) != "") {
+        for (let raw_line in split(res.output, "\n")) {
+            let line = trim(as_string(raw_line || ""));
+            if (line == "")
+                continue;
+            try {
+                let parsed = json(line);
+                if (type(parsed) == "object")
+                    return parsed;
+            }
+            catch (e) {}
         }
-        catch (e) {}
     }
     return null;
 }
@@ -535,6 +755,12 @@ return {
     get_pause_remaining,
     process_running_by_pidfile,
     get_system_status,
+    country_code_to_flag,
+    get_outbound_display_metadata,
+    format_outbound_display_name,
+    format_group_display_name,
+    probe_group_delay,
+    probe_all_groups_delay,
     get_clash_proxies_data,
     clash_request,
     get_clash_connections,

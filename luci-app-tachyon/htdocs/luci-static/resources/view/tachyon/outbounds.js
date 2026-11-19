@@ -2,6 +2,7 @@
 "require baseclass";
 "require form";
 "require fs";
+"require network";
 "require uci";
 "require ui";
 "require view.tachyon.main as main";
@@ -53,6 +54,13 @@ const PROTOCOL_CHOICES = [
   "shadowtls",
   "snell",
   "sudoku",
+  "warp",
+  "tewfai",
+  "csqtt",
+  "wdtt",
+  "tailscale",
+  "tor",
+  "desync",
   "socks",
   "http",
   "direct",
@@ -81,15 +89,7 @@ const PORT_CHOICES = [
   "8080",
 ];
 
-const DPI_SOURCE_TYPES = new Set(["zapret", "zapret2", "byedpi", "desync"]);
-
-const ZAPRET_DEFAULT_NFQWS_OPT =
-  "--filter-tcp=80 --dpi-desync=fake,fakedsplit --dpi-desync-autottl=2 --dpi-desync-fooling=badsum --new --filter-tcp=443 --dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-repeats=11 --dpi-desync-fooling=badsum --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com --new --filter-udp=443 --dpi-desync=fake --dpi-desync-repeats=11 --dpi-desync-fake-quic=/opt/zapret/files/fake/quic_initial_www_google_com.bin";
-
-const ZAPRET2_DEFAULT_NFQWS2_OPT =
-  "--filter-tcp=80 --filter-l7=http --payload=http_req --lua-desync=fake:blob=fake_default_http:tcp_md5 --lua-desync=multisplit:pos=method+2 --new --filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld --new --filter-udp=443 --filter-l7=quic --payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6";
-
-const BYEDPI_DEFAULT_CMD_OPTS = "-o 2 --auto=t,r,a,s -d 2";
+const DPI_SOURCE_TYPES = new Set(["desync"]);
 
 function isoToFlagEmoji(iso) {
   const code = String(iso || "")
@@ -102,112 +102,766 @@ function isoToFlagEmoji(iso) {
   );
 }
 
+function poolServerName(rawName, rawPrefix) {
+  const name = String(rawName || "").trim();
+  const prefix = String(rawPrefix || "").trim();
+  if (!name) return "";
+  if (!prefix) return name;
+  const fullPrefix = `${prefix}: `;
+  if (name.startsWith(fullPrefix)) return name.slice(fullPrefix.length).trim();
+  const bracketPrefix = `[${prefix}]`;
+  if (name.startsWith(bracketPrefix))
+    return name.slice(bracketPrefix.length).trim();
+  const spacePrefix = `${prefix} `;
+  if (name.startsWith(spacePrefix))
+    return name.slice(spacePrefix.length).trim();
+  return name;
+}
+
+function serverNameList(val) {
+  if (!val) return [];
+  if (Array.isArray(val))
+    return val.map((v) => String(v).trim()).filter(Boolean);
+  return String(val)
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function canonPoolServerName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (
+    typeof main !== "undefined" &&
+    main &&
+    typeof main.stripDynamicServerTelemetry === "function"
+  ) {
+    return main.stripDynamicServerTelemetry(raw);
+  }
+  return raw;
+}
+
+function buildPoolServerFilterSets(listVal) {
+  const rawSet = new Set();
+  const canonSet = new Set();
+  serverNameList(listVal).forEach((item) => {
+    rawSet.add(item);
+    const canon = canonPoolServerName(item);
+    if (canon) canonSet.add(canon);
+  });
+  return { rawSet, canonSet };
+}
+
+function poolServerMatchesFilterSets(sets, candidates) {
+  if (!sets || !sets.rawSet || !sets.rawSet.size) return false;
+  for (let i = 0; i < candidates.length; i += 1) {
+    const raw = String(candidates[i] || "").trim();
+    if (!raw) continue;
+    if (sets.rawSet.has(raw)) return true;
+    const canon = canonPoolServerName(raw);
+    if (canon && sets.canonSet.has(canon)) return true;
+  }
+  return false;
+}
+
+const SUB_CACHE_DIR = "/etc/tachyon/subscription-cache";
+
+function extractFlagCountryIso(str) {
+  const s = String(str || "");
+  const cps = Array.from(s);
+  for (let i = 0; i < cps.length - 1; i++) {
+    const c1 = cps[i].codePointAt(0);
+    const c2 = cps[i + 1].codePointAt(0);
+    if (c1 >= 0x1f1e6 && c1 <= 0x1f1ff && c2 >= 0x1f1e6 && c2 <= 0x1f1ff) {
+      return (
+        String.fromCharCode(65 + (c1 - 0x1f1e6)) +
+        String.fromCharCode(65 + (c2 - 0x1f1e6))
+      );
+    }
+  }
+  if (typeof main.detectOutboundCountry === "function") {
+    const detected = main.detectOutboundCountry({ displayName: s });
+    if (detected && detected.code && detected.code !== "OTHER") {
+      return detected.code;
+    }
+  }
+  return "";
+}
+
+function isFsNotFoundErr(err) {
+  const msg = `${String((err && err.name) || "")} ${String((err && err.message) || err || "")}`;
+  return /NotFoundError|ENOENT|No such file or directory|Object not found|-32000/i.test(
+    msg,
+  );
+}
+
+function readTextSafe(path, allowDirect = true) {
+  return fs
+    .read(path)
+    .catch((err) =>
+      allowDirect &&
+      !isFsNotFoundErr(err) &&
+      typeof fs.read_direct === "function"
+        ? fs.read_direct(path, "text")
+        : Promise.resolve(""),
+    )
+    .then((raw) => String(raw || ""))
+    .catch(() => "");
+}
+
+function readJsonSafe(path, allowDirect = true) {
+  return readTextSafe(path, allowDirect)
+    .then((raw) => (raw.trim() ? JSON.parse(raw) : {}))
+    .catch(() => ({}));
+}
+
 function loadGlobalPoolChoices() {
   const secNames = (uci.sections(UCI_PACKAGE, "section") || [])
     .map((s) => s[".name"])
     .filter((n) => n && /^[A-Za-z0-9_-]+$/.test(n));
   if (!secNames.includes("Main")) secNames.unshift("Main");
 
-  const readCache = (secName) => {
-    const path = `${SECTION_CACHE_DIR}/${secName}.json`;
-    return fs
-      .read(path)
-      .catch(() =>
-        typeof fs.read_direct === "function"
-          ? fs.read_direct(path, "text")
-          : Promise.resolve("{}"),
-      )
-      .then((raw) => JSON.parse(raw || "{}"))
-      .catch(() => ({}));
-  };
-
-  return Promise.all(secNames.map(readCache)).then((caches) => {
-    const serverMap = new Map();
-    const countrySet = new Set();
-    const prefixSet = new Set();
-
-    (uci.sections(UCI_PACKAGE, "outbound_source") || []).forEach((src) => {
-      if (src.node_prefix) prefixSet.add(String(src.node_prefix).trim());
-      const stype = String(src.source_type || "subscription").toLowerCase();
-      if (DPI_SOURCE_TYPES.has(stype)) return;
-      const sname = String(src.name || src[".name"] || "").trim();
-      asArray(src.proxy_links || src.selector_proxy_links).forEach((link) => {
-        const lname =
-          (typeof main.getProxyUrlName === "function" &&
-            main.getProxyUrlName(link)) ||
-          link;
-        if (lname && !serverMap.has(lname)) {
-          serverMap.set(lname, lname);
-        }
-      });
-      if (stype !== "subscription" && stype !== "proxy_links" && sname) {
-        const badge = stype.toUpperCase();
-        if (!serverMap.has(sname)) {
-          serverMap.set(sname, `${sname} [${badge}]`);
-        }
-      }
+  const readSectionCaches = () =>
+    (typeof fs.list === "function"
+      ? fs
+          .list(SECTION_CACHE_DIR)
+          .then((entries) =>
+            Array.isArray(entries)
+              ? new Set(
+                  entries
+                    .map((e) => String((e && e.name) || ""))
+                    .filter(Boolean),
+                )
+              : null,
+          )
+          .catch(() => null)
+      : Promise.resolve(null)
+    ).then((existingFiles) => {
+      const candidates =
+        existingFiles !== null
+          ? secNames.filter((secName) => existingFiles.has(`${secName}.json`))
+          : secNames;
+      const allowDirect = existingFiles !== null;
+      return Promise.all(
+        candidates.map((secName) =>
+          readJsonSafe(`${SECTION_CACHE_DIR}/${secName}.json`, allowDirect),
+        ),
+      );
     });
 
-    caches.forEach((c) => {
-      const meta = (c && c.outboundMetadata) || {};
-      const groups = (c && c.urltestGroups) || {};
-      const pgroups = (c && c.priorityGroups) || {};
-      const rawHidden = (c && c.hiddenOutboundTags) || {};
-      const hiddenSet = new Set(
-        Array.isArray(rawHidden) ? rawHidden : Object.keys(rawHidden),
-      );
-      const names = meta.names || {};
-      const countries = meta.countries || {};
-      const protocols = meta.protocols || {};
-      const transports = meta.transports || {};
-      const prefixes = meta.prefixes || {};
+  const readSubCaches = () =>
+    fs
+      .list(SUB_CACHE_DIR)
+      .catch(() => [])
+      .then((entries) => {
+        const list = Array.isArray(entries) ? entries : [];
+        const jsonBases = [];
+        const urlFileSet = new Set();
+        const mtimeMap = new Map();
 
-      Object.entries(names).forEach(([tag, rawName]) => {
-        if (groups[tag] || pgroups[tag] || hiddenSet.has(tag)) return;
-        const name = String(rawName || "").trim();
-        if (!name) return;
-        const proto = String(protocols[tag] || "").toUpperCase();
-        if (proto === "URLTEST" || proto === "SELECTOR") return;
-        const trans = String(transports[tag] || "").toUpperCase();
-        const badge =
-          proto && trans && proto !== trans
-            ? `${proto}+${trans}`
-            : proto || trans;
-        const label = badge ? `${name} [${badge}]` : name;
-        if (!serverMap.has(name)) {
-          serverMap.set(name, label);
+        list.forEach((ent) => {
+          const fname = String((ent && ent.name) || "");
+          if (fname.endsWith(".url")) {
+            urlFileSet.add(fname.slice(0, -4));
+          } else if (
+            fname.endsWith(".json") &&
+            !fname.endsWith(".metadata.json") &&
+            fname.includes("-subscription-")
+          ) {
+            const base = fname.slice(0, -5);
+            jsonBases.push(base);
+            mtimeMap.set(base, Number(ent.mtime || 0));
+          }
+        });
+
+        return Promise.all(
+          jsonBases.map((base) =>
+            (urlFileSet.has(base)
+              ? readTextSafe(`${SUB_CACHE_DIR}/${base}.url`)
+              : Promise.resolve("")
+            ).then((u) => ({
+              base,
+              url: u.trim(),
+              mtime: mtimeMap.get(base) || 0,
+            })),
+          ),
+        ).then((baseInfos) => {
+          // Deduplicate by URL (keep newest mtime) so we don't read duplicate section copies
+          const chosenByKey = new Map();
+          baseInfos.forEach((info) => {
+            const key = info.url || `base:${info.base}`;
+            const prev = chosenByKey.get(key);
+            if (!prev || info.mtime >= prev.mtime) {
+              chosenByKey.set(key, info);
+            }
+          });
+          const chosen = Array.from(chosenByKey.values());
+          return Promise.all(
+            chosen.map((info) =>
+              Promise.all([
+                readJsonSafe(`${SUB_CACHE_DIR}/${info.base}.json`),
+                readTextSafe(`${SUB_CACHE_DIR}/${info.base}.links`),
+              ]).then(([data, linksText]) => ({
+                base: info.base,
+                url: info.url,
+                mtime: info.mtime,
+                outbounds: Array.isArray(data && data.outbounds)
+                  ? data.outbounds
+                  : [],
+                links: String(linksText || "")
+                  .split(/\r?\n/)
+                  .map((l) => l.trim())
+                  .filter(Boolean),
+              })),
+            ),
+          );
+        });
+      })
+      .catch(() => []);
+
+  return Promise.all([readSectionCaches(), readSubCaches()]).then(
+    ([caches, subCaches]) => {
+      const serverMap = new Map();
+      const canonToMapKey = new Map();
+      const countrySet = new Set();
+      const prefixSet = new Set();
+      const urlToSources = new Map();
+      const sidToSource = new Map();
+
+      const upsertServer = (name, details) => {
+        let prefix = String(details.prefix || "").trim();
+        const cleanName = poolServerName(name, prefix);
+        if (!cleanName) return;
+
+        if (!prefix) {
+          for (const kp of prefixSet) {
+            if (kp && serverMap.has(`[${kp}] ${cleanName}`)) {
+              prefix = kp;
+              break;
+            }
+          }
+        } else if (serverMap.has(cleanName)) {
+          const unprefixed = serverMap.get(cleanName);
+          if (unprefixed && !unprefixed.prefix) {
+            serverMap.delete(cleanName);
+            const targetKey = `[${prefix}] ${cleanName}`;
+            if (!serverMap.has(targetKey)) {
+              serverMap.set(targetKey, unprefixed);
+            }
+          }
         }
-      });
 
-      Object.values(countries).forEach((cc) => {
-        const code = String(cc || "")
+        let mapKey =
+          prefix &&
+          !cleanName.startsWith(`${prefix}: `) &&
+          !cleanName.startsWith(`[${prefix}]`)
+            ? `[${prefix}] ${cleanName}`
+            : cleanName;
+        const canonKeyName = canonPoolServerName(mapKey);
+        const canonIndexKey = canonKeyName
+          ? `${prefix.toLowerCase()}|${String(details.proto || "").toLowerCase()}|${String(details.port || "")}|${canonKeyName}`
+          : "";
+        if (details.fromSubCache && canonIndexKey) {
+          if (!canonToMapKey.has(canonIndexKey)) {
+            canonToMapKey.set(canonIndexKey, mapKey);
+          }
+        } else if (
+          details.fromSectionCache &&
+          !serverMap.has(mapKey) &&
+          canonIndexKey &&
+          canonToMapKey.has(canonIndexKey)
+        ) {
+          mapKey = canonToMapKey.get(canonIndexKey);
+        }
+        const existing = serverMap.get(mapKey);
+        const proto = String(
+          details.proto || (existing && existing.proto) || "",
+        )
+          .trim()
+          .toLowerCase();
+        const trans = String(
+          details.trans || (existing && existing.trans) || "",
+        )
+          .trim()
+          .toLowerCase();
+        const sec = String(details.sec || (existing && existing.sec) || "")
+          .trim()
+          .toLowerCase();
+        const port = String(
+          details.port || (existing && existing.port) || "",
+        ).trim();
+        const effPrefix = String(
+          prefix || (existing && existing.prefix) || "",
+        ).trim();
+        const link = String(
+          details.link || (existing && existing.link) || "",
+        ).trim();
+        const country = String(
+          details.country ||
+            (existing && existing.country) ||
+            extractFlagCountryIso(cleanName) ||
+            "",
+        )
           .trim()
           .toUpperCase();
-        if (code.length === 2) countrySet.add(code);
-      });
+        if (country.length === 2) countrySet.add(country);
+        if (effPrefix) prefixSet.add(effPrefix);
 
-      Object.values(prefixes).forEach((p) => {
-        const pfx = String(p || "").trim();
+        const pUp = proto.toUpperCase();
+        const tUp = trans.toUpperCase();
+        const badge =
+          pUp && tUp && pUp !== tUp ? `${pUp}+${tUp}` : pUp || tUp || "";
+        const label = badge ? `${mapKey} [${badge}]` : mapKey;
+        const sourceIds = existing ? existing.sourceIds : new Set();
+        if (details.sourceId) sourceIds.add(details.sourceId);
+
+        serverMap.set(mapKey, {
+          value: mapKey,
+          rawName:
+            details.fromSectionCache && existing && existing.rawName
+              ? existing.rawName
+              : cleanName,
+          label:
+            details.fromSectionCache && existing && existing.label
+              ? existing.label
+              : label,
+          proto,
+          trans,
+          sec,
+          port,
+          prefix: effPrefix,
+          link,
+          country,
+          sourceIds,
+        });
+      };
+
+      (uci.sections(UCI_PACKAGE, "outbound_source") || []).forEach((src) => {
+        const sid = src[".name"];
+        const pfx =
+          src.prefix_nodes === "0" ? "" : String(src.node_prefix || "").trim();
         if (pfx) prefixSet.add(pfx);
+        if (sid) sidToSource.set(sid, { sid, prefix: pfx });
+        const stype = String(src.source_type || "subscription").toLowerCase();
+
+        if (stype === "subscription") {
+          const rawUrl = String(src.url || "").trim();
+          const fallbackName = String(src.name || "").trim();
+          const u =
+            rawUrl || (/^https?:\/\//i.test(fallbackName) ? fallbackName : "");
+          if (u) {
+            if (!urlToSources.has(u)) urlToSources.set(u, []);
+            urlToSources.get(u).push({ sid, prefix: pfx });
+          }
+        }
+
+        const sname = String(src.name || src[".name"] || "").trim();
+        const rawLinks = [
+          ...asArray(src.proxy_links),
+          ...asArray(src.selector_proxy_links),
+          ...String(src.proxy_links_text || "")
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean),
+          ...String(src.selector_proxy_links_text || "")
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean),
+        ];
+        Array.from(new Set(rawLinks)).forEach((link) => {
+          const lname =
+            (typeof main.getProxyUrlName === "function" &&
+              main.getProxyUrlName(link)) ||
+            link;
+          const m = String(link || "").match(/^([a-z0-9+-]+):\/\//i);
+          const lproto = m ? m[1].toLowerCase() : "";
+          if (lname) {
+            upsertServer(poolServerName(lname, pfx), {
+              proto: lproto,
+              prefix: pfx,
+              link,
+              sourceId: sid,
+            });
+          }
+        });
+        if (stype === "amnezia_config" || stype === "awg") {
+          const awgList = asRawList(
+            src.amnezia_configs || src.selector_amnezia_configs,
+          );
+          if (awgList.length > 0) {
+            awgList.forEach((entry) => {
+              let cname = sname;
+              try {
+                const parsed = JSON.parse(entry);
+                if (
+                  parsed &&
+                  typeof parsed.name === "string" &&
+                  parsed.name.trim()
+                ) {
+                  cname = parsed.name.trim();
+                }
+              } catch (_e) {}
+              if (cname) {
+                upsertServer(cname, {
+                  proto: "amneziawg",
+                  prefix: pfx,
+                  sourceId: sid,
+                });
+              }
+            });
+          } else if (sname) {
+            upsertServer(sname, {
+              proto: "amneziawg",
+              prefix: pfx,
+              sourceId: sid,
+            });
+          }
+        } else if (
+          stype !== "subscription" &&
+          stype !== "proxy_links" &&
+          sname
+        ) {
+          upsertServer(sname, {
+            proto: stype,
+            prefix: pfx,
+            sourceId: sid,
+          });
+        }
       });
-    });
 
-    const servers = Array.from(serverMap.entries())
-      .map(([value, label]) => ({ value, label }))
-      .sort((a, b) => a.label.localeCompare(b.label));
+      // 1. Add all unfiltered servers from /etc/tachyon/subscription-cache
+      (subCaches || []).forEach((sc) => {
+        let matchedSources = sc.url && urlToSources.get(sc.url);
+        if (!matchedSources && sc.base) {
+          const baseMatch = String(sc.base).match(
+            /^(?:src-|Pool_)(.+)-subscription-\d+$/,
+          );
+          if (baseMatch && sidToSource.has(baseMatch[1])) {
+            matchedSources = [sidToSource.get(baseMatch[1])];
+          }
+        }
+        if (!matchedSources) {
+          matchedSources = [{ sid: "", prefix: "" }];
+        }
+        const linkByTag = new Map();
+        (sc.links || []).forEach((lnk) => {
+          const hashIdx = lnk.indexOf("#");
+          if (hashIdx >= 0) {
+            try {
+              const dec = decodeURIComponent(lnk.slice(hashIdx + 1)).trim();
+              if (dec) linkByTag.set(dec, lnk);
+            } catch (_e) {
+              const rawFrag = lnk.slice(hashIdx + 1).trim();
+              if (rawFrag) linkByTag.set(rawFrag, lnk);
+            }
+          }
+        });
+        const leafOutbounds = (sc.outbounds || []).filter((ob) => {
+          if (!ob || typeof ob !== "object") return false;
+          const rawTag = String(ob.remark || ob.tag || ob.name || "").trim();
+          const proto = String(ob.type || "").toLowerCase();
+          return (
+            Boolean(rawTag) &&
+            proto !== "urltest" &&
+            proto !== "selector" &&
+            proto !== "direct"
+          );
+        });
+        leafOutbounds.forEach((ob, idx) => {
+          const rawTag = String(ob.remark || ob.tag || ob.name || "").trim();
+          const proto = String(ob.type || "").toLowerCase();
+          const trans = String(
+            (ob.transport && ob.transport.type) || "tcp",
+          ).toLowerCase();
+          const sec =
+            ob.tls && ob.tls.enabled
+              ? ob.tls.reality && ob.tls.reality.enabled
+                ? "reality"
+                : "tls"
+              : "none";
+          const port = String(ob.server_port || ob.port || "");
 
-    const countryMap = new Map(COMMON_COUNTRIES);
-    countrySet.forEach((cc) => {
-      if (!countryMap.has(cc)) {
-        countryMap.set(cc, `${isoToFlagEmoji(cc)} ${cc}`);
+          matchedSources.forEach((ms) => {
+            const cleanName = poolServerName(rawTag, ms.prefix);
+            const resolvedLink = String(
+              ob.share_link ||
+                ob.__tachyon_link ||
+                ob.link ||
+                linkByTag.get(cleanName) ||
+                linkByTag.get(rawTag) ||
+                (Array.isArray(sc.links) &&
+                sc.links.length >= leafOutbounds.length &&
+                sc.links[idx]
+                  ? sc.links[idx]
+                  : "") ||
+                "",
+            ).trim();
+            upsertServer(cleanName, {
+              proto,
+              trans,
+              sec,
+              port,
+              prefix: ms.prefix,
+              link: resolvedLink,
+              sourceId: ms.sid,
+              fromSubCache: true,
+            });
+          });
+        });
+      });
+
+      const knownPrefixes = Array.from(prefixSet).filter(Boolean);
+
+      // 2. Also merge servers and metadata from section-cache
+      caches.forEach((c) => {
+        const meta = (c && c.outboundMetadata) || {};
+        const groups = (c && c.urltestGroups) || {};
+        const pgroups = (c && c.priorityGroups) || {};
+        const rawHidden = (c && c.hiddenOutboundTags) || {};
+        const hiddenSet = new Set(
+          Array.isArray(rawHidden) ? rawHidden : Object.keys(rawHidden),
+        );
+        const names =
+          meta.names && Object.keys(meta.names).length
+            ? meta.names
+            : (c && c.names) || {};
+        const countries =
+          meta.countries && Object.keys(meta.countries).length
+            ? meta.countries
+            : (c && c.countries) || {};
+        const protocols =
+          meta.protocols && Object.keys(meta.protocols).length
+            ? meta.protocols
+            : (c && (c.protocols || c.types)) || {};
+        const transports =
+          meta.transports && Object.keys(meta.transports).length
+            ? meta.transports
+            : (c && c.transports) || {};
+        const securities =
+          meta.securities && Object.keys(meta.securities).length
+            ? meta.securities
+            : (c && c.securities) || {};
+        const ports =
+          meta.ports && Object.keys(meta.ports).length
+            ? meta.ports
+            : (c && c.ports) || {};
+        const prefixes =
+          meta.prefixes && Object.keys(meta.prefixes).length
+            ? meta.prefixes
+            : (c && c.prefixes) || {};
+        const links =
+          meta.links && Object.keys(meta.links).length
+            ? meta.links
+            : (c && (c.outboundLinks || c.links)) || {};
+
+        Object.entries(names).forEach(([tag, rawName]) => {
+          if (groups[tag] || pgroups[tag] || hiddenSet.has(tag)) return;
+          if (
+            tag === "direct-out" ||
+            tag === "block-out" ||
+            tag.endsWith("-urltest-out") ||
+            tag.endsWith("-priority-out") ||
+            tag.startsWith("bal-") ||
+            tag.startsWith("lvl-")
+          )
+            return;
+          let pfx = String(prefixes[tag] || "").trim();
+          const rawStr = String(rawName || "").trim();
+          if (!pfx && rawStr) {
+            for (let i = 0; i < knownPrefixes.length; i++) {
+              const kp = knownPrefixes[i];
+              if (
+                rawStr.startsWith(`${kp}: `) ||
+                rawStr.startsWith(`[${kp}] `) ||
+                rawStr.startsWith(`${kp} `)
+              ) {
+                pfx = kp;
+                break;
+              }
+            }
+          }
+          const name = poolServerName(rawStr, pfx);
+          if (!name) return;
+          const proto = String(protocols[tag] || "").toLowerCase();
+          if (
+            proto === "urltest" ||
+            proto === "selector" ||
+            proto === "direct" ||
+            proto === "dpi"
+          )
+            return;
+          const trans = String(transports[tag] || "").toLowerCase();
+          const sec = String(securities[tag] || "").toLowerCase();
+          const port = String(ports[tag] || "");
+          const link = String(links[tag] || "").trim();
+          const country = String(countries[tag] || "")
+            .trim()
+            .toUpperCase();
+          upsertServer(name, {
+            proto,
+            trans,
+            sec,
+            port,
+            prefix: pfx,
+            link,
+            country,
+            sourceId: String(
+              (meta.source_ids && meta.source_ids[tag]) ||
+                (c && c.source_ids && c.source_ids[tag]) ||
+                "",
+            ).trim(),
+            fromSectionCache: true,
+          });
+        });
+
+        Object.values(countries).forEach((cc) => {
+          const code = String(cc || "")
+            .trim()
+            .toUpperCase();
+          if (code.length === 2) countrySet.add(code);
+        });
+
+        Object.values(prefixes).forEach((p) => {
+          const pfx = String(p || "").trim();
+          if (pfx) prefixSet.add(pfx);
+        });
+      });
+
+      const servers = Array.from(serverMap.values())
+        .map((s) => ({
+          ...s,
+          sourceIds: Array.from(s.sourceIds),
+        }))
+        .sort((a, b) => a.label.localeCompare(b.label));
+
+      const countryMap = new Map(COMMON_COUNTRIES);
+      countrySet.forEach((cc) => {
+        if (!countryMap.has(cc)) {
+          countryMap.set(cc, `${isoToFlagEmoji(cc)} ${cc}`);
+        }
+      });
+      const countries = Array.from(countryMap.entries()).map(
+        ([value, label]) => ({ value, label }),
+      );
+
+      const prefixes = Array.from(prefixSet).filter(Boolean);
+      return { servers, countries, prefixes };
+    },
+  );
+}
+
+function portMatchesSpec(portStr, specList) {
+  const p = Number(portStr);
+  if (!portStr || !Number.isFinite(p)) return false;
+  return specList.some((spec) => {
+    const s = String(spec || "").trim();
+    if (!s) return false;
+    const rangeMatch = s.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (rangeMatch) {
+      const lo = Number(rangeMatch[1]);
+      const hi = Number(rangeMatch[2]);
+      return p >= Math.min(lo, hi) && p <= Math.max(lo, hi);
+    }
+    return Number(s) === p;
+  });
+}
+
+function filterPoolServersForGroup(poolServers, grp) {
+  const list = Array.isArray(poolServers) ? poolServers : [];
+  if (!grp) return list;
+  const mode = String(grp.filter_mode || "mixed").toLowerCase();
+  const srcRefs = asArray(grp.source_refs);
+
+  const incPfx = asArray(grp.include_prefixes).map((s) => s.toLowerCase());
+  const excPfx = asArray(grp.exclude_prefixes).map((s) => s.toLowerCase());
+  const incCountries = asArray(grp.include_countries).map((s) =>
+    s.toUpperCase(),
+  );
+  const excCountries = asArray(grp.exclude_countries).map((s) =>
+    s.toUpperCase(),
+  );
+  const incNameSets = buildPoolServerFilterSets(grp.include_outbounds);
+  const excNameSets = buildPoolServerFilterSets(grp.exclude_outbounds);
+  const incRx = asArray(grp.include_regex)
+    .map((r) => {
+      try {
+        return new RegExp(r, "i");
+      } catch (_e) {
+        return null;
       }
-    });
-    const countries = Array.from(countryMap.entries()).map(
-      ([value, label]) => ({ value, label }),
-    );
+    })
+    .filter(Boolean);
+  const excRx = asArray(grp.exclude_regex)
+    .map((r) => {
+      try {
+        return new RegExp(r, "i");
+      } catch (_e) {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  const incProto = asArray(grp.include_protocols).map((s) => s.toLowerCase());
+  const excProto = asArray(grp.exclude_protocols).map((s) => s.toLowerCase());
+  const incTrans = asArray(grp.include_transports).map((s) => s.toLowerCase());
+  const excTrans = asArray(grp.exclude_transports).map((s) => s.toLowerCase());
+  const incSec = asArray(grp.include_securities).map((s) => s.toLowerCase());
+  const excSec = asArray(grp.exclude_securities).map((s) => s.toLowerCase());
+  const incPorts = asArray(grp.include_ports);
+  const excPorts = asArray(grp.exclude_ports);
 
-    const prefixes = Array.from(prefixSet).filter(Boolean);
-    return { servers, countries, prefixes };
+  return list.filter((srv) => {
+    if (
+      srcRefs.length &&
+      Array.isArray(srv.sourceIds) &&
+      srv.sourceIds.length > 0 &&
+      !srv.sourceIds.some((id) => srcRefs.includes(id))
+    ) {
+      return false;
+    }
+    if (mode === "disabled") return true;
+
+    const name = String(srv.value || "");
+    const rawName = String(srv.rawName || name);
+    const pfx = String(srv.prefix || "").toLowerCase();
+    const cc = String(srv.country || extractFlagCountryIso(name)).toUpperCase();
+    const proto = String(srv.proto || "").toLowerCase();
+    const trans = String(srv.trans || "").toLowerCase();
+    const sec = String(srv.sec || "").toLowerCase();
+    const port = String(srv.port || "");
+
+    if (mode === "include" || mode === "mixed") {
+      if (incPfx.length && !incPfx.includes(pfx)) return false;
+      if (incCountries.length && !incCountries.includes(cc)) return false;
+      if (
+        incNameSets.rawSet.size &&
+        !poolServerMatchesFilterSets(incNameSets, [name, rawName])
+      )
+        return false;
+      if (
+        incRx.length &&
+        !incRx.some((rx) => rx.test(name) || rx.test(rawName))
+      )
+        return false;
+      if (incProto.length && !incProto.includes(proto)) return false;
+      if (incTrans.length && !incTrans.includes(trans)) return false;
+      if (incSec.length && !incSec.includes(sec)) return false;
+      if (incPorts.length && !portMatchesSpec(port, incPorts)) return false;
+    }
+
+    if (mode === "exclude" || mode === "mixed") {
+      if (excPfx.length && pfx && excPfx.includes(pfx)) return false;
+      if (excCountries.length && cc && excCountries.includes(cc)) return false;
+      if (poolServerMatchesFilterSets(excNameSets, [name, rawName]))
+        return false;
+      if (excRx.length && excRx.some((rx) => rx.test(name) || rx.test(rawName)))
+        return false;
+      if (excProto.length && proto && excProto.includes(proto)) return false;
+      if (excTrans.length && trans && excTrans.includes(trans)) return false;
+      if (excSec.length && sec && excSec.includes(sec)) return false;
+      if (excPorts.length && portMatchesSpec(port, excPorts)) return false;
+    }
+
+    return true;
   });
 }
 
@@ -233,7 +887,7 @@ function createChipToggleBar(inputEl, choices, isUpper) {
             class: "btn cbi-button",
             style: `padding: 2px 8px; font-size: 11px; line-height: 1.4; border-radius: 999px; ${
               active
-                ? "background: rgba(59,130,246,0.22); border-color: #3b82f6; font-weight: 600;"
+                ? "background: rgba(139, 92, 246,0.22); border-color: #8b5cf6; font-weight: 600;"
                 : "opacity: 0.78;"
             }`,
             click: () => {
@@ -244,6 +898,7 @@ function createChipToggleBar(inputEl, choices, isUpper) {
               if (idx >= 0) list.splice(idx, 1);
               else list.push(norm);
               inputEl.value = list.join(", ");
+              inputEl.dispatchEvent(new Event("input"));
               render();
             },
           },
@@ -258,26 +913,159 @@ function createChipToggleBar(inputEl, choices, isUpper) {
 }
 
 function createServerChecklistPicker(inputEl) {
-  const container = E("div", { style: "margin-top: 6px;" });
+  const container = E("div", {
+    style: "margin-top: 6px; min-width: 0; max-width: 100%;",
+  });
+  const summaryBar = E("div", {
+    style:
+      "display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-bottom: 6px;",
+  });
+  const selectedChipsBox = E("div", {
+    style: "display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px;",
+  });
+  const drawerWrap = E("div", {
+    style:
+      "border: 1px solid rgba(128,128,128,0.25); border-radius: 8px; padding: 8px; background: rgba(15, 23, 42, 0.25);",
+  });
+  const searchRow = E("div", {
+    style:
+      "display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px;",
+  });
   const searchInput = E("input", {
     type: "text",
     class: "cbi-input-text",
     placeholder: _("Search servers in pool..."),
-    style: "width: 100%; margin-bottom: 6px; font-size: 12px;",
+    style: "flex: 1; min-width: 160px; font-size: 12px; margin: 0;",
   });
   const listBox = E("div", {
     style:
-      "max-height: 140px; overflow-y: auto; border: 1px solid rgba(128,128,128,0.25); border-radius: 6px; padding: 6px; display: flex; flex-wrap: wrap; gap: 4px;",
+      "max-height: 200px; min-width: 0; max-width: 100%; box-sizing: border-box; overflow-x: hidden; overflow-y: auto; display: flex; flex-direction: column; gap: 3px;",
   });
+
   let allServers = [];
+  let isListOpen = true;
+
+  const setSelectedValues = (arr) => {
+    inputEl.value = arr.join(", ");
+    inputEl.dispatchEvent(new Event("input"));
+  };
+
+  const getMergedServers = () => {
+    const selectedList = serverNameList(inputEl.value);
+    const knownMap = new Map();
+    allServers.forEach((s) => knownMap.set(s.value, s));
+    const merged = [...allServers];
+    selectedList.forEach((name) => {
+      if (!knownMap.has(name)) {
+        merged.unshift({
+          value: name,
+          label: name,
+          proto: "",
+          trans: "",
+          isCustom: true,
+        });
+      }
+    });
+    return merged;
+  };
 
   const renderList = () => {
+    const selectedArr = serverNameList(inputEl.value);
+    const selected = new Set(selectedArr);
+    const merged = getMergedServers();
+
+    summaryBar.innerHTML = "";
+    const countBadge = E(
+      "span",
+      {
+        style: `font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; ${
+          selected.size > 0
+            ? "background: rgba(139, 92, 246, 0.22); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.45);"
+            : "opacity: 0.72;"
+        }`,
+      },
+      selected.size > 0
+        ? `${_("Selected servers")}: ${selected.size} / ${merged.length || selected.size}`
+        : `${_("Selected servers")}: 0 (${_("Pool")}: ${merged.length})`,
+    );
+
+    const rightBtns = E("div", { style: "display: flex; gap: 6px;" });
+    if (selected.size > 0) {
+      rightBtns.appendChild(
+        E(
+          "button",
+          {
+            type: "button",
+            class: "btn cbi-button",
+            style: "padding: 2px 8px; font-size: 11px; line-height: 1.4;",
+            click: () => {
+              setSelectedValues([]);
+              renderList();
+            },
+          },
+          _("Clear all"),
+        ),
+      );
+    }
+    rightBtns.appendChild(
+      E(
+        "button",
+        {
+          type: "button",
+          class: "btn cbi-button",
+          style: "padding: 2px 8px; font-size: 11px; line-height: 1.4;",
+          click: () => {
+            isListOpen = !isListOpen;
+            drawerWrap.style.display = isListOpen ? "" : "none";
+            renderList();
+          },
+        },
+        isListOpen
+          ? `▴ ${_("Hide server list")} (${merged.length})`
+          : `▾ ${_("Choose from server list")} (${merged.length})`,
+      ),
+    );
+    summaryBar.appendChild(countBadge);
+    summaryBar.appendChild(rightBtns);
+
+    selectedChipsBox.innerHTML = "";
+    if (selectedArr.length > 0) {
+      selectedChipsBox.style.display = "flex";
+      selectedArr.forEach((name) => {
+        selectedChipsBox.appendChild(
+          E(
+            "button",
+            {
+              type: "button",
+              class: "btn cbi-button",
+              title: _("Click to remove server from selection"),
+              style:
+                "padding: 2px 8px; font-size: 11px; line-height: 1.35; border-radius: 999px; background: rgba(139, 92, 246, 0.24); border-color: #8b5cf6; color: #ede9fe; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+              click: () => {
+                const next = serverNameList(inputEl.value).filter(
+                  (x) => x !== name,
+                );
+                setSelectedValues(next);
+                renderList();
+              },
+            },
+            [
+              E("span", {}, `✓ ${name}`),
+              E("span", { style: "opacity: 0.75; font-weight: 600;" }, "×"),
+            ],
+          ),
+        );
+      });
+    } else {
+      selectedChipsBox.style.display = "none";
+    }
+
     listBox.innerHTML = "";
-    if (!allServers.length) {
+    if (!merged.length) {
       listBox.appendChild(
         E(
           "span",
-          { style: "font-size: 11px; opacity: 0.65;" },
+          { style: "font-size: 11px; opacity: 0.65; padding: 4px;" },
           _(
             "No cached servers found yet — enter server names above or update subscriptions.",
           ),
@@ -285,48 +1073,146 @@ function createServerChecklistPicker(inputEl) {
       );
       return;
     }
+
     const q = searchInput.value.trim().toLowerCase();
-    const selected = new Set(asArray(inputEl.value));
     const filtered = q
-      ? allServers.filter(
+      ? merged.filter(
           (s) =>
             s.label.toLowerCase().includes(q) ||
             s.value.toLowerCase().includes(q),
         )
-      : allServers;
+      : merged;
 
-    filtered.slice(0, 120).forEach((srv) => {
+    // Sort selected servers to top when no search query, or keep natural order?
+    // Keeping selected highlighted with checkbox makes them easy to spot, and we also show selected chips at top!
+    filtered.slice(0, 200).forEach((srv) => {
       const active = selected.has(srv.value);
+      const cb = E("input", {
+        type: "checkbox",
+        style: "margin: 0; cursor: pointer; flex-shrink: 0;",
+      });
+      cb.checked = active;
+
+      const protoBadge =
+        srv.proto || srv.trans
+          ? E(
+              "span",
+              {
+                style:
+                  "font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(148, 163, 184, 0.16); color: #cbd5e1; flex-shrink: 0; font-family: monospace;",
+              },
+              [srv.proto, srv.trans]
+                .filter(Boolean)
+                .map((x) => String(x).toUpperCase())
+                .filter((v, i, a) => a.indexOf(v) === i)
+                .join("+"),
+            )
+          : null;
+
+      const pfxBadge = srv.prefix
+        ? E(
+            "span",
+            {
+              style:
+                "font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(56, 189, 248, 0.16); color: #7dd3fc; flex-shrink: 0;",
+            },
+            srv.prefix,
+          )
+        : null;
+
+      const toggleSrv = (ev) => {
+        if (ev) ev.stopPropagation();
+        const cur = serverNameList(inputEl.value);
+        const idx = cur.indexOf(srv.value);
+        if (idx >= 0) cur.splice(idx, 1);
+        else cur.push(srv.value);
+        setSelectedValues(cur);
+        renderList();
+      };
+
+      cb.addEventListener("click", toggleSrv);
+
       listBox.appendChild(
         E(
-          "button",
+          "div",
           {
-            type: "button",
-            class: "btn cbi-button",
-            style: `padding: 2px 7px; font-size: 11px; line-height: 1.35; border-radius: 6px; ${
-              active
-                ? "background: rgba(59,130,246,0.22); border-color: #3b82f6; font-weight: 600;"
-                : "opacity: 0.82;"
-            }`,
-            click: () => {
-              const cur = asArray(inputEl.value);
-              const idx = cur.indexOf(srv.value);
-              if (idx >= 0) cur.splice(idx, 1);
-              else cur.push(srv.value);
-              inputEl.value = cur.join(", ");
-              renderList();
-            },
+            style: `display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; user-select: none; border: 1px solid ${
+              active ? "rgba(139, 92, 246, 0.55)" : "rgba(148, 163, 184, 0.12)"
+            }; background: ${
+              active ? "rgba(139, 92, 246, 0.18)" : "rgba(30, 41, 59, 0.35)"
+            };`,
+            click: toggleSrv,
           },
-          srv.label,
+          [
+            E(
+              "div",
+              {
+                style:
+                  "display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1;",
+              },
+              [
+                cb,
+                E(
+                  "span",
+                  {
+                    style: `font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; ${
+                      active ? "font-weight: 600; color: #f8fafc;" : ""
+                    }`,
+                  },
+                  srv.value,
+                ),
+              ],
+            ),
+            E(
+              "div",
+              {
+                style:
+                  "display: flex; align-items: center; gap: 4px; flex-shrink: 0;",
+              },
+              [pfxBadge, protoBadge].filter(Boolean),
+            ),
+          ],
         ),
       );
     });
   };
 
+  const selectFilteredBtn = E(
+    "button",
+    {
+      type: "button",
+      class: "btn cbi-button",
+      style: "padding: 2px 8px; font-size: 11px; line-height: 1.4;",
+      click: () => {
+        const q = searchInput.value.trim().toLowerCase();
+        const merged = getMergedServers();
+        const filtered = q
+          ? merged.filter(
+              (s) =>
+                s.label.toLowerCase().includes(q) ||
+                s.value.toLowerCase().includes(q),
+            )
+          : merged;
+        const cur = new Set(serverNameList(inputEl.value));
+        filtered.forEach((s) => cur.add(s.value));
+        setSelectedValues(Array.from(cur));
+        renderList();
+      },
+    },
+    _("Select matching"),
+  );
+
   searchInput.addEventListener("input", renderList);
   inputEl.addEventListener("input", renderList);
-  container.appendChild(searchInput);
-  container.appendChild(listBox);
+  searchRow.appendChild(searchInput);
+  searchRow.appendChild(selectFilteredBtn);
+  drawerWrap.appendChild(searchRow);
+  drawerWrap.appendChild(listBox);
+
+  container.appendChild(summaryBar);
+  container.appendChild(selectedChipsBox);
+  container.appendChild(drawerWrap);
+  renderList();
 
   return {
     node: container,
@@ -353,6 +1239,35 @@ function asRawList(val) {
     return val.map((v) => String(v).trim()).filter(Boolean);
   const s = String(val).trim();
   return s ? [s] : [];
+}
+
+function updateEntityListRef(entityType, refKey, targetId, selectedIds) {
+  const want = new Set(asArray(selectedIds));
+  (uci.sections(UCI_PACKAGE, entityType) || []).forEach((s) => {
+    const sid = s[".name"];
+    if (!sid) return;
+    const current = asArray(s[refKey]);
+    const has = current.includes(targetId);
+    if (want.has(sid) && !has) {
+      uci.set(UCI_PACKAGE, sid, refKey, [...current, targetId]);
+    } else if (!want.has(sid) && has) {
+      const next = current.filter((id) => id !== targetId);
+      if (next.length) uci.set(UCI_PACKAGE, sid, refKey, next);
+      else uci.unset(UCI_PACKAGE, sid, refKey);
+    }
+  });
+}
+
+function updateSectionsRef(refKey, targetId, selectedIds) {
+  updateEntityListRef("section", refKey, targetId, selectedIds);
+}
+
+function updateBalancersRef(refKey, targetId, selectedIds) {
+  updateEntityListRef("balancer", refKey, targetId, selectedIds);
+}
+
+function updateGroupsRef(refKey, targetId, selectedIds) {
+  updateEntityListRef("outbound_group", refKey, targetId, selectedIds);
 }
 
 function shortenMiddle(str, maxLen) {
@@ -409,9 +1324,22 @@ function summarizeOutboundSource(sectionId) {
     return `Tor SOCKS5 (127.0.0.1:${port})${prefixTag}`;
   }
   if (stype === "tailscale") {
-    const iface =
-      uci.get(UCI_PACKAGE, sectionId, "interface_name") || "tailscale0";
-    return `Tailscale Mesh (${iface})${prefixTag}`;
+    const hostname = String(
+      uci.get(UCI_PACKAGE, sectionId, "tailscale_hostname") || "",
+    ).trim();
+    const controlUrl = String(
+      uci.get(UCI_PACKAGE, sectionId, "tailscale_control_url") || "",
+    ).trim();
+    const hostPart = controlUrl
+      ? controlUrl.replace(/^https?:\/\//i, "").replace(/\/+$/, "")
+      : "";
+    const detail =
+      hostname &&
+      hostPart &&
+      controlUrl !== "https://controlplane.tailscale.com"
+        ? `${hostname} @ ${hostPart}`
+        : hostname || hostPart || _("Tailscale");
+    return `Tailscale Mesh (${detail})${prefixTag}`;
   }
   if (stype === "interface") {
     const iface =
@@ -424,30 +1352,25 @@ function summarizeOutboundSource(sectionId) {
     const jsons = asRawList(uci.get(UCI_PACKAGE, sectionId, "outbound_jsons"));
     return `${_("JSON Outbounds")}: ${jsons.length || 1}${prefixTag}`;
   }
-  if (stype === "zapret2") {
-    const direct =
-      uci.get(UCI_PACKAGE, sectionId, "direct_nfqws") === "1"
-        ? " [Direct NFQUEUE]"
-        : "";
-    return `Zapret2 (nfqws2)${direct}`;
-  }
-  if (stype === "zapret") {
-    const direct =
-      uci.get(UCI_PACKAGE, sectionId, "direct_nfqws") === "1"
-        ? " [Direct NFQUEUE]"
-        : "";
-    return `Zapret (nfqws)${direct}`;
-  }
-  if (stype === "byedpi") {
-    const opts =
-      uci.get(UCI_PACKAGE, sectionId, "byedpi_cmd_opts") ||
-      BYEDPI_DEFAULT_CMD_OPTS;
-    return `ByeDPI: ${shortenMiddle(opts, 42)}`;
-  }
   if (stype === "desync") {
-    const preset =
-      uci.get(UCI_PACKAGE, sectionId, "desync_preset") || "google_youtube";
-    return `Desync (${preset})`;
+    const preset = uci.get(UCI_PACKAGE, sectionId, "desync_preset") || "auto";
+    const fooling = uci.get(UCI_PACKAGE, sectionId, "desync_fooling") || "";
+    const label = preset === "auto" ? "Adaptive 2.0" : preset;
+    return `Desync (${label}${fooling ? ", " + fooling : ""})`;
+  }
+  if (stype === "wdtt") {
+    const uri = String(
+      uci.get(UCI_PACKAGE, sectionId, "warp_flow_uri") ||
+        uci.get(UCI_PACKAGE, sectionId, "csqtt_uri") ||
+        "",
+    ).trim();
+    const srv = String(
+      uci.get(UCI_PACKAGE, sectionId, "server") ||
+        uci.get(UCI_PACKAGE, sectionId, "csqtt_server") ||
+        "",
+    ).trim();
+    const detail = srv ? `: ${srv}` : uri ? " (URI)" : "";
+    return `WDTT${detail}${prefixTag}`;
   }
   const srv =
     uci.get(UCI_PACKAGE, sectionId, "server") ||
@@ -455,6 +1378,7 @@ function summarizeOutboundSource(sectionId) {
     "";
   const port =
     uci.get(UCI_PACKAGE, sectionId, "server_port") ||
+    uci.get(UCI_PACKAGE, sectionId, `${stype}_server_port`) ||
     uci.get(UCI_PACKAGE, sectionId, `${stype}_port`) ||
     "";
   return `${stype.toUpperCase()}${srv ? `: ${srv}${port ? ":" + port : ""}` : ""}${prefixTag}`;
@@ -483,9 +1407,9 @@ function summarizeOutboundGroup(groupObj) {
   const excC = asArray(groupObj.exclude_countries);
   if (excC.length)
     parts.push(`-${_("Flags")}: ${excC.join(", ").toUpperCase()}`);
-  const incSrv = asArray(groupObj.include_outbounds);
+  const incSrv = serverNameList(groupObj.include_outbounds);
   if (incSrv.length) parts.push(`+${_("Servers")}: ${incSrv.length}`);
-  const excSrv = asArray(groupObj.exclude_outbounds);
+  const excSrv = serverNameList(groupObj.exclude_outbounds);
   if (excSrv.length) parts.push(`-${_("Servers")}: ${excSrv.length}`);
   const incRx = asArray(groupObj.include_regex);
   if (incRx.length) parts.push(`+${_("Regex")}: ${incRx.join(", ")}`);
@@ -606,7 +1530,7 @@ function showOutboundGroupModal(existingId, onSaved) {
   const incOutboundsInput = E("input", {
     type: "text",
     class: "cbi-input-text",
-    value: asArray(grp.include_outbounds).join(", "),
+    value: serverNameList(grp.include_outbounds).join(", "),
     placeholder: _(
       "Select servers below or enter comma-separated server names",
     ),
@@ -616,7 +1540,7 @@ function showOutboundGroupModal(existingId, onSaved) {
   const excOutboundsInput = E("input", {
     type: "text",
     class: "cbi-input-text",
-    value: asArray(grp.exclude_outbounds).join(", "),
+    value: serverNameList(grp.exclude_outbounds).join(", "),
     placeholder: _(
       "Select servers below or enter comma-separated server names",
     ),
@@ -703,14 +1627,35 @@ function showOutboundGroupModal(existingId, onSaved) {
     style: "width: 100%;",
   });
 
+  const usedSectionIds = existingId
+    ? (uci.sections(UCI_PACKAGE, "section") || [])
+        .filter(
+          (s) =>
+            s[".name"] && asArray(s.outbound_group_refs).includes(existingId),
+        )
+        .map((s) => s[".name"])
+    : [];
+
+  const secRefsInput = E("input", {
+    type: "text",
+    class: "cbi-input-text",
+    value: usedSectionIds.join(", "),
+    placeholder: _(
+      "Optional: select routing Sections that should use this group",
+    ),
+    style: "width: 100%;",
+  });
+
+  const sectionChoices = (uci.sections(UCI_PACKAGE, "section") || [])
+    .filter((s) => s[".name"])
+    .map((s) => ({
+      value: s[".name"],
+      label: s.label || s.name || s[".name"],
+    }));
+  const secChips = createChipToggleBar(secRefsInput, sectionChoices, false);
+
   const sourceChoices = (uci.sections(UCI_PACKAGE, "outbound_source") || [])
-    .filter(
-      (s) =>
-        s[".name"] &&
-        !DPI_SOURCE_TYPES.has(
-          String(s.source_type || "subscription").toLowerCase(),
-        ),
-    )
+    .filter((s) => s[".name"])
     .map((s) => ({
       value: s[".name"],
       label: `${s.name || s.label || s[".name"]}${s.node_prefix ? " [" + s.node_prefix + "]" : ""}`,
@@ -787,11 +1732,15 @@ function showOutboundGroupModal(existingId, onSaved) {
   const fieldRow = (label, input, hint, extraNode) =>
     E("div", { class: "cbi-value" }, [
       E("label", { class: "cbi-value-title" }, label),
-      E("div", { class: "cbi-value-field" }, [
-        input,
-        extraNode || "",
-        hint ? E("div", { class: "cbi-value-description" }, hint) : "",
-      ]),
+      E(
+        "div",
+        { class: "cbi-value-field", style: "min-width: 0; max-width: 100%;" },
+        [
+          input,
+          extraNode || "",
+          hint ? E("div", { class: "cbi-value-description" }, hint) : "",
+        ],
+      ),
     ]);
 
   ui.showModal(
@@ -806,6 +1755,14 @@ function showOutboundGroupModal(existingId, onSaved) {
           _("Unique identifier (letters, digits, underscores)."),
         ),
         fieldRow(_("Display Name"), nameInput),
+        fieldRow(
+          _("Used in Sections"),
+          secRefsInput,
+          _(
+            "Click sections below to attach this reusable server group to routing Sections.",
+          ),
+          secChips.bar,
+        ),
         fieldRow(
           _("Source Pool References"),
           srcRefsInput,
@@ -975,6 +1932,17 @@ function showOutboundGroupModal(existingId, onSaved) {
                   else uci.unset(UCI_PACKAGE, rawId, key);
                 };
 
+                const setServerListOrUnset = (key, rawText) => {
+                  const arr = serverNameList(rawText);
+                  if (arr.length) uci.set(UCI_PACKAGE, rawId, key, arr);
+                  else uci.unset(UCI_PACKAGE, rawId, key);
+                };
+
+                updateSectionsRef(
+                  "outbound_group_refs",
+                  rawId,
+                  secRefsInput.value,
+                );
                 setListOrUnset("source_refs", srcRefsInput.value, false);
                 setCsvListOrUnset("include_prefixes", incPfxInput.value);
                 setCsvListOrUnset("exclude_prefixes", excPfxInput.value);
@@ -988,8 +1956,14 @@ function showOutboundGroupModal(existingId, onSaved) {
                   excCountriesInput.value,
                   true,
                 );
-                setCsvListOrUnset("include_outbounds", incOutboundsInput.value);
-                setCsvListOrUnset("exclude_outbounds", excOutboundsInput.value);
+                setServerListOrUnset(
+                  "include_outbounds",
+                  incOutboundsInput.value,
+                );
+                setServerListOrUnset(
+                  "exclude_outbounds",
+                  excOutboundsInput.value,
+                );
                 setCsvListOrUnset("include_regex", incRegexInput.value);
                 setCsvListOrUnset("exclude_regex", excRegexInput.value);
 
@@ -1062,6 +2036,16 @@ function showOutboundGroupModal(existingId, onSaved) {
                 }
 
                 ui.hideModal();
+                Promise.resolve(uci.save())
+                  .then(() => {
+                    if (
+                      ui &&
+                      ui.changes &&
+                      typeof ui.changes.init === "function"
+                    )
+                      ui.changes.init();
+                  })
+                  .catch(() => {});
                 if (typeof onSaved === "function") onSaved();
               },
             },
@@ -1074,144 +2058,759 @@ function showOutboundGroupModal(existingId, onSaved) {
 }
 
 function createOutboundGroupsAndProberPanel(sectionRef) {
-  const wrapper = E("div", {});
+  const wrapper = E("div", { class: "tachyon-studio-aux-stack" });
 
   // Layer 2: Outbound Server Groups panel
-  const groupsTableBody = E("tbody", {});
+  const groupsListWrap = E("div", { class: "tachyon-studio-groups-grid" });
+  let cachedPoolServers = [];
+  const expandedGroupIds = new Set();
+  let draggedGroupId = null;
+
+  const refreshPoolAndRender = () => {
+    loadGlobalPoolChoices()
+      .then((pool) => {
+        cachedPoolServers = (pool && pool.servers) || [];
+        renderGroupsRows();
+      })
+      .catch(() => {
+        renderGroupsRows();
+      });
+  };
+
+  function moveGroup(fromId, toId) {
+    if (!fromId || !toId || fromId === toId) return;
+    uci.move(UCI_PACKAGE, fromId, toId);
+    renderGroupsRows();
+    Promise.resolve(uci.save())
+      .then(() => {
+        if (ui && ui.changes && typeof ui.changes.init === "function")
+          ui.changes.init();
+      })
+      .catch(() => {});
+  }
 
   function renderGroupsRows() {
-    groupsTableBody.innerHTML = "";
+    groupsListWrap.innerHTML = "";
     const groups = uci.sections(UCI_PACKAGE, "outbound_group") || [];
     if (!groups.length) {
-      groupsTableBody.appendChild(
-        E("tr", { class: "tr cbi-section-table-descr" }, [
-          E(
-            "td",
-            { class: "td", colspan: "3" },
+      groupsListWrap.appendChild(
+        E(
+          "div",
+          { class: "tachyon-studio-empty tachyon-studio-empty--compact" },
+          [
             E(
-              "em",
-              {},
+              "div",
+              { class: "tachyon-studio-empty__sub" },
               _(
                 "No Outbound Groups defined yet. Create reusable filtered groups (by prefix, country flag, regex, protocol) to use in Sections and Priority Balancers.",
               ),
             ),
-          ),
-        ]),
+          ],
+        ),
       );
       return;
     }
 
-    groups.forEach((g) => {
+    groups.forEach((g, idx) => {
       const gid = g[".name"];
-      groupsTableBody.appendChild(
-        E("tr", { class: "tr" }, [
-          E("td", { class: "td" }, E("strong", {}, g.name || g.label || gid)),
-          E("td", { class: "td" }, summarizeOutboundGroup(g)),
+      const isExpanded = expandedGroupIds.has(gid);
+      const matchedServers = filterPoolServersForGroup(cachedPoolServers, g);
+      const usedSections = (uci.sections(UCI_PACKAGE, "section") || [])
+        .filter(
+          (s) => s[".name"] && asArray(s.outbound_group_refs).includes(gid),
+        )
+        .map((s) => ({
+          id: s[".name"],
+          name: s.label || s.name || s[".name"],
+        }));
+      const usedBalancers = (uci.sections(UCI_PACKAGE, "balancer") || [])
+        .filter(
+          (b) =>
+            b[".name"] &&
+            (asArray(b.group_refs).includes(gid) ||
+              asArray(b.outbound_group_levels).includes(gid)),
+        )
+        .map((b) => ({
+          id: b[".name"],
+          name: b.name || b.label || b[".name"],
+        }));
+
+      const sectionChips = [];
+      usedSections.forEach((u) => {
+        sectionChips.push(
           E(
-            "td",
+            "span",
             {
-              class: "td cbi-section-table-cell",
-              style: "white-space: nowrap;",
+              class: "tachyon-studio-chip tachyon-studio-chip--section",
+              title: `${_("Used in Section")}: ${u.name}`,
+            },
+            u.name,
+          ),
+        );
+      });
+      usedBalancers.forEach((b) => {
+        sectionChips.push(
+          E(
+            "span",
+            {
+              class: "tachyon-studio-chip tachyon-studio-chip--balancer",
+              title: `${_("Used in Balancer")}: ${b.name}`,
+            },
+            [
+              typeof main !== "undefined" &&
+              typeof main.renderScaleIcon === "function"
+                ? main.renderScaleIcon(11)
+                : null,
+              E("span", {}, b.name),
+            ].filter(Boolean),
+          ),
+        );
+      });
+      if (!sectionChips.length) {
+        sectionChips.push(
+          E(
+            "span",
+            { class: "tachyon-studio-chip tachyon-studio-chip--muted" },
+            _("Not used"),
+          ),
+        );
+      }
+
+      const copyServerLinkToClipboard = (rawLink, btnEl) => {
+        const text = String(rawLink || "").trim();
+        if (!text) return;
+        const markDone = () => {
+          const orig = btnEl.innerHTML;
+          btnEl.textContent = `✓ ${_("Copied")}`;
+          setTimeout(() => {
+            btnEl.innerHTML = orig;
+          }, 1400);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard
+            .writeText(text)
+            .then(markDone)
+            .catch(() => {});
+          return;
+        }
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          markDone();
+        } catch (_e) {
+          // ignore
+        }
+      };
+
+      let groupExpanded = isExpanded;
+      const expandedInspectorStyle =
+        "display: flex; flex-direction: column; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(148, 163, 184, 0.16);";
+      let card = null;
+      const toggleGroupExpanded = () => {
+        const prevTop =
+          card && typeof card.getBoundingClientRect === "function"
+            ? card.getBoundingClientRect().top
+            : null;
+        groupExpanded = !groupExpanded;
+        if (groupExpanded) expandedGroupIds.add(gid);
+        else expandedGroupIds.delete(gid);
+        if (card) card.classList.toggle("is-expanded", groupExpanded);
+        inspectorEl.setAttribute(
+          "style",
+          groupExpanded ? expandedInspectorStyle : "display: none;",
+        );
+        chevronBtn.textContent = groupExpanded ? "▴" : "▾";
+        if (
+          prevTop !== null &&
+          card &&
+          typeof card.getBoundingClientRect === "function"
+        ) {
+          const restoreAnchor = () => {
+            if (!card) return;
+            const nextTop = card.getBoundingClientRect().top;
+            const delta = nextTop - prevTop;
+            if (Math.abs(delta) > 1) {
+              const mainContent = document.getElementById("maincontent");
+              if (
+                mainContent &&
+                mainContent.scrollHeight > mainContent.clientHeight
+              ) {
+                mainContent.scrollTop += delta;
+              }
+              if (
+                typeof window !== "undefined" &&
+                typeof window.scrollBy === "function"
+              ) {
+                window.scrollBy(0, delta);
+              }
+            }
+          };
+          restoreAnchor();
+          if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(restoreAnchor);
+          }
+        }
+      };
+
+      const chevronBtn = E(
+        "button",
+        {
+          type: "button",
+          class: "tachyon-studio-action-btn",
+          title: _("Show matching servers"),
+          style: "padding: 4px 8px; font-size: 12px;",
+          click: (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            toggleGroupExpanded();
+          },
+        },
+        groupExpanded ? "▴" : "▾",
+      );
+
+      const inspectorEl = E(
+        "div",
+        {
+          class: "tachyon-studio-source-inspector",
+          style: groupExpanded ? expandedInspectorStyle : "display: none;",
+          click: (ev) => ev.stopPropagation(),
+        },
+        [
+          E(
+            "div",
+            {
+              style:
+                "display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;",
             },
             [
               E(
-                "button",
-                {
-                  type: "button",
-                  class: "btn cbi-button cbi-button-edit",
-                  style: "margin-right: 6px;",
-                  click: () =>
-                    showOutboundGroupModal(gid, () => {
-                      renderGroupsRows();
-                      refreshProberGroupOptions();
-                    }),
-                },
-                _("Edit"),
+                "span",
+                { style: "font-size: 12px; font-weight: 600; opacity: 0.85;" },
+                `${_("Matching servers in pool")} (${matchedServers.length}):`,
               ),
               E(
-                "button",
-                {
-                  type: "button",
-                  class: "btn cbi-button cbi-button-remove",
-                  click: () => {
-                    updateSectionsRef("outbound_group_refs", gid, []);
-                    updateBalancersRef("group_refs", gid, []);
-                    (uci.sections(UCI_PACKAGE, "balancer") || []).forEach(
-                      (b) => {
-                        const bid = b[".name"];
-                        if (!bid) return;
-                        const cur = asArray(b.outbound_group_levels);
-                        if (cur.includes(gid)) {
-                          const next = cur.filter((id) => id !== gid);
-                          if (next.length)
-                            uci.set(
-                              UCI_PACKAGE,
-                              bid,
-                              "outbound_group_levels",
-                              next,
-                            );
-                          else
-                            uci.unset(
-                              UCI_PACKAGE,
-                              bid,
-                              "outbound_group_levels",
-                            );
-                        }
-                      },
-                    );
-                    uci.remove(UCI_PACKAGE, gid);
-                    renderGroupsRows();
-                    refreshProberGroupOptions();
-                  },
-                },
-                _("Delete"),
+                "span",
+                { style: "font-size: 11px; opacity: 0.7;" },
+                summarizeOutboundGroup(g),
               ),
             ],
           ),
-        ]),
+          matchedServers.length > 0
+            ? (() => {
+                let sortCol = "idx";
+                let sortDir = "asc";
+                const tbody = E("tbody", {});
+                const thIndicators = new Map();
+                const indexedItems = matchedServers.map((srv, sIdx) => {
+                  const pUp = String(srv.proto || "").toUpperCase();
+                  const tUp = String(srv.trans || "").toUpperCase();
+                  const badge =
+                    pUp && tUp && pUp !== tUp
+                      ? `${pUp} • ${tUp}`
+                      : pUp || tUp || "PROXY";
+                  return {
+                    srv,
+                    origIdx: sIdx,
+                    name: String(srv.value || srv.label || ""),
+                    badge,
+                  };
+                });
+
+                const populateRows = () => {
+                  thIndicators.forEach((ind, col) => {
+                    ind.textContent =
+                      sortCol === col ? (sortDir === "asc" ? " ▲" : " ▼") : "";
+                  });
+                  const sorted = [...indexedItems].sort((a, b) => {
+                    let cmp = 0;
+                    if (sortCol === "idx") cmp = a.origIdx - b.origIdx;
+                    else if (sortCol === "name")
+                      cmp = a.name.localeCompare(b.name, "ru");
+                    else if (sortCol === "proto")
+                      cmp = a.badge.localeCompare(b.badge, "ru");
+                    return sortDir === "asc" ? cmp : -cmp;
+                  });
+                  tbody.replaceChildren(
+                    ...sorted.map(({ srv, origIdx, badge }) => {
+                      let resolvedLink = String(srv.link || "").trim();
+                      if (!resolvedLink) {
+                        try {
+                          const storeMod = globalThis.tachyonStore || null;
+                          const sectionsObj =
+                            storeMod && typeof storeMod.get === "function"
+                              ? storeMod.get()?.connectionsWidget?.data
+                                  ?.sections || {}
+                              : {};
+                          const srvName = String(
+                            srv.value || srv.label || "",
+                          ).trim();
+                          for (const sec of Object.values(sectionsObj)) {
+                            const obs = Array.isArray(sec?.outbounds)
+                              ? sec.outbounds
+                              : [];
+                            for (const ob of obs) {
+                              const n = String(
+                                ob?.displayName || ob?.name || "",
+                              ).trim();
+                              if (
+                                (n === srvName ||
+                                  n.endsWith(`: ${srvName}`) ||
+                                  n.endsWith(` ${srvName}`)) &&
+                                ob?.link &&
+                                String(ob.link).includes("://")
+                              ) {
+                                resolvedLink = String(ob.link).trim();
+                                break;
+                              }
+                            }
+                            if (resolvedLink) break;
+                          }
+                        } catch (_e) {
+                          // ignore
+                        }
+                      }
+                      return E("tr", {}, [
+                        E(
+                          "td",
+                          { class: "tachyon-studio-server-table__idx" },
+                          String(origIdx + 1),
+                        ),
+                        E(
+                          "td",
+                          { class: "tachyon-studio-server-table__name" },
+                          srv.value || srv.label,
+                        ),
+                        E(
+                          "td",
+                          { class: "tachyon-studio-server-table__proto" },
+                          [
+                            E(
+                              "span",
+                              {
+                                class:
+                                  "tachyon-studio-badge tachyon-studio-badge--proto",
+                              },
+                              badge,
+                            ),
+                          ],
+                        ),
+                        E(
+                          "td",
+                          {
+                            class: "tachyon-studio-server-table__actions",
+                            style: "text-align:right;",
+                          },
+                          resolvedLink
+                            ? [
+                                E(
+                                  "button",
+                                  {
+                                    type: "button",
+                                    class:
+                                      "tachyon-studio-action-btn tachyon-studio-copy-link-btn",
+                                    title: _("Copy proxy link"),
+                                    click: (ev) => {
+                                      ev.preventDefault();
+                                      ev.stopPropagation();
+                                      copyServerLinkToClipboard(
+                                        resolvedLink,
+                                        ev.currentTarget,
+                                      );
+                                    },
+                                  },
+                                  [
+                                    typeof main !== "undefined" &&
+                                    typeof main.renderCopyIcon === "function"
+                                      ? main.renderCopyIcon(12)
+                                      : null,
+                                    E("span", {}, _("Copy link")),
+                                  ].filter(Boolean),
+                                ),
+                              ]
+                            : [E("span", { style: "opacity:0.45;" }, "—")],
+                        ),
+                      ]);
+                    }),
+                  );
+                };
+
+                const makeTh = (col, label) => {
+                  const ind = E("span", {
+                    style: "font-size: 10px; opacity: 0.75;",
+                  });
+                  thIndicators.set(col, ind);
+                  return E(
+                    "th",
+                    {
+                      style: "cursor: pointer; user-select: none;",
+                      click: (ev) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        if (sortCol === col) {
+                          sortDir = sortDir === "asc" ? "desc" : "asc";
+                        } else {
+                          sortCol = col;
+                          sortDir = "asc";
+                        }
+                        populateRows();
+                      },
+                    },
+                    [E("span", {}, label), ind],
+                  );
+                };
+
+                populateRows();
+                return E("div", { class: "tachyon-studio-server-table-wrap" }, [
+                  E("table", { class: "tachyon-studio-server-table" }, [
+                    E("thead", {}, [
+                      E("tr", {}, [
+                        makeTh("idx", "#"),
+                        makeTh("name", _("Server")),
+                        makeTh("proto", _("Protocol")),
+                        E(
+                          "th",
+                          { style: "text-align:right;" },
+                          _("Proxy Link"),
+                        ),
+                      ]),
+                    ]),
+                    tbody,
+                  ]),
+                ]);
+              })()
+            : E(
+                "div",
+                { style: "font-size: 12px; opacity: 0.68;" },
+                _(
+                  "No servers in the cached pool currently match these group filters.",
+                ),
+              ),
+        ],
       );
+
+      const orderControls = E(
+        "div",
+        {
+          class: "tachyon-studio-order",
+          click: (ev) => ev.stopPropagation(),
+        },
+        [
+          E(
+            "span",
+            {
+              class: "tachyon-studio-order__grip",
+              title: _("Drag to reorder"),
+            },
+            "⋮⋮",
+          ),
+          E("span", { class: "tachyon-studio-order__idx" }, `#${idx + 1}`),
+          E("div", { class: "tachyon-studio-order__arrows" }, [
+            E(
+              "button",
+              {
+                type: "button",
+                class: "tachyon-studio-order__btn",
+                disabled: idx === 0 ? "disabled" : null,
+                title: _("Move up"),
+                click: (ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  if (idx > 0) moveGroup(gid, groups[idx - 1][".name"]);
+                },
+              },
+              "↑",
+            ),
+            E(
+              "button",
+              {
+                type: "button",
+                class: "tachyon-studio-order__btn",
+                disabled: idx === groups.length - 1 ? "disabled" : null,
+                title: _("Move down"),
+                click: (ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  if (idx < groups.length - 1)
+                    moveGroup(gid, groups[idx + 1][".name"]);
+                },
+              },
+              "↓",
+            ),
+          ]),
+        ],
+      );
+
+      card = E(
+        "div",
+        {
+          class: `tachyon-studio-card tachyon-studio-card--group is-enabled ${
+            groupExpanded ? "is-expanded" : ""
+          }`,
+          draggable: "true",
+          style: "cursor: pointer;",
+          click: () => {
+            toggleGroupExpanded();
+          },
+        },
+        [
+          E("div", { class: "tachyon-studio-card__head" }, [
+            E("div", { class: "tachyon-studio-card__identity" }, [
+              orderControls,
+              E(
+                "div",
+                {
+                  class:
+                    "tachyon-studio-card__icon tachyon-studio-card__icon--proxy",
+                },
+                [main.renderFolderIcon(20)],
+              ),
+              E("div", { class: "tachyon-studio-card__title-wrap" }, [
+                E("div", { class: "tachyon-studio-card__title-row" }, [
+                  E(
+                    "span",
+                    { class: "tachyon-studio-card__title" },
+                    g.name || g.label || gid,
+                  ),
+                  E(
+                    "span",
+                    {
+                      class: "tachyon-studio-badge tachyon-studio-badge--proto",
+                    },
+                    _("FILTER GROUP"),
+                  ),
+                  E(
+                    "span",
+                    {
+                      class:
+                        "tachyon-studio-badge tachyon-studio-badge--transport",
+                    },
+                    `${_("Servers")}: ${matchedServers.length}`,
+                  ),
+                ]),
+                E(
+                  "div",
+                  { class: "tachyon-studio-card__sid" },
+                  summarizeOutboundGroup(g),
+                ),
+                E(
+                  "div",
+                  {
+                    style:
+                      "display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 5px;",
+                  },
+                  [
+                    E(
+                      "span",
+                      {
+                        style:
+                          "font-size: 10px; font-weight: 600; letter-spacing: 0.04em; opacity: 0.65; margin-right: 2px;",
+                      },
+                      `${_("Used in sections")}:`,
+                    ),
+                    ...sectionChips,
+                  ],
+                ),
+              ]),
+            ]),
+            E(
+              "div",
+              {
+                class: "tachyon-studio-card__footer",
+                click: (ev) => ev.stopPropagation(),
+              },
+              [
+                E(
+                  "button",
+                  {
+                    type: "button",
+                    class: "tachyon-studio-action-btn",
+                    title: _("Clone"),
+                    click: (ev) => {
+                      ev.stopPropagation();
+                      const base = `${gid || "grp"}`.replace(
+                        /[^A-Za-z0-9_]/g,
+                        "_",
+                      );
+                      let newGid = `${base}_copy`;
+                      let idx = 1;
+                      while (uci.get(UCI_PACKAGE, newGid)) {
+                        idx += 1;
+                        newGid = `${base}_copy${idx}`;
+                      }
+                      if (!uci.add(UCI_PACKAGE, "outbound_group", newGid))
+                        return;
+                      Object.entries(grp || {}).forEach(([k, v]) => {
+                        if (k.startsWith(".")) return;
+                        if (v === undefined || v === null) return;
+                        uci.set(UCI_PACKAGE, newGid, k, v);
+                      });
+                      const baseName = grp.name || grp.label || gid;
+                      uci.set(
+                        UCI_PACKAGE,
+                        newGid,
+                        "name",
+                        `${baseName} (Copy)`,
+                      );
+                      renderGroupsRows();
+                      refreshProberGroupOptions();
+                      Promise.resolve(uci.save())
+                        .then(() => {
+                          if (
+                            ui &&
+                            ui.changes &&
+                            typeof ui.changes.init === "function"
+                          )
+                            ui.changes.init();
+                        })
+                        .catch(() => {});
+                    },
+                  },
+                  [
+                    typeof main.renderCopyIcon === "function"
+                      ? main.renderCopyIcon(13)
+                      : null,
+                    E("span", {}, _("Clone")),
+                  ].filter(Boolean),
+                ),
+                E(
+                  "button",
+                  {
+                    type: "button",
+                    class:
+                      "tachyon-studio-action-btn tachyon-studio-action-btn--primary",
+                    click: (ev) => {
+                      ev.stopPropagation();
+                      showOutboundGroupModal(gid, () => {
+                        refreshPoolAndRender();
+                        refreshProberGroupOptions();
+                      });
+                    },
+                  },
+                  [
+                    typeof main.renderSettingsIcon === "function"
+                      ? main.renderSettingsIcon(13)
+                      : null,
+                    E("span", {}, _("Edit")),
+                  ].filter(Boolean),
+                ),
+                E(
+                  "button",
+                  {
+                    type: "button",
+                    class:
+                      "tachyon-studio-action-btn tachyon-studio-action-btn--danger",
+                    title: _("Delete"),
+                    click: (ev) => {
+                      ev.stopPropagation();
+                      updateSectionsRef("outbound_group_refs", gid, []);
+                      updateBalancersRef("group_refs", gid, []);
+                      updateBalancersRef("outbound_group_levels", gid, []);
+                      uci.remove(UCI_PACKAGE, gid);
+                      renderGroupsRows();
+                      refreshProberGroupOptions();
+                      Promise.resolve(uci.save())
+                        .then(() => {
+                          if (
+                            ui &&
+                            ui.changes &&
+                            typeof ui.changes.init === "function"
+                          )
+                            ui.changes.init();
+                        })
+                        .catch(() => {});
+                    },
+                  },
+                  [main.renderTrashIcon(13)],
+                ),
+                chevronBtn,
+              ],
+            ),
+          ]),
+          inspectorEl,
+        ],
+      );
+
+      card.addEventListener("dragstart", (ev) => {
+        draggedGroupId = gid;
+        card.classList.add("is-dragging");
+        if (ev.dataTransfer) {
+          ev.dataTransfer.effectAllowed = "move";
+          ev.dataTransfer.setData("text/plain", gid);
+        }
+      });
+      card.addEventListener("dragend", () => {
+        draggedGroupId = null;
+        card.classList.remove("is-dragging");
+      });
+      card.addEventListener("dragover", (ev) => {
+        if (!draggedGroupId || draggedGroupId === gid) return;
+        ev.preventDefault();
+        card.classList.add("is-drop-target");
+      });
+      card.addEventListener("dragleave", () => {
+        card.classList.remove("is-drop-target");
+      });
+      card.addEventListener("drop", (ev) => {
+        ev.preventDefault();
+        card.classList.remove("is-drop-target");
+        if (draggedGroupId && draggedGroupId !== gid) {
+          moveGroup(draggedGroupId, gid);
+        }
+      });
+
+      groupsListWrap.appendChild(card);
     });
   }
 
   const groupsSection = E(
     "div",
-    { class: "cbi-section", style: "margin-top: 14px;" },
+    { class: "tachyon-studio-deck tachyon-studio-deck--outbound-groups" },
     [
-      E("h3", {}, _("Layer 2: Reusable Outbound Server Groups")),
-      E(
-        "div",
-        { class: "cbi-section-descr" },
-        _(
-          "Filter servers from the global pool by subscription prefix, country flag, regular expression, or protocol. Multiple include filters in a group act as an intersection (AND).",
-        ),
-      ),
-      E("div", { class: "cbi-section-node" }, [
-        E("table", { class: "table cbi-section-table" }, [
-          E("thead", {}, [
-            E("tr", { class: "tr cbi-section-table-titles" }, [
-              E("th", { class: "th" }, _("Group Name")),
-              E("th", { class: "th" }, _("Intersection Filter Criteria (AND)")),
-              E("th", { class: "th" }, _("Actions")),
-            ]),
+      E("div", { class: "tachyon-studio-toolbar" }, [
+        E("div", { class: "tachyon-studio-toolbar__top" }, [
+          E("div", { class: "tachyon-studio-toolbar__titles" }, [
+            E(
+              "span",
+              { class: "tachyon-studio-toolbar__kicker" },
+              _("SERVER FILTERING • LAYER 2"),
+            ),
+            E(
+              "h3",
+              { class: "tachyon-studio-toolbar__title" },
+              _("Layer 2: Reusable Outbound Server Groups"),
+            ),
+            E(
+              "p",
+              { class: "tachyon-studio-toolbar__subtitle" },
+              _(
+                "Filter servers from the global pool by subscription prefix, country flag, regular expression, or protocol. Multiple include filters in a group act as an intersection (AND).",
+              ),
+            ),
           ]),
-          groupsTableBody,
-        ]),
-        E("div", { class: "cbi-section-create", style: "padding: 8px 0;" }, [
-          E(
-            "button",
-            {
-              type: "button",
-              class: "btn cbi-button cbi-button-add",
-              click: () =>
-                showOutboundGroupModal(null, () => {
-                  renderGroupsRows();
-                  refreshProberGroupOptions();
-                }),
-            },
-            _("Add Outbound Group"),
-          ),
+          E("div", { class: "tachyon-studio-toolbar__actions" }, [
+            E(
+              "button",
+              {
+                type: "button",
+                class: "tachyon-studio-btn tachyon-studio-btn--primary",
+                click: () =>
+                  showOutboundGroupModal(null, () => {
+                    refreshPoolAndRender();
+                    refreshProberGroupOptions();
+                  }),
+              },
+              `+ ${_("Add Outbound Group")}`,
+            ),
+          ]),
         ]),
       ]),
+      groupsListWrap,
     ],
   );
 
@@ -1241,7 +2840,6 @@ function createOutboundGroupsAndProberPanel(sectionRef) {
       const sid = src[".name"];
       if (!sid) return;
       const stypeRaw = String(src.source_type || "subscription").toLowerCase();
-      if (["zapret", "zapret2", "byedpi", "desync"].includes(stypeRaw)) return;
       const stype = stypeRaw.toUpperCase();
       groupSelect.appendChild(
         E(
@@ -1353,14 +2951,27 @@ function createOutboundGroupsAndProberPanel(sectionRef) {
                       "span",
                       {
                         style:
-                          "color: var(--success-color, #27ae60); font-weight: bold;",
+                          "color: var(--success-color, #27ae60); font-weight: 600; display: inline-flex; align-items: center; gap: 4px;",
                       },
-                      `✓ ${r.delay_ms} ms`,
+                      [
+                        typeof main.renderCheckIcon === "function"
+                          ? main.renderCheckIcon(12)
+                          : null,
+                        `${r.delay_ms} ms`,
+                      ].filter(Boolean),
                     )
                   : E(
                       "span",
-                      { style: "color: var(--error-color, #e74c3c);" },
-                      _("Unreachable"),
+                      {
+                        style:
+                          "color: var(--error-color, #e74c3c); display: inline-flex; align-items: center; gap: 4px;",
+                      },
+                      [
+                        typeof main.renderXIcon === "function"
+                          ? main.renderXIcon(12)
+                          : null,
+                        _("Unreachable"),
+                      ].filter(Boolean),
                     ),
               ),
             ]);
@@ -1396,33 +3007,37 @@ function createOutboundGroupsAndProberPanel(sectionRef) {
     _("Check URL Reachability"),
   );
 
-  const proberSection = E(
-    "div",
-    { class: "cbi-section", style: "margin-top: 14px;" },
-    [
-      E("h3", {}, _("Manual URL Reachability Tester")),
-      E(
-        "div",
-        { class: "cbi-section-descr" },
-        _(
-          "Test which servers in the pool or in a specific Outbound Group can reach a given URL right now.",
-        ),
-      ),
-      E("div", { class: "cbi-section-node", style: "padding: 10px;" }, [
+  const proberSection = E("div", { class: "tachyon-studio-panel" }, [
+    E("div", { class: "tachyon-studio-panel__header" }, [
+      E("div", { class: "tachyon-studio-panel__titles" }, [
         E(
-          "div",
-          {
-            style:
-              "display: flex; flex-wrap: wrap; gap: 8px; align-items: center;",
-          },
-          [urlInput, groupSelect, probeBtn],
+          "span",
+          { class: "tachyon-studio-toolbar__kicker" },
+          _("LIVE CONNECTIVITY PROBER"),
         ),
-        probeResults,
+        E(
+          "h3",
+          { class: "tachyon-studio-panel__title" },
+          _("Manual URL Reachability Tester"),
+        ),
+        E(
+          "p",
+          { class: "tachyon-studio-panel__subtitle" },
+          _(
+            "Test which servers in the pool or in a specific Outbound Group can reach a given URL right now.",
+          ),
+        ),
       ]),
-    ],
-  );
+    ]),
+    E("div", { class: "tachyon-studio-panel__controls" }, [
+      urlInput,
+      groupSelect,
+      probeBtn,
+    ]),
+    probeResults,
+  ]);
 
-  renderGroupsRows();
+  refreshPoolAndRender();
   refreshProberGroupOptions();
 
   wrapper.appendChild(groupsSection);
@@ -1430,16 +3045,53 @@ function createOutboundGroupsAndProberPanel(sectionRef) {
   return wrapper;
 }
 
+function isProxyShareLinkUri(str) {
+  return /^(?:vless|vmess|trojan|ss|ssr|hysteria2|hy2|hysteria|tuic|anytls|naive\+(?:https|quic|h2|h3)|mieru|mierus|snell|trusttunnel|shadowtls|masque|tewfai|csqtt|wdtt|qwdtt|warp|wg|awg|wireguard|socks5?h?):\/\//i.test(
+    String(str || "").trim(),
+  );
+}
+
 function configureOutboundsSection(sectionRef) {
   const origAdd = sectionRef.handleAdd;
   sectionRef.handleAdd = function (ev, name) {
+    const rawArg = String(name || "").trim();
     const res = origAdd.apply(this, arguments);
     const sources = uci.sections(UCI_PACKAGE, "outbound_source") || [];
     const last = sources[sources.length - 1];
     if (last && last[".name"]) {
       const sid = last[".name"];
+      if (!last.enabled) {
+        uci.set(UCI_PACKAGE, sid, "enabled", "1");
+      }
       if (!last.name) {
-        uci.set(UCI_PACKAGE, sid, "name", sid);
+        uci.set(UCI_PACKAGE, sid, "name", rawArg || sid);
+      }
+      const nm = String(
+        rawArg || last.name || uci.get(UCI_PACKAGE, sid, "name") || "",
+      ).trim();
+      const st = String(
+        last.source_type ||
+          uci.get(UCI_PACKAGE, sid, "source_type") ||
+          "subscription",
+      ).toLowerCase();
+      if (isProxyShareLinkUri(nm)) {
+        let friendlyName = nm;
+        const hashIdx = nm.indexOf("#");
+        if (hashIdx >= 0 && hashIdx + 1 < nm.length) {
+          try {
+            const decoded = decodeURIComponent(nm.slice(hashIdx + 1)).trim();
+            if (decoded) friendlyName = decoded;
+          } catch (_e) {}
+        }
+        uci.set(UCI_PACKAGE, sid, "source_type", "proxy_links");
+        uci.set(UCI_PACKAGE, sid, "proxy_links", [nm]);
+        uci.set(UCI_PACKAGE, sid, "name", friendlyName);
+      } else if (
+        st === "subscription" &&
+        !last.url &&
+        /^https?:\/\//i.test(nm)
+      ) {
+        uci.set(UCI_PACKAGE, sid, "url", nm);
       }
     }
     return res;
@@ -1456,14 +3108,32 @@ function configureOutboundsSection(sectionRef) {
     (uci.sections(UCI_PACKAGE, "section") || []).forEach((s) => {
       const sid = s[".name"];
       if (!sid) return;
+      const safeSid = String(sid).replace(/[^A-Za-z0-9_]/g, "_");
       const cur = asArray(s.outbound_source_refs);
       const hasRef = cur.includes(sectionId);
       const isLegacyChild =
         sectionId === `src_${sid}_links` ||
+        sectionId === `src_links_${sid}` ||
+        sectionId === `src_${safeSid}_links` ||
+        sectionId === `src_links_${safeSid}` ||
         sectionId === `src_${sid}_awg` ||
+        sectionId === `src_awg_${sid}` ||
+        sectionId === `src_amnezia_${sid}` ||
+        sectionId === `src_${safeSid}_awg` ||
+        sectionId === `src_awg_${safeSid}` ||
+        sectionId === `src_amnezia_${safeSid}` ||
         sectionId === `src_${sid}_fptn` ||
+        sectionId === `src_fptn_${sid}` ||
+        sectionId === `src_${safeSid}_fptn` ||
+        sectionId === `src_fptn_${safeSid}` ||
         sectionId === `src_${sid}_json` ||
-        sectionId === `src_${sid}_desync`;
+        sectionId === `src_json_${sid}` ||
+        sectionId === `src_${safeSid}_json` ||
+        sectionId === `src_json_${safeSid}` ||
+        sectionId === `src_${sid}_desync` ||
+        sectionId === `src_desync_${sid}` ||
+        sectionId === `src_${safeSid}_desync` ||
+        sectionId === `src_desync_${safeSid}`;
       if (hasRef) {
         const next = cur.filter((id) => id !== sectionId);
         if (next.length)
@@ -1471,16 +3141,29 @@ function configureOutboundsSection(sectionRef) {
         else uci.unset(UCI_PACKAGE, sid, "outbound_source_refs");
       }
       if (hasRef || isLegacyChild) {
-        if (srcType === "links") {
+        try {
+          if (
+            typeof fs !== "undefined" &&
+            fs &&
+            typeof fs.remove === "function"
+          ) {
+            fs.remove(`/var/run/tachyon/section-cache/${sid}.json`).catch(
+              () => null,
+            );
+          }
+        } catch (_e) {}
+        if (srcType === "links" || srcType === "proxy_links") {
           uci.unset(UCI_PACKAGE, sid, "selector_proxy_links");
           uci.unset(UCI_PACKAGE, sid, "selector_proxy_links_text");
-        } else if (srcType === "awg") {
+          uci.unset(UCI_PACKAGE, sid, "proxy_links");
+          uci.unset(UCI_PACKAGE, sid, "proxy_links_text");
+        } else if (srcType === "awg" || srcType === "amnezia_config") {
           uci.unset(UCI_PACKAGE, sid, "selector_amnezia_configs");
           uci.unset(UCI_PACKAGE, sid, "amnezia_configs");
           uci.unset(UCI_PACKAGE, sid, "amnezia_conf_text");
         } else if (srcType === "fptn") {
           uci.unset(UCI_PACKAGE, sid, "access_token");
-        } else if (srcType === "json") {
+        } else if (srcType === "json" || srcType === "outbound_json") {
           uci.unset(UCI_PACKAGE, sid, "outbound_jsons");
           uci.unset(UCI_PACKAGE, sid, "outbound_json");
         }
@@ -1488,6 +3171,7 @@ function configureOutboundsSection(sectionRef) {
     });
 
     updateBalancersRef("source_refs", sectionId, []);
+    updateBalancersRef("outbound_group_levels", sectionId, []);
     updateGroupsRef("source_refs", sectionId, []);
     updateGroupsRef("outbound_sources", sectionId, []);
 
@@ -1498,6 +3182,35 @@ function configureOutboundsSection(sectionRef) {
           (sub.url === srcUrl || `src_${sub[".name"]}` === sectionId)
         ) {
           uci.remove(UCI_PACKAGE, sub[".name"]);
+        }
+      });
+      (uci.sections(UCI_PACKAGE, "section") || []).forEach((sec) => {
+        const sid = sec[".name"];
+        if (!sid) return;
+        const rawUrls = uci.get(UCI_PACKAGE, sid, "subscription_urls");
+        const urls = Array.isArray(rawUrls)
+          ? rawUrls
+          : rawUrls
+            ? String(rawUrls).split(/\s+/).filter(Boolean)
+            : [];
+        if (urls.includes(srcUrl)) {
+          const nextUrls = urls.filter((u) => u !== srcUrl);
+          if (nextUrls.length > 0) {
+            uci.set(UCI_PACKAGE, sid, "subscription_urls", nextUrls);
+          } else {
+            uci.unset(UCI_PACKAGE, sid, "subscription_urls");
+          }
+          try {
+            if (
+              typeof fs !== "undefined" &&
+              fs &&
+              typeof fs.remove === "function"
+            ) {
+              fs.remove(`/var/run/tachyon/section-cache/${sid}.json`).catch(
+                () => null,
+              );
+            }
+          } catch (_e) {}
         }
       });
     }
@@ -1596,22 +3309,37 @@ function parseAwgConfigText(text) {
 }
 
 const PREFIX_COLOR_PRESETS = [
-  { label: "Default", bg: "", color: "" },
-  { label: "Blue", bg: "#dbeafe", color: "#1e40af" },
-  { label: "Green", bg: "#dcfce7", color: "#166534" },
-  { label: "Amber", bg: "#fef3c7", color: "#92400e" },
-  { label: "Red", bg: "#fee2e2", color: "#991b1b" },
-  { label: "Purple", bg: "#f3e8ff", color: "#6b21a8" },
-  { label: "Cyan", bg: "#cffafe", color: "#155e75" },
-  { label: "Pink", bg: "#fce7f3", color: "#9d174d" },
-  { label: "Dark", bg: "#1e293b", color: "#f8fafc" },
+  { label: _("Default"), bg: "", color: "" },
+  { label: _("Blue"), bg: "#dbeafe", color: "#1e40af" },
+  { label: _("Green"), bg: "#dcfce7", color: "#166534" },
+  { label: _("Amber"), bg: "#fef3c7", color: "#92400e" },
+  { label: _("Red"), bg: "#fee2e2", color: "#991b1b" },
+  { label: _("Purple"), bg: "#f3e8ff", color: "#6b21a8" },
+  { label: _("Cyan"), bg: "#cffafe", color: "#155e75" },
+  { label: _("Pink"), bg: "#fce7f3", color: "#9d174d" },
+  { label: _("Dark"), bg: "#1e293b", color: "#f8fafc" },
 ];
 
-const WDTT_DEFAULT_NFQWS2_OPT =
-  "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5 --lua-desync=multisplit:pos=1,midsld --new --filter-udp=443 --filter-l7=quic --payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6";
-
-const OLCRTC_DEFAULT_NFQWS2_OPT =
-  "--filter-udp=50000-65535 --filter-l7=stun,discord --lua-desync=fake:repeats=6 --new --filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5 --lua-desync=multidisorder:pos=1,midsld";
+function getOutboundOptionSourceType(optionInstance, sectionId) {
+  let raw = "";
+  try {
+    if (
+      optionInstance &&
+      optionInstance.section &&
+      typeof optionInstance.section.formvalue === "function"
+    ) {
+      raw = String(
+        optionInstance.section.formvalue(sectionId, "source_type") || "",
+      );
+    }
+  } catch {
+    // Fallback to UCI value when formvalue is unavailable
+  }
+  if (!raw) {
+    raw = String(uci.get(UCI_PACKAGE, sectionId, "source_type") || "");
+  }
+  return raw.trim().toLowerCase();
+}
 
 function setModalFieldValue(sectionRef, sectionId, optName, value) {
   uci.set(UCI_PACKAGE, sectionId, optName, value);
@@ -1675,6 +3403,114 @@ function setModalFieldValue(sectionRef, sectionId, optName, value) {
   } catch (_e) {}
 }
 
+let outboundScannerEnginesPromise = null;
+function resolveOutboundScannerEngines() {
+  const sysInfo =
+    main.store && typeof main.store.get === "function"
+      ? main.store.get().diagnosticsSystemInfo
+      : null;
+  if (sysInfo && (sysInfo.providerInfoLoaded || sysInfo.loaded)) {
+    return Promise.resolve({
+      desync: true,
+    });
+  }
+  if (
+    !outboundScannerEnginesPromise &&
+    main.TachyonShellMethods &&
+    typeof main.TachyonShellMethods.getFuzzerStrategies === "function"
+  ) {
+    outboundScannerEnginesPromise =
+      main.TachyonShellMethods.getFuzzerStrategies()
+        .then((res) => {
+          const av = res && res.success ? res.data?.available_engines : null;
+          return {
+            desync: Boolean(av?.desync),
+          };
+        })
+        .catch(() => ({
+          desync: false,
+        }));
+  }
+  return (
+    outboundScannerEnginesPromise ||
+    Promise.resolve({
+      desync: false,
+    })
+  );
+}
+
+function attachOutboundStrategyScannerButton(
+  sectionRef,
+  option,
+  engineKey,
+  _optName,
+) {
+  const origRender = option.renderWidget;
+  option.renderWidget = function (sectionId, optionIndex, cfgvalue) {
+    const node = origRender.call(this, sectionId, optionIndex, cfgvalue);
+    if (!node || typeof main.renderStrategyFuzzerModal !== "function") {
+      return node;
+    }
+
+    const scanBtn = E(
+      "button",
+      {
+        type: "button",
+        class: "btn cbi-button cbi-button-action",
+        style: "margin-top: 6px; display: none; align-items: center; gap: 6px;",
+      },
+      _("Scan Strategies"),
+    );
+
+    const updateBtnVisibility = (av) => {
+      if (!av || !av[engineKey]) {
+        scanBtn.style.display = "none";
+        return;
+      }
+      scanBtn.style.display = "inline-flex";
+    };
+
+    resolveOutboundScannerEngines()
+      .then((av) => {
+        updateBtnVisibility(av);
+      })
+      .catch(() => {});
+
+    scanBtn.addEventListener("click", () => {
+      resolveOutboundScannerEngines().then((availableEngines) => {
+        if (!availableEngines[engineKey]) return;
+        main.renderStrategyFuzzerModal([], {
+          initialEngine: engineKey,
+          initialRuleSection: sectionId,
+          availableEngines,
+          nestedModal: true,
+          onApplyStrategy: (_eng, args) => {
+            setModalFieldValue(
+              sectionRef,
+              sectionId,
+              "desync_preset",
+              "custom",
+            );
+            setModalFieldValue(sectionRef, sectionId, "desync_opts", args);
+          },
+        });
+      });
+    });
+
+    const btnWrap = E("div", { style: "margin-top: 4px;" }, [scanBtn]);
+    if (
+      node.nodeName === "INPUT" ||
+      node.nodeName === "TEXTAREA" ||
+      node.nodeName === "SELECT" ||
+      typeof node.appendChild !== "function"
+    ) {
+      return E("div", {}, [node, btnWrap]);
+    }
+    node.appendChild(btnWrap);
+    return node;
+  };
+}
+
 function createOutboundsContent(section) {
   section.tab("general", _("Source Settings"));
   section.tab("advanced", _("Advanced & Subscription Options"));
@@ -1687,6 +3523,20 @@ function createOutboundsContent(section) {
 
   o = section.taboption(
     "general",
+    form.Flag,
+    "hidden",
+    _("Hide on Dashboard"),
+    _(
+      "Hide this subscription or server on the Dashboard while keeping it active in routing",
+    ),
+  );
+  o.default = "0";
+  o.rmempty = false;
+  o.editable = true;
+  o.width = "6rem";
+
+  o = section.taboption(
+    "general",
     form.Value,
     "name",
     _("Connection Name"),
@@ -1694,7 +3544,7 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.rmempty = false;
-  o.placeholder = _("e.g. Main Subscription, YouTube Zapret2, EU AWG");
+  o.placeholder = _("e.g. Main Subscription, YouTube Desync, EU AWG");
 
   o = section.taboption(
     "general",
@@ -1727,16 +3577,98 @@ function createOutboundsContent(section) {
   o.value("shadowtls", "ShadowTLS v3");
   o.value("trusttunnel", "TrustTunnel");
   o.value("tewfai", "TewFai");
-  o.value("zapret2", _("Zapret2 (nfqws2 DPI Desync)"));
-  o.value("zapret", _("Zapret (nfqws DPI Desync)"));
-  o.value("byedpi", _("ByeDPI (ciadpi SOCKS5 Desync)"));
-  o.value("desync", _("Desync (Built-in TCP/UDP DPI Fragmentation)"));
-  o.value("wdtt", _("WDTT (nfqws2 Preset)"));
-  o.value("olcrtc", _("OlcRTC (Discord / WebRTC nfqws2)"));
+  o.value("csqtt", "CSQTT / WDTT v3");
+  o.value("desync", _("Desync (Built-in TCP/UDP Fragmentation)"));
+  o.value("wdtt", _("WDTT (tachyon-core native)"));
   o.value("tor", _("Tor Network (SOCKS5)"));
   o.value("tailscale", _("Tailscale Mesh VPN"));
   o.value("interface", _("Network Interface (WireGuard / OpenVPN / TUN)"));
-  o.value("outbound_json", _("Sing-box Outbound JSON"));
+  o.value("outbound_json", _("Tachyon Core Outbound JSON"));
+  o.write = function (sectionId, value) {
+    const st = String(value || "subscription")
+      .trim()
+      .toLowerCase();
+    uci.set(UCI_PACKAGE, sectionId, "source_type", st);
+    if (st !== "subscription") {
+      uci.unset(UCI_PACKAGE, sectionId, "url");
+    }
+    if (st !== "proxy_links" && st !== "links") {
+      uci.unset(UCI_PACKAGE, sectionId, "proxy_links");
+      uci.unset(UCI_PACKAGE, sectionId, "proxy_links_text");
+      uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links");
+      uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links_text");
+    }
+    if (st !== "amnezia_config" && st !== "awg") {
+      uci.unset(UCI_PACKAGE, sectionId, "amnezia_configs");
+      uci.unset(UCI_PACKAGE, sectionId, "selector_amnezia_configs");
+      uci.unset(UCI_PACKAGE, sectionId, "amnezia_conf_text");
+    }
+    if (st !== "outbound_json" && st !== "json") {
+      uci.unset(UCI_PACKAGE, sectionId, "outbound_jsons");
+      uci.unset(UCI_PACKAGE, sectionId, "outbound_json");
+    }
+    if (st !== "fptn") {
+      uci.unset(UCI_PACKAGE, sectionId, "access_token");
+    }
+    if (st !== "tailscale") {
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_mode");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_auth_key");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_control_url");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_hostname");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_accept_routes");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_accept_dns");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_exit_node");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_exit_node_allow_lan_access");
+      uci.unset(UCI_PACKAGE, sectionId, "tailscale_ephemeral");
+    }
+    if (st !== "interface") {
+      uci.unset(UCI_PACKAGE, sectionId, "interface_name");
+      uci.unset(UCI_PACKAGE, sectionId, "interface");
+    }
+    if (st !== "csqtt") {
+      [
+        "csqtt_server",
+        "csqtt_server_port",
+        "csqtt_port",
+        "csqtt_password",
+        "csqtt_mode",
+        "csqtt_obfs",
+        "csqtt_raw_port",
+        "csqtt_wg_port",
+        "csqtt_local_port",
+        "csqtt_hashes",
+        "csqtt_workers",
+        "csqtt_turn_transport",
+        "csqtt_turn_server",
+        "csqtt_turn_urls",
+        "csqtt_turn_username",
+        "csqtt_turn_password",
+        "csqtt_vk_auth_mode",
+        "csqtt_vk_cookie",
+        "csqtt_vk_client_ids",
+        "csqtt_mtu",
+        "csqtt_device_id",
+        "csqtt_chunk1",
+        "csqtt_wg_private_key",
+        "csqtt_wg_peer_public_key",
+        "csqtt_wg_address",
+        "csqtt_uri",
+      ].forEach((k) => uci.unset(UCI_PACKAGE, sectionId, k));
+    }
+    if (st !== "wdtt") {
+      [
+        "wdtt_native",
+        "peer",
+        "qwdtt_mode",
+        "wdtt_workers",
+        "wdtt_mtu",
+        "warp_flow_device_id",
+      ].forEach((k) => uci.unset(UCI_PACKAGE, sectionId, k));
+      if (st !== "csqtt") {
+        uci.unset(UCI_PACKAGE, sectionId, "warp_flow_uri");
+      }
+    }
+  };
 
   o = section.taboption(
     "general",
@@ -1792,6 +3724,7 @@ function createOutboundsContent(section) {
   };
   o.write = function (sectionId, value) {
     const want = new Set(asArray(value));
+    const srcUrl = String(uci.get(UCI_PACKAGE, sectionId, "url") || "").trim();
     (uci.sections(UCI_PACKAGE, "section") || []).forEach((s) => {
       const sid = s[".name"];
       if (!sid) return;
@@ -1804,6 +3737,74 @@ function createOutboundsContent(section) {
         if (next.length)
           uci.set(UCI_PACKAGE, sid, "outbound_source_refs", next);
         else uci.unset(UCI_PACKAGE, sid, "outbound_source_refs");
+        if (srcUrl) {
+          (uci.sections(UCI_PACKAGE, "subscription_url") || []).forEach(
+            (sub) => {
+              const subId = sub ? sub[".name"] : null;
+              if (
+                subId &&
+                String(sub.section || "").trim() === sid &&
+                String(sub.url || "").trim() === srcUrl
+              ) {
+                uci.remove(UCI_PACKAGE, subId);
+              }
+            },
+          );
+        }
+      }
+    });
+  };
+  o.remove = function (sectionId) {
+    this.write(sectionId, []);
+  };
+
+  o = section.taboption(
+    "general",
+    form.DynamicList,
+    "_target_groups",
+    _("Used in Outbound Groups"),
+    _(
+      "Optional: select which Reusable Outbound Server Groups include this connection source in their pool.",
+    ),
+  );
+  o.modalonly = true;
+  o.load = function (sectionId) {
+    this.keylist = [];
+    this.vallist = [];
+    const used = [];
+    (uci.sections(UCI_PACKAGE, "outbound_group") || []).forEach((g) => {
+      const gid = g[".name"];
+      if (!gid) return;
+      this.value(gid, g.name || g.label || gid);
+      if (asArray(g.source_refs).includes(sectionId)) {
+        used.push(gid);
+      }
+    });
+    return used;
+  };
+  o.cfgvalue = function (sectionId) {
+    const used = [];
+    (uci.sections(UCI_PACKAGE, "outbound_group") || []).forEach((g) => {
+      const gid = g[".name"];
+      if (gid && asArray(g.source_refs).includes(sectionId)) {
+        used.push(gid);
+      }
+    });
+    return used;
+  };
+  o.write = function (sectionId, value) {
+    const want = new Set(asArray(value));
+    (uci.sections(UCI_PACKAGE, "outbound_group") || []).forEach((g) => {
+      const gid = g[".name"];
+      if (!gid) return;
+      const cur = asArray(g.source_refs);
+      const has = cur.includes(sectionId);
+      if (want.has(gid) && !has) {
+        uci.set(UCI_PACKAGE, gid, "source_refs", [...cur, sectionId]);
+      } else if (!want.has(gid) && has) {
+        const next = cur.filter((id) => id !== sectionId);
+        if (next.length) uci.set(UCI_PACKAGE, gid, "source_refs", next);
+        else uci.unset(UCI_PACKAGE, gid, "source_refs");
       }
     });
   };
@@ -1834,6 +3835,17 @@ function createOutboundsContent(section) {
   o.modalonly = true;
   o.placeholder = "https://example.com/sub";
   o.depends("source_type", "subscription");
+  o.cfgvalue = function (section_id) {
+    const val = uci.get("tachyon", section_id, "url");
+    if (val) return val;
+    const st = uci.get("tachyon", section_id, "source_type") || "subscription";
+    const nm = String(uci.get("tachyon", section_id, "name") || "").trim();
+    if (st === "subscription" && /^https?:\/\//i.test(nm)) {
+      uci.set("tachyon", section_id, "url", nm);
+      return nm;
+    }
+    return "";
+  };
 
   o = section.taboption(
     "general",
@@ -1936,7 +3948,128 @@ function createOutboundsContent(section) {
     return wrap;
   };
 
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "subscription_update_enabled",
+    _("Auto-update Subscription"),
+    _("Update this subscription automatically"),
+  );
+  o.modalonly = true;
+  o.default = "1";
+  o.depends("source_type", "subscription");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "subscription_update_interval",
+    _("Update Interval"),
+    _("Use duration format like 1d, 12h or 30m"),
+  );
+  o.modalonly = true;
+  o.default = "1h";
+  o.placeholder = "1h";
+  o.depends({
+    source_type: "subscription",
+    subscription_update_enabled: "1",
+  });
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "subscription_update_jitter",
+    _("Update Interval Randomization (Jitter)"),
+    _(
+      "Add a randomized offset to automatic subscription updates (e.g. 15%, 25%, or 15m) so updates do not fire at fixed clock intervals.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "";
+  o.placeholder = _("Disabled (Exact interval)");
+  o.value("", _("Disabled (Exact interval)"));
+  o.value("15%", _("±15% (Recommended — spreads auto-update load)"));
+  o.value("25%", _("±25% (Medium randomization)"));
+  o.value("40%", _("±40% (High randomization)"));
+  o.depends({
+    source_type: "subscription",
+    subscription_update_enabled: "1",
+  });
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "download_via_proxy_enabled",
+    _("Download Subscription via Proxy Section"),
+    _("Download subscriptions via the selected section"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("source_type", "subscription");
+
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "download_via_proxy_section",
+    _("Proxy Section for Download"),
+    _("Select a section for downloading this subscription"),
+  );
+  o.modalonly = true;
+  o.depends({
+    source_type: "subscription",
+    download_via_proxy_enabled: "1",
+  });
+  o.load = function (sectionId) {
+    this.keylist = [];
+    this.vallist = [];
+    (uci.sections(UCI_PACKAGE, "section") || []).forEach((s) => {
+      const sid = s[".name"];
+      if (sid) this.value(sid, s.label || s.name || sid);
+    });
+    return uci.get(UCI_PACKAGE, sectionId, "download_via_proxy_section");
+  };
+
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "subscription_engine",
+    _("Subscription Fetch & Parse Engine"),
+    _(
+      "Select the engine used to download and parse this subscription. Tachyon Core uses the native Rust binary (tachyon-core subscription) with adaptive User-Agent cascade and full Xray multi-hop config support.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "auto";
+  o.value("auto", _("Default (From Global Settings)"));
+  o.value("core", _("Tachyon Core Binary (tachyon-core subscription)"));
+  o.value("ucode", _("Built-in Script (curl + ucode)"));
+  o.depends("source_type", "subscription");
+
   // ── 2. Proxy Share Links ──────────────────────────────────────────────────
+  const getSourceProxyLinks = (sectionId) => {
+    const items = [
+      ...asArray(uci.get(UCI_PACKAGE, sectionId, "proxy_links")),
+      ...asArray(uci.get(UCI_PACKAGE, sectionId, "selector_proxy_links")),
+      ...String(uci.get(UCI_PACKAGE, sectionId, "proxy_links_text") || "")
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+      ...String(
+        uci.get(UCI_PACKAGE, sectionId, "selector_proxy_links_text") || "",
+      )
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ];
+    if (items.length === 0) {
+      const nm = String(uci.get(UCI_PACKAGE, sectionId, "name") || "").trim();
+      if (isProxyShareLinkUri(nm)) {
+        uci.set(UCI_PACKAGE, sectionId, "proxy_links", [nm]);
+        return [nm];
+      }
+    }
+    return Array.from(new Set(items));
+  };
+
   o = section.taboption(
     "general",
     form.DynamicList,
@@ -1948,6 +4081,80 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.depends("source_type", "proxy_links");
+  o.cfgvalue = function (sectionId) {
+    const all = getSourceProxyLinks(sectionId);
+    return all.length > 50 ? [] : all;
+  };
+  o.formvalue = function (sectionId) {
+    const base = form.DynamicList.prototype.formvalue.apply(this, arguments);
+    const list = Array.isArray(base) ? [...base] : base ? [String(base)] : [];
+    const seen = new Set(list);
+    try {
+      const fieldId = this.cbid(sectionId);
+      const wrap =
+        typeof document !== "undefined"
+          ? document.getElementById(fieldId) ||
+            document.querySelector(`[data-field="${fieldId}"]`)
+          : null;
+      if (wrap) {
+        const textInputs = wrap.querySelectorAll('input[type="text"]');
+        textInputs.forEach((inp) => {
+          const val = String(inp.value || "").trim();
+          if (val && !seen.has(val)) {
+            seen.add(val);
+            list.push(val);
+          }
+        });
+      }
+    } catch (_e) {}
+    return list;
+  };
+  o.write = function (sectionId, value) {
+    const activeType = String(
+      this.section.formvalue(sectionId, "source_type") ||
+        uci.get(UCI_PACKAGE, sectionId, "source_type") ||
+        "subscription",
+    )
+      .trim()
+      .toLowerCase();
+    if (activeType !== "proxy_links" && activeType !== "links") {
+      return;
+    }
+    const list = asArray(value);
+    if (list.length) {
+      uci.set(UCI_PACKAGE, sectionId, "proxy_links", list);
+      uci.unset(UCI_PACKAGE, sectionId, "proxy_links_text");
+      uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links_text");
+      uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links");
+    }
+  };
+  o.remove = function (sectionId) {
+    const activeType = String(
+      this.section.formvalue(sectionId, "source_type") ||
+        uci.get(UCI_PACKAGE, sectionId, "source_type") ||
+        "subscription",
+    )
+      .trim()
+      .toLowerCase();
+    if (activeType === "proxy_links" || activeType === "links") {
+      try {
+        const bulkId = `cbid.${UCI_PACKAGE}.${sectionId}._proxy_links_bulk`;
+        const bulkEl =
+          typeof document !== "undefined"
+            ? document.getElementById(`widget.${bulkId}`) ||
+              document.querySelector(`textarea[name="${bulkId}"]`) ||
+              document.querySelector(`[data-field="${bulkId}"] textarea`)
+            : null;
+        if (bulkEl && String(bulkEl.value || "").trim()) {
+          return;
+        }
+      } catch (_e) {}
+    }
+    uci.unset(UCI_PACKAGE, sectionId, "proxy_links");
+    uci.unset(UCI_PACKAGE, sectionId, "proxy_links_text");
+    uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links_text");
+    uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links");
+  };
 
   o = section.taboption(
     "general",
@@ -1959,21 +4166,44 @@ function createOutboundsContent(section) {
     ),
   );
   o.modalonly = true;
-  o.rows = 5;
+  o.rows = 8;
   o.depends("source_type", "proxy_links");
   o.cfgvalue = function (sectionId) {
-    return asArray(uci.get(UCI_PACKAGE, sectionId, "proxy_links")).join("\n");
+    const all = getSourceProxyLinks(sectionId);
+    return all.length > 50 ? all.join("\n") : "";
   };
   o.write = function (sectionId, value) {
+    const activeType = String(
+      this.section.formvalue(sectionId, "source_type") ||
+        uci.get(UCI_PACKAGE, sectionId, "source_type") ||
+        "subscription",
+    )
+      .trim()
+      .toLowerCase();
+    if (activeType !== "proxy_links" && activeType !== "links") {
+      return;
+    }
     const lines = String(value || "")
       .split(/\r?\n/)
       .map((s) => s.trim())
       .filter(Boolean);
     if (lines.length) {
-      const existing = asArray(uci.get(UCI_PACKAGE, sectionId, "proxy_links"));
-      const merged = Array.from(new Set([...existing, ...lines]));
+      const existing = getSourceProxyLinks(sectionId);
+      const dynamicLinks = asArray(
+        this.section.formvalue(sectionId, "proxy_links"),
+      );
+      const merged =
+        existing.length > 50
+          ? Array.from(new Set(lines))
+          : Array.from(new Set([...dynamicLinks, ...lines]));
       uci.set(UCI_PACKAGE, sectionId, "proxy_links", merged);
+      uci.unset(UCI_PACKAGE, sectionId, "proxy_links_text");
+      uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links_text");
+      uci.unset(UCI_PACKAGE, sectionId, "selector_proxy_links");
     }
+  };
+  o.remove = function () {
+    // Never remove proxy_links when bulk textarea is cleared; DynamicList manages removal.
   };
 
   // ── 3. Amnezia / AmneziaWG Multi-Config (vpn:// or .conf files) ───────────
@@ -2009,7 +4239,9 @@ function createOutboundsContent(section) {
               reader.onload = (e) =>
                 resolve({
                   name: file.name.replace(/\.(conf|wg|txt)$/i, ""),
-                  config: String((e.target && e.target.result) || "").trim(),
+                  config: String((e.target && e.target.result) || "")
+                    .replace(/\r\n?/g, "\n")
+                    .trim(),
                 });
               reader.onerror = () => resolve(null);
               reader.readAsText(file);
@@ -2032,14 +4264,8 @@ function createOutboundsContent(section) {
             [sectionId]: next,
           };
           setModalFieldValue(section, sectionId, "amnezia_configs", next);
-          if (valid.length >= 1) {
-            setModalFieldValue(
-              section,
-              sectionId,
-              "amnezia_conf_text",
-              valid[0].config,
-            );
-          }
+          uci.unset(UCI_PACKAGE, sectionId, "amnezia_conf_text");
+          setModalFieldValue(section, sectionId, "amnezia_conf_text", "");
           ui.addNotification(
             null,
             E("p", _("Loaded %d configuration file(s).").format(valid.length)),
@@ -2052,6 +4278,44 @@ function createOutboundsContent(section) {
     fileInput.click();
   };
 
+  function validateAmneziaVpnLink(link) {
+    const vr = main.validateVpnUrl(main.compactVpnUri(link));
+    return vr.valid
+      ? true
+      : vr.message ||
+          _("Invalid vpn:// link; use a WG/AWG .conf or Amnezia export");
+  }
+
+  function normalizeAmneziaConfigEntry(rawEntry, defaultName) {
+    const trimmed = String(rawEntry || "").trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof parsed.config === "string" &&
+          parsed.config.trim()
+        ) {
+          return [trimmed];
+        }
+      } catch (_e) {
+        // Not valid JSON; fall through to text/URI splitting
+      }
+    }
+    const normalized = trimmed.replace(/\r\n?/g, "\n");
+    if (
+      trimmed.startsWith("vpn://") &&
+      !normalized.toLowerCase().includes("[interface]") &&
+      !/\n\s*vpn:\/\//i.test(normalized)
+    ) {
+      return [main.compactVpnUri(trimmed)];
+    }
+    const split = main.splitAmneziaTextEntries(normalized, defaultName);
+    return split.entries.length ? split.entries : [main.compactVpnUri(trimmed)];
+  }
+
   o = section.taboption(
     "general",
     form.DynamicList,
@@ -2061,8 +4325,80 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.depends("source_type", "amnezia_config");
+  o.validate = function (_sectionId, value) {
+    const items = Array.isArray(value)
+      ? value
+      : value !== undefined && value !== null
+        ? [value]
+        : [];
+    for (const rawItem of items) {
+      const trimmed = String(rawItem || "").trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith("{")) {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (_e) {
+          return _(
+            "Invalid Amnezia configuration JSON: expected {name, config}.",
+          );
+        }
+        if (
+          !parsed ||
+          typeof parsed !== "object" ||
+          typeof parsed.config !== "string" ||
+          !parsed.config.trim()
+        ) {
+          return _(
+            "Invalid Amnezia configuration JSON: expected {name, config}.",
+          );
+        }
+        const cfg = parsed.config.trim();
+        if (cfg.startsWith("vpn://")) {
+          const vpnCheck = validateAmneziaVpnLink(cfg);
+          if (vpnCheck !== true) return vpnCheck;
+        }
+        continue;
+      }
+      const normalized = trimmed.replace(/\r\n?/g, "\n");
+      if (
+        trimmed.startsWith("vpn://") &&
+        !normalized.toLowerCase().includes("[interface]") &&
+        !/\n\s*vpn:\/\//i.test(normalized)
+      ) {
+        const vpnCheck = validateAmneziaVpnLink(trimmed);
+        if (vpnCheck !== true) return vpnCheck;
+        continue;
+      }
+      const parsed = main.splitAmneziaTextEntries(normalized);
+      for (const link of parsed.vpnLinks) {
+        const vpnCheck = validateAmneziaVpnLink(link);
+        if (vpnCheck !== true) return vpnCheck;
+      }
+      if (
+        parsed.confBody &&
+        !parsed.confBody.toLowerCase().includes("[interface]")
+      ) {
+        return _(
+          "Invalid Amnezia configuration: paste a vpn:// link or WireGuard / AmneziaWG .conf with [Interface].",
+        );
+      }
+      if (!parsed.vpnLinks.length && !parsed.confBody) {
+        return _(
+          "Invalid Amnezia configuration: paste a vpn:// link or WireGuard / AmneziaWG .conf with [Interface].",
+        );
+      }
+    }
+    return true;
+  };
   o.write = function (sectionId, value) {
-    const fromWidget = asRawList(value);
+    const name = uci.get(UCI_PACKAGE, sectionId, "name") || sectionId;
+    const fromWidget = [];
+    asRawList(value).forEach((entry) => {
+      normalizeAmneziaConfigEntry(entry, name).forEach((item) => {
+        if (!fromWidget.includes(item)) fromWidget.push(item);
+      });
+    });
     const loaded =
       (section._loadedAmneziaConfigs &&
         section._loadedAmneziaConfigs[sectionId]) ||
@@ -2102,25 +4438,89 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.rows = 6;
+  o.rmempty = true;
   o.depends("source_type", "amnezia_config");
+  o.validate = function (_sectionId, value) {
+    const trimmed = String(value || "")
+      .replace(/\r\n?/g, "\n")
+      .trim();
+    if (!trimmed) return true;
+    const { vpnLinks, confBody } = main.splitAmneziaTextEntries(trimmed);
+    for (const link of vpnLinks) {
+      const vpnCheck = validateAmneziaVpnLink(link);
+      if (vpnCheck !== true) return vpnCheck;
+    }
+    if (confBody && !confBody.toLowerCase().includes("[interface]")) {
+      return _(
+        "Configuration must contain [Interface] section or valid vpn:// links.",
+      );
+    }
+    if (!vpnLinks.length && !confBody) {
+      return _(
+        "Configuration must contain [Interface] section or valid vpn:// links.",
+      );
+    }
+    return true;
+  };
+  o.remove = function (sectionId) {
+    uci.unset(UCI_PACKAGE, sectionId, "amnezia_conf_text");
+  };
   o.write = function (sectionId, value) {
-    const trimmed = String(value || "").trim();
-    if (!trimmed) return;
-    uci.set(UCI_PACKAGE, sectionId, "amnezia_conf_text", trimmed);
-    const cur = asRawList(uci.get(UCI_PACKAGE, sectionId, "amnezia_configs"));
-    const name = uci.get(UCI_PACKAGE, sectionId, "name") || sectionId;
-    const serialized = JSON.stringify({ name, config: trimmed });
-    const alreadyExists = cur.some((entry) => {
-      if (entry === serialized || entry === trimmed) return true;
-      try {
-        const parsed = JSON.parse(entry);
-        return parsed && String(parsed.config || "").trim() === trimmed;
-      } catch (_e) {
-        return false;
-      }
+    const trimmed = String(value || "")
+      .replace(/\r\n?/g, "\n")
+      .trim();
+    if (!trimmed) {
+      uci.unset(UCI_PACKAGE, sectionId, "amnezia_conf_text");
+      return;
+    }
+    const loaded =
+      (section._loadedAmneziaConfigs &&
+        section._loadedAmneziaConfigs[sectionId]) ||
+      [];
+    const fromUci = asRawList(
+      uci.get(UCI_PACKAGE, sectionId, "amnezia_configs"),
+    );
+    const cur = [...fromUci];
+    loaded.forEach((entry) => {
+      if (!cur.includes(entry)) cur.push(entry);
     });
-    if (!alreadyExists) {
-      uci.set(UCI_PACKAGE, sectionId, "amnezia_configs", [...cur, serialized]);
+    const name = uci.get(UCI_PACKAGE, sectionId, "name") || sectionId;
+    const {
+      vpnLinks,
+      confBody,
+      entries: candidates,
+    } = main.splitAmneziaTextEntries(trimmed, name);
+
+    const next = [...cur];
+    candidates.forEach((candidate) => {
+      const alreadyExists = next.some((entry) => {
+        const normEntry = String(entry || "")
+          .replace(/\r\n?/g, "\n")
+          .trim();
+        if (normEntry === candidate || normEntry === confBody) return true;
+        try {
+          const parsed = JSON.parse(entry);
+          return (
+            parsed &&
+            confBody &&
+            String(parsed.config || "")
+              .replace(/\r\n?/g, "\n")
+              .trim() === confBody
+          );
+        } catch (_e) {
+          return false;
+        }
+      });
+      if (!alreadyExists) next.push(candidate);
+    });
+
+    if (next.length) {
+      uci.set(UCI_PACKAGE, sectionId, "amnezia_configs", next);
+    }
+    if (cur.length > 0 || vpnLinks.length > 0 || next.length > 1) {
+      uci.unset(UCI_PACKAGE, sectionId, "amnezia_conf_text");
+    } else if (confBody) {
+      uci.set(UCI_PACKAGE, sectionId, "amnezia_conf_text", confBody);
     }
   };
 
@@ -2312,14 +4712,22 @@ function createOutboundsContent(section) {
             kv.persistentkeepalive,
           );
         if (kv.endpoint) {
-          const lastColon = kv.endpoint.lastIndexOf(":");
-          if (lastColon > 0) {
-            const host = kv.endpoint
-              .slice(0, lastColon)
-              .replace(/^\[|\]$/g, "");
-            const port = kv.endpoint.slice(lastColon + 1);
-            setModalFieldValue(section, sectionId, "awg_server_address", host);
-            setModalFieldValue(section, sectionId, "awg_server_port", port);
+          const parsedEndpoint = main.splitHostPort(kv.endpoint);
+          if (parsedEndpoint) {
+            setModalFieldValue(
+              section,
+              sectionId,
+              "awg_server_address",
+              parsedEndpoint.host,
+            );
+            if (parsedEndpoint.port) {
+              setModalFieldValue(
+                section,
+                sectionId,
+                "awg_server_port",
+                parsedEndpoint.port,
+              );
+            }
           } else {
             setModalFieldValue(
               section,
@@ -2529,43 +4937,43 @@ function createOutboundsContent(section) {
   o.depends("source_type", "awg");
 
   [
-    ["awg_jc", "Jc (Junk Packet Count)", "4"],
-    ["awg_jmin", "Jmin (Junk Min Size)", "40"],
-    ["awg_jmax", "Jmax (Junk Max Size)", "70"],
-    ["awg_s1", "S1 (Init Padding)", "0"],
-    ["awg_s2", "S2 (Response Padding)", "0"],
-    ["awg_s3", "S3 (Cookie Padding)", "0"],
-    ["awg_s4", "S4 (Transport Padding)", "0"],
-    ["awg_h1", "H1 (Init Header)", "1"],
-    ["awg_h2", "H2 (Response Header)", "2"],
-    ["awg_h3", "H3 (Cookie Header)", "3"],
-    ["awg_h4", "H4 (Transport Header)", "4"],
-    ["awg_i1", "I1 (Signature Packet 1)", ""],
-    ["awg_i2", "I2 (Signature Packet 2)", ""],
-    ["awg_i3", "I3 (Signature Packet 3)", ""],
-    ["awg_i4", "I4 (Signature Packet 4)", ""],
-    ["awg_i5", "I5 (Signature Packet 5)", ""],
-    ["awg_j1", "J1 (Custom Junk 1)", ""],
-    ["awg_j2", "J2 (Custom Junk 2)", ""],
-    ["awg_j3", "J3 (Custom Junk 3)", ""],
-    ["awg_itime", "Itime (Signature Timeout)", ""],
+    ["awg_jc", _("Jc (Junk Packet Count)"), "4"],
+    ["awg_jmin", _("Jmin (Junk Min Size)"), "40"],
+    ["awg_jmax", _("Jmax (Junk Max Size)"), "70"],
+    ["awg_s1", _("S1 (Init Padding)"), "0"],
+    ["awg_s2", _("S2 (Response Padding)"), "0"],
+    ["awg_s3", _("S3 (Cookie Padding)"), "0"],
+    ["awg_s4", _("S4 (Transport Padding)"), "0"],
+    ["awg_h1", _("H1 (Init Header)"), "1"],
+    ["awg_h2", _("H2 (Response Header)"), "2"],
+    ["awg_h3", _("H3 (Cookie Header)"), "3"],
+    ["awg_h4", _("H4 (Transport Header)"), "4"],
+    ["awg_i1", _("I1 (Signature Packet 1)"), ""],
+    ["awg_i2", _("I2 (Signature Packet 2)"), ""],
+    ["awg_i3", _("I3 (Signature Packet 3)"), ""],
+    ["awg_i4", _("I4 (Signature Packet 4)"), ""],
+    ["awg_i5", _("I5 (Signature Packet 5)"), ""],
+    ["awg_j1", _("J1 (Custom Junk 1)"), ""],
+    ["awg_j2", _("J2 (Custom Junk 2)"), ""],
+    ["awg_j3", _("J3 (Custom Junk 3)"), ""],
+    ["awg_itime", _("Itime (Signature Timeout)"), ""],
   ].forEach(([key, title, ph]) => {
-    o = section.taboption("general", form.Value, key, _(title));
+    o = section.taboption("general", form.Value, key, title);
     o.modalonly = true;
     if (ph) o.placeholder = ph;
     o.depends("source_type", "awg");
   });
 
   [
-    ["awg_header_protection_key", "HeaderProtectionKey (Base64)", ""],
-    ["awg_content_padding_addition", "ContentPaddingAddition", "0"],
-    ["awg_rekey_after_time", "RekeyAfterTime (s)", "120"],
-    ["awg_rekey_timeout", "RekeyTimeout (s)", "5"],
-    ["awg_reject_after_time", "RejectAfterTime (s)", "180"],
-    ["awg_keepalive_timeout", "KeepaliveTimeout (s)", "10"],
-    ["awg_max_handshake_attempts", "MaxHandshakeAttempts", "10"],
+    ["awg_header_protection_key", _("HeaderProtectionKey (Base64)"), ""],
+    ["awg_content_padding_addition", _("ContentPaddingAddition"), "0"],
+    ["awg_rekey_after_time", _("RekeyAfterTime (s)"), "120"],
+    ["awg_rekey_timeout", _("RekeyTimeout (s)"), "5"],
+    ["awg_reject_after_time", _("RejectAfterTime (s)"), "180"],
+    ["awg_keepalive_timeout", _("KeepaliveTimeout (s)"), "10"],
+    ["awg_max_handshake_attempts", _("MaxHandshakeAttempts"), "10"],
   ].forEach(([key, title, ph]) => {
-    o = section.taboption("general", form.Value, key, _(title));
+    o = section.taboption("general", form.Value, key, title);
     o.modalonly = true;
     if (ph) o.placeholder = ph;
     o.depends({ source_type: "awg", awg_version: "3.0" });
@@ -2681,6 +5089,34 @@ function createOutboundsContent(section) {
         if (data.mtu) {
           setModalFieldValue(section, sectionId, "warp_mtu", String(data.mtu));
         }
+        const awgKeys = [
+          "awg_version",
+          "awg_jc",
+          "awg_jmin",
+          "awg_jmax",
+          "awg_s1",
+          "awg_s2",
+          "awg_s3",
+          "awg_s4",
+          "awg_h1",
+          "awg_h2",
+          "awg_h3",
+          "awg_h4",
+          "awg_i1",
+          "awg_i2",
+          "awg_i3",
+          "awg_i4",
+          "awg_i5",
+        ];
+        awgKeys.forEach((k) => {
+          if (
+            data[k] !== undefined &&
+            data[k] !== null &&
+            String(data[k]) !== ""
+          ) {
+            uci.set("tachyon", sectionId, k, String(data[k]));
+          }
+        });
         ui.addNotification(
           null,
           E("p", _("WARP configuration generated and filled.")),
@@ -2822,7 +5258,7 @@ function createOutboundsContent(section) {
     "general",
     form.ListValue,
     "bypass_method",
-    _("FPTN DPI Bypass Method"),
+    _("FPTN Traffic Masking Method"),
   );
   o.modalonly = true;
   o.default = "obfuscation";
@@ -3095,6 +5531,7 @@ function createOutboundsContent(section) {
     "mieru",
     "trusttunnel",
     "tewfai",
+    "csqtt",
     "masque",
     "openconnect",
     "shadowtls",
@@ -3105,12 +5542,110 @@ function createOutboundsContent(section) {
   o.modalonly = true;
   o.placeholder = "example.com";
   directProtoTypes.forEach((t) => o.depends("source_type", t));
+  o.load = function (sectionId) {
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      return String(
+        uci.get(UCI_PACKAGE, sectionId, "csqtt_server") ||
+          uci.get(UCI_PACKAGE, sectionId, "server") ||
+          "",
+      );
+    }
+    return String(uci.get(UCI_PACKAGE, sectionId, "server") || "");
+  };
+  o.cfgvalue = function (sectionId) {
+    return this.load(sectionId);
+  };
+  o.write = function (sectionId, value) {
+    const val = String(value || "").trim();
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      if (val) {
+        uci.set(UCI_PACKAGE, sectionId, "server", val);
+        uci.set(UCI_PACKAGE, sectionId, "csqtt_server", val);
+      } else {
+        uci.unset(UCI_PACKAGE, sectionId, "server");
+        uci.unset(UCI_PACKAGE, sectionId, "csqtt_server");
+      }
+      return;
+    }
+    if (val) uci.set(UCI_PACKAGE, sectionId, "server", val);
+    else uci.unset(UCI_PACKAGE, sectionId, "server");
+  };
+  o.remove = function (sectionId) {
+    uci.unset(UCI_PACKAGE, sectionId, "server");
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      uci.unset(UCI_PACKAGE, sectionId, "csqtt_server");
+    }
+  };
 
   o = section.taboption("general", form.Value, "server_port", _("Server Port"));
   o.modalonly = true;
   o.default = "443";
-  o.placeholder = "443";
+  o.placeholder = "443, 2000-2010";
   directProtoTypes.forEach((t) => o.depends("source_type", t));
+  o.load = function (sectionId) {
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      return String(
+        uci.get(UCI_PACKAGE, sectionId, "csqtt_server_port") ||
+          uci.get(UCI_PACKAGE, sectionId, "csqtt_port") ||
+          uci.get(UCI_PACKAGE, sectionId, "server_port") ||
+          "46000",
+      );
+    }
+    const stored = uci.get(UCI_PACKAGE, sectionId, "server_port");
+    return stored != null && stored !== ""
+      ? String(stored)
+      : String(this.default || "443");
+  };
+  o.cfgvalue = function (sectionId) {
+    return this.load(sectionId);
+  };
+  o.write = function (sectionId, value) {
+    const val = String(value || "").trim();
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      uci.unset(UCI_PACKAGE, sectionId, "csqtt_port");
+      if (val) {
+        uci.set(UCI_PACKAGE, sectionId, "server_port", val);
+        uci.set(UCI_PACKAGE, sectionId, "csqtt_server_port", val);
+      } else {
+        uci.unset(UCI_PACKAGE, sectionId, "server_port");
+        uci.unset(UCI_PACKAGE, sectionId, "csqtt_server_port");
+      }
+      return;
+    }
+    if (val) uci.set(UCI_PACKAGE, sectionId, "server_port", val);
+    else uci.unset(UCI_PACKAGE, sectionId, "server_port");
+  };
+  o.remove = function (sectionId) {
+    uci.unset(UCI_PACKAGE, sectionId, "server_port");
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      uci.unset(UCI_PACKAGE, sectionId, "csqtt_server_port");
+      uci.unset(UCI_PACKAGE, sectionId, "csqtt_port");
+    }
+  };
+  o.validate = function (_sectionId, value) {
+    const raw = `${value || ""}`.trim();
+    if (!raw) return true;
+    const tokens = raw.split(/[\s,]+/).filter(Boolean);
+    for (const tok of tokens) {
+      if (/^[0-9]+$/.test(tok)) {
+        const p = parseInt(tok, 10);
+        if (p < 1 || p > 65535) {
+          return _("Port must be between 1 and 65535");
+        }
+        continue;
+      }
+      const m = tok.match(/^([0-9]+)[-:]([0-9]+)$/);
+      if (m) {
+        const lo = parseInt(m[1], 10);
+        const hi = parseInt(m[2], 10);
+        if (lo >= 1 && hi >= lo && hi <= 65535) {
+          continue;
+        }
+      }
+      return _("Specify a port (1-65535) or port range (e.g. 2000-2010)");
+    }
+    return true;
+  };
 
   o = section.taboption(
     "general",
@@ -3132,6 +5667,41 @@ function createOutboundsContent(section) {
   o.modalonly = true;
   o.password = true;
   directProtoTypes.forEach((t) => o.depends("source_type", t));
+  o.depends("source_type", "wdtt");
+  o.load = function (sectionId) {
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      return String(
+        uci.get(UCI_PACKAGE, sectionId, "csqtt_password") ||
+          uci.get(UCI_PACKAGE, sectionId, "password") ||
+          "",
+      );
+    }
+    return String(uci.get(UCI_PACKAGE, sectionId, "password") || "");
+  };
+  o.cfgvalue = function (sectionId) {
+    return this.load(sectionId);
+  };
+  o.write = function (sectionId, value) {
+    const val = String(value || "").trim();
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      if (val) {
+        uci.set(UCI_PACKAGE, sectionId, "password", val);
+        uci.set(UCI_PACKAGE, sectionId, "csqtt_password", val);
+      } else {
+        uci.unset(UCI_PACKAGE, sectionId, "password");
+        uci.unset(UCI_PACKAGE, sectionId, "csqtt_password");
+      }
+      return;
+    }
+    if (val) uci.set(UCI_PACKAGE, sectionId, "password", val);
+    else uci.unset(UCI_PACKAGE, sectionId, "password");
+  };
+  o.remove = function (sectionId) {
+    uci.unset(UCI_PACKAGE, sectionId, "password");
+    if (getOutboundOptionSourceType(this, sectionId) === "csqtt") {
+      uci.unset(UCI_PACKAGE, sectionId, "csqtt_password");
+    }
+  };
 
   o = section.taboption(
     "general",
@@ -3270,10 +5840,10 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.value("", _("Default"));
-  o.value("MULTIPLEXING_OFF", "Off");
-  o.value("MULTIPLEXING_LOW", "Low");
-  o.value("MULTIPLEXING_MIDDLE", "Middle");
-  o.value("MULTIPLEXING_HIGH", "High");
+  o.value("MULTIPLEXING_OFF", _("Off"));
+  o.value("MULTIPLEXING_LOW", _("Low"));
+  o.value("MULTIPLEXING_MIDDLE", _("Middle"));
+  o.value("MULTIPLEXING_HIGH", _("High"));
   o.depends("source_type", "mieru");
 
   o = section.taboption(
@@ -3284,8 +5854,8 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.value("", _("Default"));
-  o.value("HANDSHAKE_STANDARD", "Standard");
-  o.value("HANDSHAKE_NO_WAIT", "No Wait (0-RTT)");
+  o.value("HANDSHAKE_STANDARD", _("Standard"));
+  o.value("HANDSHAKE_NO_WAIT", _("No Wait (0-RTT)"));
   o.depends("source_type", "mieru");
 
   // NaiveProxy extras
@@ -3545,12 +6115,269 @@ function createOutboundsContent(section) {
     _("Morph Profile"),
   );
   o.modalonly = true;
-  o.value("", _("None (Default)"));
-  o.value("browsing", "Browsing");
-  o.value("video", "Video");
+  o.value("", _("Auto / Adaptive Transformer (Default)"));
+  o.value("auto", _("Auto / Adaptive Transformer"));
+  o.value("browsing", _("Browsing"));
+  o.value("video", _("Video"));
   o.value("webrtc", "WebRTC");
-  o.value("bulk", "Bulk");
+  o.value("bulk", _("Bulk"));
   o.depends("source_type", "tewfai");
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "tewfai_desync_enabled",
+    _("TCP Desync (First-Flight ClientHello Split)"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("source_type", "tewfai");
+
+  // CSQTT / WDTT v3 extras
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "csqtt_mode",
+    _("CSQTT Mode"),
+  );
+  o.modalonly = true;
+  o.default = "csqtt";
+  o.value("csqtt", "csqtt (v2/v3)");
+  o.value("csqtt_v1", "csqtt_v1");
+  o.value("wg", "wg (WireGuard over UDP)");
+  o.value("raw", "raw (UDP)");
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "csqtt_obfs",
+    _("Framing Profile (obfs)"),
+  );
+  o.modalonly = true;
+  o.default = "audio";
+  o.value("audio", "audio");
+  o.value("video", "video");
+  o.value("unified", "unified");
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_raw_port",
+    _("Raw UDP Port (optional)"),
+  );
+  o.modalonly = true;
+  o.datatype = "port";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_wg_port",
+    _("WireGuard Port (wg mode, optional)"),
+  );
+  o.modalonly = true;
+  o.datatype = "port";
+  o.placeholder = "56000";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_local_port",
+    _("Local UDP Port (optional)"),
+  );
+  o.modalonly = true;
+  o.datatype = "port";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.DynamicList,
+    "csqtt_hashes",
+    _("Peer Hashes / Keys"),
+  );
+  o.modalonly = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption("general", form.Value, "csqtt_workers", _("Workers"));
+  o.modalonly = true;
+  o.datatype = "uinteger";
+  o.placeholder = "1";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "csqtt_turn_transport",
+    _("TURN Transport"),
+  );
+  o.modalonly = true;
+  o.value("", _("Auto / None"));
+  o.value("auto", "auto");
+  o.value("tcp", "tcp");
+  o.value("udp", "udp");
+  o.value("tcp_tls", "tcp_tls");
+  o.value("tls", "tls");
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_turn_server",
+    _("TURN Server (optional)"),
+  );
+  o.modalonly = true;
+  o.placeholder = "turn.example.com:3478";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.DynamicList,
+    "csqtt_turn_urls",
+    _("TURN URLs (optional)"),
+  );
+  o.modalonly = true;
+  o.placeholder = "turn:turn.example.com:3478?transport=udp";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_turn_username",
+    _("TURN Username (optional)"),
+  );
+  o.modalonly = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_turn_password",
+    _("TURN Password (optional)"),
+  );
+  o.modalonly = true;
+  o.password = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "csqtt_vk_auth_mode",
+    _("VK Auth Mode"),
+    _(
+      "VK anonymous token endpoints may require captcha or cookies under rate-limiting. For higher reliability, supply VK Cookie in cookie mode, configure a custom TURN server/URLs, or use wg / raw direct UDP mode.",
+    ),
+  );
+  o.modalonly = true;
+  o.value("", _("Default"));
+  o.value("vkcalls", "vkcalls");
+  o.value("legacy", "legacy");
+  o.value("cookie", "cookie");
+  o.value("oneme", "oneme");
+  o.value("max", "max");
+  o.value("yandex", "yandex");
+  o.value("telemost", "telemost");
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_vk_cookie",
+    _("VK Cookie (for cookie auth mode)"),
+    _(
+      "VK session Cookie header value used when VK Auth Mode is cookie (or auto-detected when non-empty).",
+    ),
+  );
+  o.modalonly = true;
+  o.password = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.DynamicList,
+    "csqtt_vk_client_ids",
+    _("VK Client IDs (optional)"),
+  );
+  o.modalonly = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption("general", form.Value, "csqtt_mtu", _("MTU"));
+  o.modalonly = true;
+  o.datatype = "uinteger";
+  o.placeholder = "1350";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "csqtt_chunk1",
+    _("Chunk1 Framing (chunk1)"),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_device_id",
+    _("Device ID (optional)"),
+  );
+  o.modalonly = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_wg_private_key",
+    _("WireGuard Private Key (wg mode, optional)"),
+  );
+  o.modalonly = true;
+  o.password = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_wg_peer_public_key",
+    _("WireGuard Peer Public Key (wg mode, optional)"),
+  );
+  o.modalonly = true;
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_wg_address",
+    _("WireGuard Tunnel Address (wg mode, optional)"),
+  );
+  o.modalonly = true;
+  o.placeholder = "10.66.0.2/32";
+  o.depends("source_type", "csqtt");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "csqtt_uri",
+    _("CSQTT / WDTT URI (optional override)"),
+  );
+  o.modalonly = true;
+  o.placeholder = "csqtt://... or qwdtt://...";
+  o.depends("source_type", "csqtt");
+
+  // WDTT (Native tachyon-core)
+  o = section.taboption(
+    "general",
+    form.Value,
+    "warp_flow_uri",
+    _("WDTT / CSQTT URI"),
+    _("Connection URI (wdtt://..., csqtt://..., or qwdtt://...)."),
+  );
+  o.modalonly = true;
+  o.placeholder = "wdtt://... or csqtt://...";
+  o.depends("source_type", "wdtt");
 
   // ── 9. Network Interface / Tailscale / Tor / JSON ─────────────────────────
   o = section.taboption(
@@ -3565,17 +6392,288 @@ function createOutboundsContent(section) {
   o.placeholder = "9050";
   o.depends("source_type", "tor");
 
+  const INTERFACE_PRESETS = [
+    ["wg0", "wg0 (WireGuard)"],
+    ["awg0", "awg0 (AmneziaWG)"],
+    ["tun0", "tun0 (OpenVPN / TUN)"],
+    ["tailscale0", "tailscale0 (Tailscale)"],
+    ["ovpn0", "ovpn0 (OpenVPN)"],
+    ["wan", "wan (WAN)"],
+    ["pppoe-wan", "pppoe-wan (PPPoE WAN)"],
+    ["eth0", "eth0 (Ethernet 0)"],
+    ["eth1", "eth1 (Ethernet 1)"],
+    ["br-lan", "br-lan (LAN Bridge)"],
+  ];
+
+  function collectRouterInterfaceChoices(devices = []) {
+    const map = new Map();
+    (devices || []).forEach((dev) => {
+      if (!dev || typeof dev.getName !== "function") return;
+      const name = String(dev.getName() || "").trim();
+      if (!name || name === "lo") return;
+      const type =
+        typeof dev.getType === "function" ? String(dev.getType() || "") : "";
+      if (type === "alias") return;
+      const i18n =
+        typeof dev.getI18n === "function" ? String(dev.getI18n() || "") : "";
+      const up = typeof dev.isUp === "function" && dev.isUp();
+      const status = up ? "●" : "○";
+      map.set(name, `${status} ${name}${i18n ? ` (${i18n})` : ""}`);
+    });
+    try {
+      (uci.sections("network", "interface") || []).forEach((sec) => {
+        const sname = sec && sec[".name"];
+        const devName = (sec && (sec.device || sec.ifname)) || sname;
+        if (devName && devName !== "loopback" && devName !== "lo") {
+          const d = String(devName).trim();
+          if (d && !map.has(d)) {
+            map.set(
+              d,
+              `${d}${sname && sname !== d ? ` (${sname})` : ""}${sec.proto ? ` [${sec.proto}]` : ""}`,
+            );
+          }
+        }
+        if (
+          sname &&
+          sname !== "loopback" &&
+          sname !== "lo" &&
+          !map.has(sname)
+        ) {
+          map.set(sname, `${sname}${sec.proto ? ` [${sec.proto}]` : ""}`);
+        }
+      });
+    } catch (_e) {}
+    INTERFACE_PRESETS.forEach(([val, lbl]) => {
+      if (!map.has(val)) {
+        map.set(val, lbl);
+      }
+    });
+    return Array.from(map.entries()).map(([value, label]) => ({
+      value,
+      label,
+    }));
+  }
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "tailscale_auth_key",
+    _("Tailscale auth key (optional)"),
+    _(
+      "Optional reusable or ephemeral pre-authentication key to join your Tailnet (e.g. tskey-auth-...). If omitted, an interactive login URL is printed in the service logs.",
+    ) +
+      ' <a href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">' +
+      _("Generate in Tailscale Admin Console") +
+      "</a>",
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "tskey-auth-...";
+  o.depends("source_type", "tailscale");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "tailscale_control_url",
+    _("Tailscale control URL"),
+  );
+  o.default = "https://controlplane.tailscale.com";
+  o.placeholder = "https://controlplane.tailscale.com";
+  o.modalonly = true;
+  o.rmempty = true;
+  o.validate = function (_sectionId, value) {
+    const raw = String(value || "").trim();
+    if (!raw) return true;
+    return /^https?:\/\/.+/i.test(raw)
+      ? true
+      : _("Control URL must start with http:// or https://");
+  };
+  o.depends("source_type", "tailscale");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "tailscale_hostname",
+    _("Tailscale hostname"),
+    _("Device hostname visible inside your tailnet (optional)."),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "tachyon-router";
+  o.depends("source_type", "tailscale");
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "tailscale_accept_routes",
+    _("Accept routes"),
+    _("Accept subnet routes advertised by other tailnet nodes."),
+  );
+  o.default = "1";
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("source_type", "tailscale");
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "tailscale_accept_dns",
+    _("Accept Tailscale DNS (MagicDNS)"),
+    _("Use DNS configuration advertised by the tailnet (MagicDNS)."),
+  );
+  o.default = "1";
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends("source_type", "tailscale");
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "tailscale_exit_node",
+    _("Exit node"),
+    _(
+      "Optional tailnet peer hostname or Tailscale IP to route outbound traffic through.",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "100.64.0.10";
+  o.depends("source_type", "tailscale");
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "tailscale_exit_node_allow_lan_access",
+    _("Allow LAN access when using exit node"),
+    _(
+      "Allow direct access to local LAN subnets while forwarding outbound traffic through an exit node.",
+    ),
+  );
+  o.default = "0";
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("source_type", "tailscale");
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "tailscale_ephemeral",
+    _("Ephemeral node"),
+    _(
+      "Register as an ephemeral node that is automatically removed from the tailnet when the service stops.",
+    ),
+  );
+  o.default = "0";
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("source_type", "tailscale");
+
   o = section.taboption(
     "general",
     form.Value,
     "interface_name",
     _("Network Interface Name"),
-    _("e.g. wg0, awg0, tun0, tailscale0"),
+    _(
+      "Select any existing router interface or preset (e.g. wg0, awg0, tun0, wan, eth0, br-lan).",
+    ),
   );
   o.modalonly = true;
+  o.rmempty = false;
   o.placeholder = "wg0";
   o.depends("source_type", "interface");
-  o.depends("source_type", "tailscale");
+  o.validate = function (sectionId, value) {
+    const st = String(
+      this.section.formvalue(sectionId, "source_type") ||
+        uci.get(UCI_PACKAGE, sectionId, "source_type") ||
+        "",
+    )
+      .trim()
+      .toLowerCase();
+    if (st === "interface" && !String(value || "").trim()) {
+      return _("Network Interface Name is required");
+    }
+    return true;
+  };
+  INTERFACE_PRESETS.forEach(([val, lbl]) => o.value(val, lbl));
+  o.load = function (sectionId) {
+    const self = this;
+    const populate = (devs) => {
+      self.keylist = [];
+      self.vallist = [];
+      collectRouterInterfaceChoices(devs).forEach((ch) => {
+        self.value(ch.value, ch.label);
+      });
+    };
+    const devPromise =
+      network && typeof network.getDevices === "function"
+        ? Promise.resolve(network.getDevices()).catch(() => [])
+        : Promise.resolve([]);
+    return devPromise.then((devs) => {
+      populate(devs || []);
+      return uci.get(UCI_PACKAGE, sectionId, "interface_name") || "";
+    });
+  };
+  const origIfaceRenderWidget = o.renderWidget;
+  o.renderWidget = function (sectionId, optionIndex, cfgvalue) {
+    const self = this;
+    if (!self.keylist || self.keylist.length <= INTERFACE_PRESETS.length) {
+      collectRouterInterfaceChoices([]).forEach((ch) => {
+        if (!self.keylist || !self.keylist.includes(ch.value)) {
+          self.value(ch.value, ch.label);
+        }
+      });
+    }
+    const node = origIfaceRenderWidget.call(
+      this,
+      sectionId,
+      optionIndex,
+      cfgvalue,
+    );
+    const chipRow = E("div", {
+      style: "display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;",
+    });
+    const renderChips = (choices) => {
+      chipRow.innerHTML = "";
+      choices.forEach((ch) => {
+        chipRow.appendChild(
+          E(
+            "button",
+            {
+              type: "button",
+              class: "btn cbi-button",
+              style:
+                "padding:2px 8px;font-size:11px;line-height:1.4;border-radius:999px;",
+              click: (ev) => {
+                ev.preventDefault();
+                setModalFieldValue(
+                  section,
+                  sectionId,
+                  "interface_name",
+                  ch.value,
+                );
+              },
+            },
+            ch.label,
+          ),
+        );
+      });
+    };
+    renderChips(collectRouterInterfaceChoices([]));
+    if (network && typeof network.getDevices === "function") {
+      Promise.resolve(network.getDevices())
+        .then((devs) => {
+          const choices = collectRouterInterfaceChoices(devs || []);
+          choices.forEach((ch) => {
+            if (!self.keylist || !self.keylist.includes(ch.value)) {
+              self.value(ch.value, ch.label);
+            }
+          });
+          renderChips(choices);
+        })
+        .catch(() => {});
+    }
+    return E("div", {}, [node, chipRow]);
+  };
 
   o = section.taboption(
     "general",
@@ -3616,106 +6714,47 @@ function createOutboundsContent(section) {
     form.DynamicList,
     "outbound_jsons",
     _("Outbound JSON Objects"),
-    _("Raw sing-box outbound JSON objects."),
+    _("Raw Tachyon Core outbound JSON objects."),
   );
   o.modalonly = true;
   o.depends("source_type", "outbound_json");
 
-  // ── 10. DPI Desync Sources (Zapret2, Zapret, ByeDPI, Native Desync, WDTT, OlcRTC)
-  o = section.taboption(
-    "general",
-    form.TextValue,
-    "nfqws2_opt",
-    _("NFQWS2 Strategy"),
-    _("Command-line strategy arguments for nfqws2 (zapret2 / wdtt / olcrtc)."),
-  );
-  o.modalonly = true;
-  o.rows = 6;
-  o.wrap = "soft";
-  o.default = ZAPRET2_DEFAULT_NFQWS2_OPT;
-  o.depends("source_type", "zapret2");
-  o.depends("source_type", "wdtt");
-  o.depends("source_type", "olcrtc");
-  o.load = function (sectionId) {
-    const existing = uci.get(UCI_PACKAGE, sectionId, "nfqws2_opt");
-    if (existing) return existing;
-    const stype = uci.get(UCI_PACKAGE, sectionId, "source_type");
-    if (stype === "wdtt") return WDTT_DEFAULT_NFQWS2_OPT;
-    if (stype === "olcrtc") return OLCRTC_DEFAULT_NFQWS2_OPT;
-    return ZAPRET2_DEFAULT_NFQWS2_OPT;
-  };
-
-  o = section.taboption(
-    "general",
-    form.TextValue,
-    "nfqws_opt",
-    _("NFQWS Strategy"),
-    _("Command-line strategy arguments for nfqws (zapret)."),
-  );
-  o.modalonly = true;
-  o.rows = 6;
-  o.wrap = "soft";
-  o.default = ZAPRET_DEFAULT_NFQWS_OPT;
-  o.depends("source_type", "zapret");
-  o.load = function (sectionId) {
-    return (
-      uci.get(UCI_PACKAGE, sectionId, "nfqws_opt") || ZAPRET_DEFAULT_NFQWS_OPT
-    );
-  };
-
-  o = section.taboption(
-    "general",
-    form.Flag,
-    "direct_nfqws",
-    _("Direct NFQUEUE Mode (Bypass Proxy Core)"),
-    _(
-      "Route matched traffic directly into kernel NFQUEUE via nftables without passing through sing-box/tachyon-core.",
-    ),
-  );
-  o.modalonly = true;
-  o.default = "0";
-  o.depends("source_type", "zapret2");
-  o.depends("source_type", "zapret");
-  o.depends("source_type", "wdtt");
-  o.depends("source_type", "olcrtc");
-
-  o = section.taboption(
-    "general",
-    form.TextValue,
-    "byedpi_cmd_opts",
-    _("ByeDPI Strategy"),
-    _("Command-line strategy arguments for ciadpi (ByeDPI)."),
-  );
-  o.modalonly = true;
-  o.rows = 5;
-  o.wrap = "soft";
-  o.default = BYEDPI_DEFAULT_CMD_OPTS;
-  o.depends("source_type", "byedpi");
-  o.load = function (sectionId) {
-    return (
-      uci.get(UCI_PACKAGE, sectionId, "byedpi_cmd_opts") ||
-      BYEDPI_DEFAULT_CMD_OPTS
-    );
-  };
-
+  // ── 10. Native Desync Sources
   o = section.taboption(
     "general",
     form.ListValue,
     "desync_preset",
     _("Desync Preset"),
-    _("Pre-configured DPI bypass profile for tachyon-core native desync."),
+    _(
+      "Pre-configured packet desynchronization profile for tachyon-core native desync.",
+    ),
   );
   o.modalonly = true;
-  o.default = "fake_split";
-  o.value("fake_split", _("Fake + Split (midsld, TTL=5) — Recommended"));
+  o.default = "auto";
+  o.value(
+    "auto",
+    _(
+      "Adaptive 2.0 (Auto-learning: ClientHello clone + RAW inject + cache.db) — Recommended",
+    ),
+  );
+  o.value("fake_split", _("Fake + Split (RAW Fake + MidSLD Split)"));
+  o.value(
+    "fake_disorder",
+    _("Fake + Disorder (RAW Fake + Out-of-order MidSLD)"),
+  );
+  o.value(
+    "multi_disorder",
+    _("Multi-Disorder (TLSRec + Fake + 3-way Out-of-order Split)"),
+  );
+  o.value("multi_split", _("Multi-Split (3-way TLS Record + SNI + MidSLD)"));
   o.value("tlsrec", _("TLS Record Fragmentation (tlsrec, midsld)"));
-  o.value("disorder", _("Fake + Disorder (Out-of-order, TTL=5)"));
+  o.value("disorder", _("Disorder (Out-of-order TCP Split)"));
   o.value("split", _("TCP Split Only (midsld)"));
-  o.value("fake", _("Fake Packet Injection Only (TTL=5)"));
+  o.value("fake", _("Fake Packet Injection Only (RAW/TTL)"));
   o.value("oob", _("TCP Urgent OOB Desync (midsld)"));
-  o.value("auto", _("Auto (Fake + Split)"));
   o.value("custom", _("Custom Parameters"));
   o.depends("source_type", "desync");
+  attachOutboundStrategyScannerButton(section, o, "desync", "desync_preset");
 
   o = section.taboption(
     "general",
@@ -3725,24 +6764,111 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.default = "fake_split";
-  o.value("fake_split", "fake_split (Fake + Split)");
-  o.value("tlsrec", "tlsrec (TLS Record Fragmentation)");
-  o.value("disorder", "disorder (Fake + Out-of-order Split)");
-  o.value("split", "split (TCP Segment Split)");
-  o.value("fake", "fake (Fake Packet Only)");
-  o.value("oob", "oob (TCP Urgent OOB)");
+  o.value("fake_split", _("fake_split (Fake + Split)"));
+  o.value("fake_disorder", _("fake_disorder (Fake + Out-of-order Split)"));
+  o.value(
+    "multi_disorder",
+    _("multi_disorder (TLSRec + Fake + 3-way Out-of-order Split)"),
+  );
+  o.value("multi_split", _("multi_split (3-way TLS Record + SNI + MidSLD)"));
+  o.value("tlsrec", _("tlsrec (TLS Record Fragmentation)"));
+  o.value("disorder", _("disorder (Out-of-order TCP Split)"));
+  o.value("split", _("split (TCP Segment Split)"));
+  o.value("fake", _("fake (Fake Packet Only)"));
+  o.value("oob", _("oob (TCP Urgent OOB)"));
   o.depends({ source_type: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "desync_fooling",
+    _("Fake Packet Fooling"),
+    _(
+      "Method used to ensure injected fake ClientHello is inspected by DPI but dropped by the destination server.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "";
+  o.value("", _("Default (TCP MD5 / Auto)"));
+  o.value("md5", _("TCP MD5 Signature (Option 19 via TCP_REPAIR)"));
+  o.value("md5_badack", _("TCP MD5 + BadAck + TS-Up (Valid Checksum Combo)"));
+  o.value("badack", _("Out-of-window TCP ACK + TS-Up (badack)"));
+  o.value("datanoack", _("TCP Data Without ACK Flag + MD5 (datanoack)"));
+  o.value("autottl", _("Auto-TTL (Calculated from kernel RTT hops)"));
+  o.value("timestamp", _("TCP Timestamp PAWS (Backdated TSval)"));
+  o.value("badseq", _("Out-of-window TCP Sequence (badseq)"));
+  o.value("badsum", _("Invalid TCP Checksum (badsum)"));
+  o.value(
+    "badseq_badack_badsum",
+    _("Compound BadSeq + BadAck + TS-Up + BadSum"),
+  );
+  o.value("hopbyhop", _("IPv6 Dual Hop-by-Hop Extension (hopbyhop2)"));
+  o.depends({ source_type: "desync", desync_preset: "auto" });
+  o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "fake_split" });
+  o.depends({ source_type: "desync", desync_preset: "fake_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "multi_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "fake" });
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "desync_auto_tune",
+    _("Adaptive 2.0 Auto-Learning (auto_tune)"),
+    _(
+      "Automatically rotate strategies on RST/cutoff/throttling (<20 KiB/s) and persist working profile per SNI in cache.db.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "1";
+  o.depends({ source_type: "desync", desync_preset: "auto" });
+  o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "fake_split" });
+  o.depends({ source_type: "desync", desync_preset: "fake_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "multi_disorder" });
 
   o = section.taboption(
     "general",
     form.Value,
     "desync_split_pos",
     _("Split Position"),
-    _("midsld, sni, or byte offset (1..1400)"),
+    _(
+      "midsld, sni, sniext+1, host+1, endhost-1, extlen, byte offset (1..1400), or comma-separated list (e.g. 1,sniext+1,midsld)",
+    ),
   );
   o.modalonly = true;
   o.placeholder = "midsld";
+  o.value("midsld", _("midsld (Middle of SLD domain)"));
+  o.value("sni", _("sni (Start of SNI extension)"));
+  o.value("sniext+1", _("sniext+1 (1 byte into SNI extension)"));
+  o.value("host+1", _("host+1 (1 byte into hostname)"));
+  o.value("midsld-2", _("midsld-2 (2 bytes before MidSLD)"));
+  o.value("midsld+2", _("midsld+2 (2 bytes after MidSLD)"));
+  o.value("endhost-1", _("endhost-1 (1 byte before end of hostname)"));
+  o.value("extlen", _("extlen (TLS extensions length field)"));
+  o.value(
+    "sni,endhost-1",
+    _("sni,endhost-1 (HostFakeSplit: hostname boundaries)"),
+  );
+  o.value("1,midsld", _("1,midsld (Byte 1 + MidSLD)"));
+  o.value("1,sniext+1,midsld", _("1,sniext+1,midsld (3-way compound split)"));
+  o.value(
+    "1,sniext+1,host+1,midsld-2,midsld,midsld+2,endhost-1",
+    _(
+      "1,sniext+1,host+1,midsld-2,midsld,midsld+2,endhost-1 (7-point deep split)",
+    ),
+  );
+  o.value("1", _("1 (Byte 1 after header)"));
+  o.value("2", _("2 (Byte 2)"));
+  o.value("3", _("3 (Byte 3)"));
+  o.depends({ source_type: "desync", desync_preset: "auto" });
   o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "fake_split" });
+  o.depends({ source_type: "desync", desync_preset: "fake_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "multi_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "multi_split" });
+  o.depends({ source_type: "desync", desync_preset: "split" });
+  o.depends({ source_type: "desync", desync_preset: "disorder" });
 
   o = section.taboption(
     "general",
@@ -3752,17 +6878,48 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.placeholder = "4";
+  o.depends({ source_type: "desync", desync_preset: "auto" });
   o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "fake_split" });
+  o.depends({ source_type: "desync", desync_preset: "fake_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "fake" });
 
   o = section.taboption(
     "general",
     form.Value,
     "desync_fake_sni",
-    _("Fake SNI"),
+    _("Fake SNI (Белый список РФ / Custom)"),
+    _(
+      "Decoy hostname injected into fake ClientHello (choose a Russian whitelist domain or enter your own)",
+    ),
   );
   o.modalonly = true;
-  o.placeholder = "www.google.com";
+  o.placeholder = "ya.ru";
+  o.value("", _("Auto (Clone target SNI / Whitelist pool)"));
+  o.value("padencap", _("padencap (max.ru + TLS Padding 1:1 exact length)"));
+  o.value("rndsni", _("rndsni (Random same-length ASCII SNI)"));
+  o.value("ya.ru", "ya.ru (Яндекс — Белый список РФ)");
+  o.value("vk.com", "vk.com (ВКонтакте — Белый список РФ)");
+  o.value("max.ru", "max.ru (MAX — Белый список РФ)");
+  o.value("gosuslugi.ru", "gosuslugi.ru (Госуслуги — Белый список РФ)");
+  o.value("sberbank.ru", "sberbank.ru (Сбербанк — Белый список РФ)");
+  o.value("tbank.ru", "tbank.ru (Т-Банк — Белый список РФ)");
+  o.value("ozon.ru", "ozon.ru (Ozon — Белый список РФ)");
+  o.value("wildberries.ru", "wildberries.ru (Wildberries — Белый список РФ)");
+  o.value("rutube.ru", "rutube.ru (Rutube — Белый список РФ)");
+  o.value("dzen.ru", "dzen.ru (Дзен — Белый список РФ)");
+  o.value("avito.ru", "avito.ru (Авито — Белый список РФ)");
+  o.value("rzd.ru", "rzd.ru (РЖД — Белый список РФ)");
+  o.value("pochta.ru", "pochta.ru (Почта России — Белый список РФ)");
+  o.value("2gis.ru", "2gis.ru (2ГИС — Белый список РФ)");
+  o.value("mail.ru", "mail.ru (Mail.ru — Белый список РФ)");
+  o.value("fonts.google.com", "fonts.google.com (Google Fonts)");
+  o.value("www.google.com", "www.google.com (Google Global)");
+  o.depends({ source_type: "desync", desync_preset: "auto" });
   o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "fake_split" });
+  o.depends({ source_type: "desync", desync_preset: "fake_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "fake" });
 
   o = section.taboption(
     "general",
@@ -3772,7 +6929,11 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.placeholder = "2";
+  o.depends({ source_type: "desync", desync_preset: "auto" });
   o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "fake_split" });
+  o.depends({ source_type: "desync", desync_preset: "fake_disorder" });
+  o.depends({ source_type: "desync", desync_preset: "fake" });
 
   o = section.taboption(
     "general",
@@ -3782,7 +6943,87 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.placeholder = "2";
+  o.depends({ source_type: "desync", desync_preset: "auto" });
   o.depends({ source_type: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "desync_tlsrec_first",
+    _("TLS Record Split Before TCP Desync (tlsrec_first)"),
+    _(
+      "Fragment TLS ClientHello at the record layer before applying TCP split or fake injection.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "fake_split" });
+  o.depends({ source_type: "desync", desync_preset: "fake_disorder" });
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "desync_seqovl",
+    _("TCP Sequence Overlap Bytes (seqovl)"),
+    _("Prepend N decoy bytes via TCP sequence overlap (0 = disabled)."),
+  );
+  o.modalonly = true;
+  o.datatype = "range(0,1400)";
+  o.placeholder = "0";
+  o.depends({ source_type: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "desync_syndata",
+    _("TCP Fast Open SYN Data (syndata)"),
+    _("Attach initial payload to TCP SYN packet when supported by kernel."),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends({ source_type: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "desync_wsize",
+    _("TCP Window Clamp Bytes (wsize)"),
+    _(
+      "Clamp TCP receive window (SO_RCVBUF) during handshake to segment ServerHello (0 = disabled).",
+    ),
+  );
+  o.modalonly = true;
+  o.datatype = "uinteger";
+  o.placeholder = "0";
+  o.depends({ source_type: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "general",
+    form.Flag,
+    "desync_ipfrag",
+    _("L3 IP Fragmentation (ipfrag)"),
+    _("Fragment fake/split packets at IPv4/IPv6 network layer."),
+  );
+  o.modalonly = true;
+  o.default = "0";
+  o.depends({ source_type: "desync", desync_preset: "custom" });
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "desync_udplen",
+    _("UDP Fake Payload Size (udplen)"),
+    _("Custom byte length for UDP fake packets (0 = default)."),
+  );
+  o.modalonly = true;
+  o.datatype = "range(0,1472)";
+  o.placeholder = "0";
+  o.depends({
+    source_type: "desync",
+    desync_preset: "custom",
+    desync_udp_fake: "1",
+  });
 
   o = section.taboption(
     "general",
@@ -3792,7 +7033,9 @@ function createOutboundsContent(section) {
   );
   o.modalonly = true;
   o.default = "1";
+  o.depends({ source_type: "desync", desync_preset: "auto" });
   o.depends({ source_type: "desync", desync_preset: "custom" });
+  o.depends({ source_type: "desync", desync_preset: "discord" });
 
   o = section.taboption(
     "general",
@@ -3804,9 +7047,61 @@ function createOutboundsContent(section) {
   o.placeholder = "4";
   o.depends({
     source_type: "desync",
+    desync_preset: "auto",
+    desync_udp_fake: "1",
+  });
+  o.depends({
+    source_type: "desync",
     desync_preset: "custom",
     desync_udp_fake: "1",
   });
+  o.depends({
+    source_type: "desync",
+    desync_preset: "discord",
+    desync_udp_fake: "1",
+  });
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "desync_udp_fake_payload",
+    _("UDP Fake Payload (HEX)"),
+    _("Custom UDP fake payload. Requires tachyon-core 0.5.9 or newer."),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "0x0001";
+  o.depends({ source_type: "desync", desync_udp_fake: "1" });
+
+  o = section.taboption(
+    "general",
+    form.Value,
+    "desync_udp_out_range",
+    _("UDP Fake Packet Range"),
+    _(
+      "Send UDP fakes before the first N packets or within an inclusive range. Requires tachyon-core 0.5.9 or newer.",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "1-2";
+  o.depends({ source_type: "desync", desync_udp_fake: "1" });
+
+  o = section.taboption(
+    "general",
+    form.ListValue,
+    "desync_udp_keep_socket",
+    _("Keep UDP Socket"),
+    _(
+      "Retain the outbound socket if replies are delayed. Requires tachyon-core 0.5.9 or newer.",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.value("", _("Default"));
+  o.value("1", _("Enabled"));
+  o.value("0", _("Disabled"));
+  o.depends("source_type", "desync");
 
   o = section.taboption(
     "general",
@@ -3818,7 +7113,17 @@ function createOutboundsContent(section) {
   o.placeholder = "3";
   o.depends({
     source_type: "desync",
+    desync_preset: "auto",
+    desync_udp_fake: "1",
+  });
+  o.depends({
+    source_type: "desync",
     desync_preset: "custom",
+    desync_udp_fake: "1",
+  });
+  o.depends({
+    source_type: "desync",
+    desync_preset: "discord",
     desync_udp_fake: "1",
   });
 
@@ -3829,68 +7134,9 @@ function createOutboundsContent(section) {
     _("Desync Strategy String (Fuzzer / CLI)"),
   );
   o.modalonly = true;
-  o.depends("source_type", "desync");
+  o.depends({ source_type: "desync", desync_preset: "custom" });
 
   // ── 11. Advanced & Subscription Options Tab ───────────────────────────────
-  o = section.taboption(
-    "advanced",
-    form.Flag,
-    "subscription_update_enabled",
-    _("Auto-update Subscription"),
-    _("Update this subscription automatically"),
-  );
-  o.modalonly = true;
-  o.default = "1";
-  o.depends("source_type", "subscription");
-
-  o = section.taboption(
-    "advanced",
-    form.Value,
-    "subscription_update_interval",
-    _("Update Interval"),
-    _("Use sing-box duration format like 1d, 12h or 30m"),
-  );
-  o.modalonly = true;
-  o.default = "1h";
-  o.placeholder = "1h";
-  o.depends({
-    source_type: "subscription",
-    subscription_update_enabled: "1",
-  });
-
-  o = section.taboption(
-    "advanced",
-    form.Flag,
-    "download_via_proxy_enabled",
-    _("Download Subscription via Proxy Section"),
-    _("Download subscriptions via the selected section"),
-  );
-  o.modalonly = true;
-  o.default = "0";
-  o.depends("source_type", "subscription");
-
-  o = section.taboption(
-    "advanced",
-    form.ListValue,
-    "download_via_proxy_section",
-    _("Proxy Section for Download"),
-    _("Select a section for downloading this subscription"),
-  );
-  o.modalonly = true;
-  o.depends({
-    source_type: "subscription",
-    download_via_proxy_enabled: "1",
-  });
-  o.load = function (sectionId) {
-    this.keylist = [];
-    this.vallist = [];
-    (uci.sections(UCI_PACKAGE, "section") || []).forEach((s) => {
-      const sid = s[".name"];
-      if (sid) this.value(sid, s.label || s.name || sid);
-    });
-    return uci.get(UCI_PACKAGE, sectionId, "download_via_proxy_section");
-  };
-
   o = section.taboption(
     "advanced",
     form.Flag,
@@ -3912,7 +7158,7 @@ function createOutboundsContent(section) {
     _("Select a common client profile or enter a custom User-Agent"),
   );
   o.modalonly = true;
-  o.value("sing-box", "sing-box (Default)");
+  o.value("tachyon-core", "Tachyon Core (Default)");
   o.value("Happ/3.7.1", "Happ (Happ/3.7.1)");
   o.value("v2rayN/7.12", "v2rayN (v2rayN/7.12)");
   o.value(
@@ -3986,18 +7232,18 @@ function createOutboundsContent(section) {
   o.depends("source_type", "subscription");
 
   [
-    ["device_os", "Device OS (x-device-os)", "Android"],
-    ["ver_os", "OS Version (x-ver-os)", "14"],
-    ["device_model", "Device Model (x-device-model)", "Pixel 8"],
-    ["device_locale", "Device Locale (x-device-locale)", "en-US"],
-    ["app_version", "App Version", "3.7.1"],
-    ["accept_language", "Accept-Language Header", "en-US,en;q=0.9"],
+    ["device_os", _("Device OS (x-device-os)"), "Android"],
+    ["ver_os", _("OS Version (x-ver-os)"), "14"],
+    ["device_model", _("Device Model (x-device-model)"), "Pixel 8"],
+    ["device_locale", _("Device Locale (x-device-locale)"), "en-US"],
+    ["app_version", _("App Version"), "3.7.1"],
+    ["accept_language", _("Accept-Language Header"), "en-US,en;q=0.9"],
   ].forEach(([key, title, ph]) => {
     o = section.taboption(
       "advanced",
       form.Value,
       key,
-      _(title),
+      title,
       _("Leave empty to omit this header"),
     );
     o.modalonly = true;
@@ -4093,7 +7339,7 @@ function createOutboundsContent(section) {
     "tls_fingerprint",
     _("TLS Fingerprint Override (uTLS)"),
     _(
-      "Override the provider's uTLS fingerprint (fp) on imported TLS/REALITY nodes. Useful when Firefox + REALITY + ML-KEM (support-x25519mlkem768) fails verification on sing-box-extended; switching to Chrome resolves it.",
+      "Override the provider's uTLS fingerprint (fp) on imported TLS/REALITY nodes (for example, switching to Chrome if another fingerprint fails verification with REALITY + ML-KEM).",
     ),
   );
   o.modalonly = true;
@@ -4105,9 +7351,82 @@ function createOutboundsContent(section) {
   o.value("ios", "iOS");
   o.value("edge", "Edge");
   o.value("android", "Android");
-  o.value("random", "Random");
-  o.value("randomized", "Randomized");
+  o.value("random", _("Random"));
+  o.value("randomized", _("Randomized"));
   o.depends("source_type", "subscription");
+  o.depends("source_type", "proxy_links");
+
+  o = section.taboption(
+    "advanced",
+    form.ListValue,
+    "tls_fragment_mode",
+    _("ClientHello / TCP Fragmentation"),
+    _(
+      "Split TLS records or TCP segments during handshake on imported TLS/TCP nodes.",
+    ),
+  );
+  o.modalonly = true;
+  o.default = "";
+  o.value("", _("Keep Provider Default"));
+  o.value("tls_record", _("TLS Record Fragmentation (tls.record_fragment)"));
+  o.value("tls_fragment", _("TLS Handshake Fragmentation (tls.fragment)"));
+  o.value("tcp_fragment", _("TCP Segment Fragmentation (tcp_fragment)"));
+  o.depends("source_type", "subscription");
+  o.depends("source_type", "proxy_links");
+
+  o = section.taboption(
+    "advanced",
+    form.Value,
+    "tcp_fragment_length",
+    _("TCP Fragment Length (bytes)"),
+    _("Segment length or range in bytes for TCP fragmentation (e.g. 20-60)."),
+  );
+  o.modalonly = true;
+  o.optional = true;
+  o.placeholder = "20-60";
+  o.depends({ source_type: "subscription", tls_fragment_mode: "tcp_fragment" });
+  o.depends({ source_type: "proxy_links", tls_fragment_mode: "tcp_fragment" });
+  o.validate = function (_section_id, value) {
+    const val = String(value || "").trim();
+    if (!val) return true;
+    if (!/^[0-9]+(-[0-9]+)?$/.test(val)) {
+      return _("Expected a byte count or range (e.g. 20-60)");
+    }
+    const parts = val.split("-");
+    const lo = Number(parts[0]);
+    const hi = parts.length > 1 ? Number(parts[1]) : lo;
+    if (lo < 1 || hi < lo) {
+      return _("Lower bound must be >= 1 and <= upper bound");
+    }
+    return true;
+  };
+
+  o = section.taboption(
+    "advanced",
+    form.Value,
+    "tcp_fragment_delay",
+    _("TCP Fragment Delay"),
+    _("Delay or range between TCP segments (e.g. 0-2ms)."),
+  );
+  o.modalonly = true;
+  o.optional = true;
+  o.placeholder = "0-2ms";
+  o.depends({ source_type: "subscription", tls_fragment_mode: "tcp_fragment" });
+  o.depends({ source_type: "proxy_links", tls_fragment_mode: "tcp_fragment" });
+  o.validate = function (_section_id, value) {
+    const val = String(value || "").trim();
+    if (!val) return true;
+    const m = /^([0-9]+)(?:-([0-9]+))?(ms|s)?$/.exec(val);
+    if (!m) {
+      return _("Expected a duration or range (e.g. 0-2ms)");
+    }
+    const lo = Number(m[1]);
+    const hi = m[2] !== undefined ? Number(m[2]) : lo;
+    if (lo < 0 || hi < lo) {
+      return _("Lower bound must be <= upper bound");
+    }
+    return true;
+  };
 
   o = section.taboption(
     "advanced",
@@ -4163,6 +7482,115 @@ function createOutboundsContent(section) {
       if (sid) this.value(sid, s.label || s.name || sid);
     });
     return uci.get(UCI_PACKAGE, sectionId, "outbound_detour_section");
+  };
+
+  // Outbound Interface (bind_interface) — Issue #320
+  o = section.taboption(
+    "advanced",
+    form.Value,
+    "bind_interface",
+    _("Outbound Interface (bind_interface)"),
+    _(
+      "Optional: bind this connection to a specific network interface (e.g. eth1, wan2, wg0). Leave empty for automatic routing.",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = _("Automatic (default)");
+  o.load = function (sectionId) {
+    this.keylist = [];
+    this.vallist = [];
+    this.value("", _("Automatic (default)"));
+    const seen = new Set(["", "lo", "loopback"]);
+    (uci.sections("network", "interface") || []).forEach((iface) => {
+      const name = String(iface[".name"] || "").trim();
+      const dev = String(iface.device || iface.ifname || "").trim();
+      const candidate = dev && !dev.startsWith("@") ? dev : name;
+      if (candidate && !seen.has(candidate)) {
+        seen.add(candidate);
+        const label =
+          name && dev && name !== dev ? `${candidate} (${name})` : candidate;
+        this.value(candidate, label);
+      }
+    });
+    for (const preset of [
+      "eth0",
+      "eth1",
+      "wan",
+      "pppoe-wan",
+      "wg0",
+      "awg0",
+      "tun0",
+    ]) {
+      if (!seen.has(preset)) {
+        seen.add(preset);
+        this.value(preset, preset);
+      }
+    }
+    return uci.get(UCI_PACKAGE, sectionId, "bind_interface") || "";
+  };
+
+  // Per-Server Outbound Interface Overrides — Issue #339
+  o = section.taboption(
+    "advanced",
+    form.DynamicList,
+    "server_interfaces",
+    _("Per-Server Outbound Interface Overrides"),
+    _(
+      "Bind individual servers inside this subscription or share-link pool to specific network interfaces (format: ServerName=interface, e.g. NL-1=eth1 or DE=wg0). Overrides the default connection interface for matching nodes.",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "ServerName=eth1";
+  o.depends("source_type", "subscription");
+  o.depends("source_type", "proxy_links");
+  o.load = function (sectionId) {
+    this.keylist = [];
+    this.vallist = [];
+    const ifaces = [];
+    const seenIfaces = new Set(["", "lo", "loopback"]);
+    (uci.sections("network", "interface") || []).forEach((iface) => {
+      const name = String(iface[".name"] || "").trim();
+      const dev = String(iface.device || iface.ifname || "").trim();
+      const candidate = dev && !dev.startsWith("@") ? dev : name;
+      if (candidate && !seenIfaces.has(candidate)) {
+        seenIfaces.add(candidate);
+        ifaces.push(candidate);
+      }
+    });
+    for (const preset of ["eth0", "eth1", "wan", "pppoe-wan", "wg0", "awg0"]) {
+      if (!seenIfaces.has(preset)) {
+        seenIfaces.add(preset);
+        ifaces.push(preset);
+      }
+    }
+    const self = this;
+    const currentVals =
+      uci.get(UCI_PACKAGE, sectionId, "server_interfaces") || [];
+    loadGlobalPoolChoices()
+      .then((pool) => {
+        const servers = (pool && pool.servers) || [];
+        const matched = servers.filter(
+          (srv) =>
+            srv &&
+            srv.rawName &&
+            (!srv.sourceIds ||
+              srv.sourceIds.size === 0 ||
+              srv.sourceIds.has(sectionId)),
+        );
+        const listToUse = matched.length > 0 ? matched : servers.slice(0, 30);
+        listToUse.slice(0, 40).forEach((srv) => {
+          const sname = String(srv.rawName || "").trim();
+          if (!sname) return;
+          ifaces.slice(0, 6).forEach((ifc) => {
+            const val = `${sname}=${ifc}`;
+            self.value(val, `${sname} → ${ifc}`);
+          });
+        });
+      })
+      .catch(() => null);
+    return currentVals;
   };
 }
 

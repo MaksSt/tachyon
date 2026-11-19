@@ -5,7 +5,7 @@
 // threshold in a row, switch the tachyon-failover selector to a healthy one,
 // persist the choice and notify Telegram.
 //
-// The runtime switch only works when sing-box was generated with
+// The runtime switch only works when tachyon-core config was generated with
 // section_failover_enabled=1 (the catch-all route then points at the
 // tachyon-failover selector group).
 //
@@ -72,8 +72,7 @@ function candidates() {
             push(proxies, as_string(section[".name"]));
             push(all, as_string(section[".name"]));
         } else if (connections.is_remote_proxy_action(action) ||
-            action == "byedpi" || action == "zapret" || action == "zapret2" ||
-            action == "wdtt" || action == "olcrtc") {
+            action == "wdtt" || action == "csqtt" || action == "desync") {
             push(all, as_string(section[".name"]));
         }
     }
@@ -126,7 +125,17 @@ function clash_delay_ok_url(tag, timeout_ms, probe_url, expected_status) {
     } catch (e) {
         return false;
     }
-    if (object_or_empty(parsed)["delay"] == null)
+    let obj = object_or_empty(parsed);
+    let has_delay = obj["delay"] != null && int(obj["delay"]) > 0;
+    if (!has_delay && obj["error"] == null) {
+        for (let k, v in obj) {
+            if (k != "status" && type(v) == "int" && v > 0) {
+                has_delay = true;
+                break;
+            }
+        }
+    }
+    if (!has_delay)
         return false;
     if (expected_status && expected_status != "") {
         let allowed = split(expected_status, /[[:space:],]+/);
@@ -177,9 +186,14 @@ function switch_group(section_name, outbound_name) {
 
 function send_notification(message) {
     let tcfg = object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
-    if (as_string(tcfg.enabled || "0") != "1" || !tcfg.bot_token || !tcfg.admin_ids)
+    if (as_string(tcfg.enabled || "0") != "1" || !tcfg.bot_token || !tcfg.admin_ids ||
+        as_string(tcfg.notify_failover || "1") == "0")
         return;
-    system(common.background_command(TACHYON_BIN + " telegram send " + shell_quote(message)));
+    if (TACHYON_BIN != "/usr/bin/tachyon" || getenv("TACHYON_FAILOVER_SYNC_NOTIFY") == "1") {
+        command_success_from_args([ TACHYON_BIN, "telegram", "send", as_string(message) ]);
+        return;
+    }
+    command_status(common.background_command(command_from_args([ TACHYON_BIN, "telegram", "send", as_string(message) ])));
 }
 
 function read_section_fail_state() {

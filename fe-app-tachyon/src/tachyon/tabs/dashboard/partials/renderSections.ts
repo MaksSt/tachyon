@@ -3,6 +3,11 @@ import {
   renderCopyIcon24,
   renderLinkIcon24,
   renderInfoIcon24,
+  renderZapIcon,
+  renderAlertTriangleIcon,
+  renderCheckIcon,
+  renderGlobeIcon,
+  renderPinIcon,
 } from '../../../../icons';
 import {
   isCopyableProxyLink,
@@ -11,7 +16,12 @@ import {
   resolvePrefixBadgeStyle,
   svgEl,
 } from '../../../../helpers';
-import { prettyBytes } from '../../../../helpers/prettyBytes';
+import {
+  formatSubscriptionBytes,
+  prettyBytes,
+} from '../../../../helpers/prettyBytes';
+import { showToast } from '../../../../helpers/showToast';
+import { TachyonShellMethods } from '../../../methods/shell';
 import { Tachyon } from '../../../types';
 import { renderFlagEmojis } from './renderFlagEmojis';
 import { formatServiceStatusMessage } from '../../../helpers/formatServiceStatusMessage';
@@ -27,6 +37,397 @@ import {
 
 const gridHoveredSections = new Set<string>();
 const gridFrozenOutboundOrders = new Map<string, string[]>();
+const sectionTableSortState = new Map<
+  string,
+  { col: 'name' | 'source' | 'type' | 'latency'; dir: 'asc' | 'desc' }
+>();
+
+export function clearDashboardGridHoverFreeze(sectionCode?: string): void {
+  if (sectionCode) {
+    gridHoveredSections.delete(sectionCode);
+    gridFrozenOutboundOrders.delete(sectionCode);
+    return;
+  }
+  gridHoveredSections.clear();
+  gridFrozenOutboundOrders.clear();
+}
+
+function getUciHandle(): typeof uci | undefined {
+  return typeof uci !== 'undefined' ? uci : undefined;
+}
+
+function getUiHandle(): typeof ui | undefined {
+  return typeof ui !== 'undefined' ? ui : undefined;
+}
+
+function getSectionServerDomainRulesRaw(sectionName: string): string[] {
+  const uciRef = getUciHandle();
+  if (!uciRef || typeof uciRef.get !== 'function' || !sectionName) return [];
+  const raw = uciRef.get('tachyon', sectionName, 'server_domain_rules');
+  if (Array.isArray(raw)) {
+    return raw.map((v) => String(v || '').trim()).filter(Boolean);
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    return [raw.trim()];
+  }
+  return [];
+}
+
+function collectSectionLeafOutbounds(
+  section?: Tachyon.OutboundGroup,
+): Tachyon.Outbound[] {
+  if (!section || !Array.isArray(section.outbounds)) return [];
+  const byCode = new Map<string, Tachyon.Outbound>();
+  for (const ob of section.outbounds) {
+    if (!ob) continue;
+    if (ob.urlTestInfo?.outbounds?.length) {
+      for (const child of ob.urlTestInfo.outbounds) {
+        if (child?.code && !byCode.has(child.code)) {
+          byCode.set(child.code, child);
+        }
+      }
+    } else if (ob.priorityInfo?.outbounds?.length) {
+      for (const child of ob.priorityInfo.outbounds) {
+        if (child?.code && !byCode.has(child.code)) {
+          byCode.set(child.code, child);
+        }
+      }
+    } else if (ob.code && !byCode.has(ob.code)) {
+      byCode.set(ob.code, ob);
+    }
+  }
+  return Array.from(byCode.values());
+}
+
+function matchesSingleOutboundRuleKey(
+  k: string,
+  outbound: Tachyon.Outbound,
+): boolean {
+  const code = String(outbound.code || '')
+    .trim()
+    .toLowerCase();
+  const disp = String(outbound.displayName || '')
+    .trim()
+    .toLowerCase();
+  const dispWithFlag = ensureOutboundDisplayFlag(outbound).trim().toLowerCase();
+  const pfx = String(outbound.prefix || '')
+    .trim()
+    .toLowerCase();
+  if (k === code) return true;
+  if (pfx) {
+    if (
+      k === `${pfx}: ${disp}` ||
+      k === `${pfx} ${disp}` ||
+      k === `[${pfx}] ${disp}` ||
+      k === `${pfx}: ${dispWithFlag}` ||
+      k === `${pfx} ${dispWithFlag}` ||
+      k === `[${pfx}] ${dispWithFlag}`
+    ) {
+      return true;
+    }
+    if (k.includes(': ') || k.startsWith('[')) {
+      return false;
+    }
+  }
+  return k === disp || k === dispWithFlag;
+}
+
+function matchesServerRuleKey(
+  ruleKey: string,
+  outbound: Tachyon.Outbound,
+  section?: Tachyon.OutboundGroup,
+): boolean {
+  const k = ruleKey.trim().toLowerCase();
+  if (!k) return false;
+  const code = String(outbound.code || '')
+    .trim()
+    .toLowerCase();
+  if (k === code) return true;
+
+  const leaves = collectSectionLeafOutbounds(section);
+  if (leaves.length > 0) {
+    const exactCodeMatch = leaves.find(
+      (leaf) =>
+        String(leaf.code || '')
+          .trim()
+          .toLowerCase() === k,
+    );
+    if (exactCodeMatch) {
+      return (
+        String(exactCodeMatch.code || '')
+          .trim()
+          .toLowerCase() === code
+      );
+    }
+
+    const prefixedMatch = leaves.find((leaf) => {
+      const pfx = String(leaf.prefix || '')
+        .trim()
+        .toLowerCase();
+      if (!pfx) return false;
+      const disp = String(leaf.displayName || '')
+        .trim()
+        .toLowerCase();
+      const dispWithFlag = ensureOutboundDisplayFlag(leaf).trim().toLowerCase();
+      return (
+        k === `${pfx}: ${disp}` ||
+        k === `${pfx} ${disp}` ||
+        k === `[${pfx}] ${disp}` ||
+        k === `${pfx}: ${dispWithFlag}` ||
+        k === `${pfx} ${dispWithFlag}` ||
+        k === `[${pfx}] ${dispWithFlag}`
+      );
+    });
+    if (prefixedMatch) {
+      return (
+        String(prefixedMatch.code || '')
+          .trim()
+          .toLowerCase() === code
+      );
+    }
+
+    if (k.includes(': ') || k.startsWith('[')) {
+      return false;
+    }
+
+    const firstDispMatch = leaves.find((leaf) => {
+      const disp = String(leaf.displayName || '')
+        .trim()
+        .toLowerCase();
+      const dispWithFlag = ensureOutboundDisplayFlag(leaf).trim().toLowerCase();
+      return k === disp || k === dispWithFlag;
+    });
+    if (firstDispMatch) {
+      return (
+        String(firstDispMatch.code || '')
+          .trim()
+          .toLowerCase() === code
+      );
+    }
+    return false;
+  }
+
+  return matchesSingleOutboundRuleKey(k, outbound);
+}
+
+function getPinnedDomainsForOutbound(
+  sectionName: string,
+  outbound: Tachyon.Outbound,
+  section?: Tachyon.OutboundGroup,
+): string[] {
+  const entries = getSectionServerDomainRulesRaw(sectionName);
+  const domains: string[] = [];
+  for (const entry of entries) {
+    const eqIdx = entry.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const srvKey = entry.slice(0, eqIdx).trim();
+    const domPart = entry.slice(eqIdx + 1).trim();
+    if (!matchesServerRuleKey(srvKey, outbound, section)) continue;
+    for (const token of domPart.split(/[\s,;]+/)) {
+      const t = token.trim();
+      if (t && !domains.includes(t)) {
+        domains.push(t);
+      }
+    }
+  }
+  return domains;
+}
+
+function openPinSitesToServerModal(
+  section: Tachyon.OutboundGroup,
+  outbound: Tachyon.Outbound,
+) {
+  const uiRef = getUiHandle();
+  const uciRef = getUciHandle();
+  if (!uiRef || typeof uiRef.showModal !== 'function' || !uciRef) return;
+
+  const isRu =
+    typeof document !== 'undefined' &&
+    (document.documentElement?.lang || '').toLowerCase().startsWith('ru');
+  const t = (ru: string, en: string) => (isRu ? ru : en);
+
+  const existingDomains = getPinnedDomainsForOutbound(
+    section.sectionName,
+    outbound,
+    section,
+  );
+  const textareaEl = E(
+    'textarea',
+    {
+      class: 'cbi-input-textarea',
+      rows: 5,
+      placeholder:
+        '2ip.ru\nchatgpt.com\nnetflix.com\nspotify.com\ncommunity:openai',
+      style:
+        'width: 100%; font-family: monospace; font-size: 13px; padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(148, 163, 184, 0.3); background: rgba(15, 23, 42, 0.35); color: inherit; box-sizing: border-box;',
+    },
+    existingDomains.join('\n'),
+  ) as HTMLTextAreaElement;
+
+  const quickServices = [
+    { key: '2ip.ru', label: '2ip.ru' },
+    { key: 'chatgpt.com', label: 'ChatGPT' },
+    { key: 'claude.ai', label: 'Claude' },
+    { key: 'gemini.google.com', label: 'Gemini' },
+    { key: 'netflix.com', label: 'Netflix' },
+    { key: 'spotify.com', label: 'Spotify' },
+    { key: 'youtube.com', label: 'YouTube' },
+    { key: 'instagram.com', label: 'Instagram' },
+  ];
+
+  const chipsWrap = E(
+    'div',
+    {
+      style: 'display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;',
+    },
+    quickServices.map((item) =>
+      E(
+        'button',
+        {
+          type: 'button',
+          class: 'cbi-button',
+          style:
+            'padding: 2px 9px; font-size: 11px; border-radius: 999px; line-height: 1.5;',
+          click: (ev: MouseEvent) => {
+            ev.preventDefault();
+            const current = textareaEl.value
+              .split(/[\s,;]+/)
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (!current.includes(item.key)) {
+              current.push(item.key);
+              textareaEl.value = current.join('\n');
+            }
+          },
+        },
+        `+ ${item.label}`,
+      ),
+    ),
+  );
+
+  const modalServerTitle = outbound.prefix
+    ? `[${outbound.prefix}] ${outbound.displayName}`
+    : outbound.displayName;
+
+  const saveRule = async (domainsText: string) => {
+    const tokens = domainsText
+      .split(/[\s,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const uniqueTokens = Array.from(new Set(tokens));
+    const allEntries = getSectionServerDomainRulesRaw(section.sectionName);
+    const otherEntries = allEntries.filter((entry) => {
+      const eqIdx = entry.indexOf('=');
+      if (eqIdx <= 0) return true;
+      const srvKey = entry.slice(0, eqIdx).trim();
+      return !matchesServerRuleKey(srvKey, outbound, section);
+    });
+
+    if (uniqueTokens.length > 0) {
+      otherEntries.push(`${outbound.code}=${uniqueTokens.join(', ')}`);
+    }
+
+    if (otherEntries.length > 0) {
+      uciRef.set(
+        'tachyon',
+        section.sectionName,
+        'server_domain_rules',
+        otherEntries,
+      );
+    } else {
+      uciRef.unset?.('tachyon', section.sectionName, 'server_domain_rules');
+    }
+
+    const condRefs = uciRef.get(
+      'tachyon',
+      section.sectionName,
+      'condition_refs',
+    );
+    if (Array.isArray(condRefs) && condRefs.length === 1 && condRefs[0]) {
+      if (otherEntries.length > 0) {
+        uciRef.set('tachyon', condRefs[0], 'server_domain_rules', otherEntries);
+      } else {
+        uciRef.unset?.('tachyon', condRefs[0], 'server_domain_rules');
+      }
+    }
+
+    await uciRef.save();
+    uiRef.hideModal();
+    showToast(
+      uniqueTokens.length > 0
+        ? t(
+            `Привязано сайтов к серверу «${modalServerTitle}»: ${uniqueTokens.length}. Применяем маршрут...`,
+            `Pinned ${uniqueTokens.length} site(s) to server "${modalServerTitle}". Applying route...`,
+          )
+        : t(
+            `Привязка сайтов для сервера «${modalServerTitle}» очищена.`,
+            `Cleared pinned sites for "${modalServerTitle}".`,
+          ),
+      'success',
+    );
+    TachyonShellMethods.serviceActionStart('reload').catch(() => {});
+  };
+
+  uiRef.showModal(
+    t(
+      `Привязка сайтов к серверу: ${modalServerTitle}`,
+      `Pin Sites to Server: ${modalServerTitle}`,
+    ),
+    [
+      E(
+        'p',
+        { style: 'margin: 0 0 10px 0; font-size: 13px; opacity: 0.85;' },
+        t(
+          'Укажите домены или сайты (по одному в строке или через запятую), которые всегда должны идти строго через этот сервер в обход общего балансировщика секции:',
+          'Enter domains or sites (one per line or comma-separated) that should always route directly through this specific server, bypassing the section balancer:',
+        ),
+      ),
+      textareaEl,
+      chipsWrap,
+      E(
+        'div',
+        {
+          class: 'right',
+          style:
+            'margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px;',
+        },
+        [
+          ...(existingDomains.length > 0
+            ? [
+                E(
+                  'button',
+                  {
+                    type: 'button',
+                    class: 'btn cbi-button-reset',
+                    click: () => saveRule(''),
+                  },
+                  t('Очистить привязку', 'Clear Pin'),
+                ),
+              ]
+            : []),
+          E(
+            'button',
+            {
+              type: 'button',
+              class: 'btn',
+              click: () => uiRef.hideModal(),
+            },
+            t('Отмена', 'Cancel'),
+          ),
+          E(
+            'button',
+            {
+              type: 'button',
+              class: 'btn cbi-button-action important',
+              click: () => saveRule(textareaEl.value),
+            },
+            t('Сохранить и применить', 'Save & Apply'),
+          ),
+        ],
+      ),
+    ],
+  );
+}
 
 interface IRenderSectionsProps {
   loading: boolean;
@@ -65,6 +466,17 @@ interface IRenderSectionsProps {
   selectorSwitchingTag?: string;
   onTestSingleOutbound?: (sectionName: string, outboundCode: string) => void;
   testingOutboundCodes?: Record<string, boolean>;
+  sectionStats?: {
+    conns: number;
+    download: number;
+    upload: number;
+    downSpeed: number;
+    upSpeed: number;
+  };
+  hideSectionHeader?: boolean;
+  nodesViewMode?: 'table' | 'tiles';
+  onChangeNodesViewMode?: (mode: 'table' | 'tiles') => void;
+  showHidden?: boolean;
 }
 
 const CONNECTION_ACTION_LABELS: Record<string, string> = {
@@ -81,10 +493,22 @@ const CONNECTION_ACTION_LABELS: Record<string, string> = {
   tewfai: 'TewFai',
   trusttunnel: 'TrustTunnel',
   shadowtls: 'ShadowTLS',
+  csqtt: 'CSQTT / WDTT',
   desync: 'Native Desync',
   fptn: 'FPTN',
   vpn: 'VPN',
 };
+
+function renderHiddenBadge() {
+  return E(
+    'span',
+    {
+      class: 'tachyon_dashboard-page__outbound-grid__item__hidden-badge',
+      title: _('Hidden on Dashboard while remaining active in routing'),
+    },
+    _('Hidden'),
+  );
+}
 
 function renderFailedState() {
   return E(
@@ -114,7 +538,7 @@ function formatBytes(value?: number) {
     return undefined;
   }
 
-  return prettyBytes(value);
+  return formatSubscriptionBytes(value);
 }
 
 function formatDate(seconds?: number) {
@@ -138,7 +562,11 @@ function formatDate(seconds?: number) {
   });
 }
 
-function renderMetadataAction(label: string, url?: string) {
+function renderMetadataAction(
+  label: string,
+  url?: string,
+  shortLabel?: string,
+) {
   if (!isValidHttpUrl(url)) {
     return undefined;
   }
@@ -153,8 +581,41 @@ function renderMetadataAction(label: string, url?: string) {
       title: label,
       'aria-label': label,
     },
-    renderLinkIcon24(),
+    shortLabel
+      ? [
+          renderLinkIcon24(),
+          E(
+            'span',
+            {
+              class: 'tachyon_dashboard-page__subscription-meta__action-label',
+            },
+            shortLabel,
+          ),
+        ]
+      : renderLinkIcon24(),
   );
+}
+
+function formatDateTime(seconds?: number) {
+  if (
+    typeof seconds !== 'number' ||
+    !Number.isFinite(seconds) ||
+    seconds <= 0
+  ) {
+    return undefined;
+  }
+
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return undefined;
+  }
+
+  return date.toLocaleString(undefined, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 function renderSubscriptionMetadata(
@@ -164,10 +625,12 @@ function renderSubscriptionMetadata(
     selectedOutbound?: Tachyon.Outbound;
     isGroupCollapsed?: boolean;
     onToggleGroup?: () => void;
+    onUpdateSubscription?: () => void;
+    subscriptionUpdating?: boolean;
   },
 ) {
   if (!metadata || Object.keys(metadata).length <= 1) {
-    if (!options?.onToggleGroup) {
+    if (!options?.onToggleGroup && !options?.onUpdateSubscription) {
       return undefined;
     }
   }
@@ -180,22 +643,125 @@ function renderSubscriptionMetadata(
     : formatBytes(traffic?.total) || '0 B';
   const expire = formatDate(metadata?.expire);
   const refillDate = formatDate(metadata?.refillDate);
+  const updatedAt = formatDateTime(metadata?.updatedAt);
+
+  const isRu =
+    typeof document !== 'undefined' &&
+    (document.documentElement?.lang || '').toLowerCase().startsWith('ru');
 
   const rows = [
     traffic
       ? {
+          kind: 'traffic' as const,
           label: _('Traffic'),
           value: `${used} / ${total}`,
+          percent:
+            !traffic.isUnlimited &&
+            typeof traffic.used === 'number' &&
+            typeof traffic.total === 'number' &&
+            traffic.total > 0
+              ? Math.min(100, Math.max(0, (traffic.used / traffic.total) * 100))
+              : undefined,
         }
       : undefined,
-    expire ? { label: _('Expires'), value: expire } : undefined,
-    refillDate ? { label: _('Refill'), value: refillDate } : undefined,
-  ].filter(Boolean) as { label: string; value: string }[];
+    expire
+      ? { kind: 'expire' as const, label: _('Expires'), value: expire }
+      : undefined,
+    refillDate
+      ? { kind: 'refill' as const, label: _('Refill'), value: refillDate }
+      : undefined,
+    updatedAt
+      ? {
+          kind: 'updated' as const,
+          label: isRu ? 'Обновлено' : _('Updated'),
+          value: updatedAt,
+        }
+      : undefined,
+  ].filter(Boolean) as {
+    kind: 'traffic' | 'expire' | 'refill' | 'updated';
+    label: string;
+    value: string;
+    percent?: number;
+  }[];
+
+  const updateBtn = options?.onUpdateSubscription
+    ? E(
+        'button',
+        {
+          type: 'button',
+          class: 'btn tachyon_dashboard-page__subscription-meta__action',
+          title: _('Update subscriptions'),
+          'aria-label': _('Update subscriptions'),
+          disabled: options.subscriptionUpdating ? true : undefined,
+          click: (event: MouseEvent) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!options.subscriptionUpdating) {
+              options.onUpdateSubscription?.();
+            }
+          },
+        },
+        options.subscriptionUpdating
+          ? [
+              renderLoaderCircleIcon24(),
+              E(
+                'span',
+                {
+                  class:
+                    'tachyon_dashboard-page__subscription-meta__action-label',
+                },
+                isRu ? 'Обновление...' : _('Updating...'),
+              ),
+            ]
+          : [
+              svgEl(
+                'svg',
+                {
+                  width: '14',
+                  height: '14',
+                  viewBox: '0 0 24 24',
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  'stroke-width': '2',
+                  'stroke-linecap': 'round',
+                  'stroke-linejoin': 'round',
+                },
+                [
+                  svgEl('path', {
+                    d: 'M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8',
+                  }),
+                  svgEl('polyline', { points: '21 3 21 8 16 8' }),
+                ],
+              ),
+              E(
+                'span',
+                {
+                  class:
+                    'tachyon_dashboard-page__subscription-meta__action-label',
+                },
+                isRu ? 'Обновить' : _('Update'),
+              ),
+            ],
+      )
+    : undefined;
 
   const actions = [
-    renderMetadataAction('Profile', metadata?.webPageUrl),
-    renderMetadataAction('Support', metadata?.supportUrl),
-    renderMetadataAction('More details', metadata?.announceUrl),
+    updateBtn,
+    renderMetadataAction(
+      _('Profile'),
+      metadata?.webPageUrl,
+      isRu ? 'Кабинет' : 'Profile',
+    ),
+    renderMetadataAction(
+      _('Support'),
+      metadata?.supportUrl,
+      isRu ? 'Поддержка' : 'Support',
+    ),
+    renderMetadataAction(
+      _('More details'),
+      metadata?.announceUrl,
+      isRu ? 'Инфо' : 'Info',
+    ),
   ].filter(Boolean) as HTMLElement[];
 
   const isToggleable = Boolean(options?.onToggleGroup);
@@ -229,99 +795,201 @@ function renderSubscriptionMetadata(
     },
     [
       E('div', { class: 'tachyon_dashboard-page__subscription-meta__main' }, [
-        ...(isToggleable
-          ? [
-              svgEl(
-                'svg',
-                {
-                  width: '15',
-                  height: '15',
-                  viewBox: '0 0 24 24',
-                  fill: 'none',
-                  stroke: 'currentColor',
-                  'stroke-width': '2',
-                  'stroke-linecap': 'round',
-                  'stroke-linejoin': 'round',
-                  style: `flex-shrink: 0; transition: transform 0.2s; transform: rotate(${isGroupCollapsed ? '-90deg' : '0deg'})`,
-                },
-                [svgEl('polyline', { points: '6 9 12 15 18 9' })],
-              ),
-            ]
-          : []),
         E(
           'div',
-          { class: 'tachyon_dashboard-page__subscription-meta__heading' },
-          _('Subscription info:'),
-        ),
-        title
-          ? E(
+          { class: 'tachyon_dashboard-page__subscription-meta__header-row' },
+          [
+            E(
               'div',
-              { class: 'tachyon_dashboard-page__subscription-meta__title' },
-              title,
-            )
-          : '',
-        typeof options?.groupCount === 'number'
-          ? E(
-              'span',
               {
-                class: 'tachyon_dashboard-page__source-group__count',
+                class: 'tachyon_dashboard-page__subscription-meta__title-group',
               },
-              `${options.groupCount}`,
-            )
-          : '',
-        isGroupCollapsed && options?.selectedOutbound
-          ? E(
-              'span',
-              {
-                class: 'tachyon_dashboard-page__source-group__active-badge',
-              },
-              `● ${options.selectedOutbound.displayName}`,
-            )
-          : '',
-        rows.length
-          ? E(
-              'div',
-              { class: 'tachyon_dashboard-page__subscription-meta__facts' },
-              rows.map((row) =>
-                E(
+              [
+                ...(isToggleable
+                  ? [
+                      svgEl(
+                        'svg',
+                        {
+                          width: '15',
+                          height: '15',
+                          viewBox: '0 0 24 24',
+                          fill: 'none',
+                          stroke: 'currentColor',
+                          'stroke-width': '2',
+                          'stroke-linecap': 'round',
+                          'stroke-linejoin': 'round',
+                          style: `flex-shrink: 0; transition: transform 0.2s; transform: rotate(${isGroupCollapsed ? '-90deg' : '0deg'})`,
+                        },
+                        [svgEl('polyline', { points: '6 9 12 15 18 9' })],
+                      ),
+                    ]
+                  : []),
+                title
+                  ? E(
+                      'div',
+                      {
+                        class:
+                          'tachyon_dashboard-page__subscription-meta__title',
+                      },
+                      renderFlagEmojis(title),
+                    )
+                  : E(
+                      'div',
+                      {
+                        class:
+                          'tachyon_dashboard-page__subscription-meta__heading',
+                      },
+                      _('Subscription'),
+                    ),
+                metadata?.hidden ? renderHiddenBadge() : '',
+                typeof options?.groupCount === 'number'
+                  ? E(
+                      'span',
+                      {
+                        class: 'tachyon_dashboard-page__source-group__count',
+                      },
+                      `${options.groupCount}`,
+                    )
+                  : '',
+                isGroupCollapsed && options?.selectedOutbound
+                  ? E(
+                      'span',
+                      {
+                        class:
+                          'tachyon_dashboard-page__source-group__active-badge',
+                      },
+                      `● ${options.selectedOutbound.displayName}`,
+                    )
+                  : '',
+              ],
+            ),
+            rows.length
+              ? E(
                   'div',
-                  { class: 'tachyon_dashboard-page__subscription-meta__fact' },
-                  [
+                  { class: 'tachyon_dashboard-page__subscription-meta__facts' },
+                  rows.map((row) =>
                     E(
-                      'span',
+                      'div',
                       {
-                        class:
-                          'tachyon_dashboard-page__subscription-meta__fact-key',
+                        class: `tachyon_dashboard-page__subscription-meta__fact tachyon_dashboard-page__subscription-meta__fact--${row.kind}`,
                       },
-                      row.label,
+                      [
+                        E(
+                          'div',
+                          {
+                            class:
+                              'tachyon_dashboard-page__subscription-meta__fact-top',
+                          },
+                          [
+                            E(
+                              'span',
+                              {
+                                class:
+                                  'tachyon_dashboard-page__subscription-meta__fact-key',
+                              },
+                              row.label,
+                            ),
+                            E(
+                              'span',
+                              {
+                                class:
+                                  'tachyon_dashboard-page__subscription-meta__fact-value',
+                              },
+                              row.value,
+                            ),
+                          ],
+                        ),
+                        ...(typeof row.percent === 'number'
+                          ? [
+                              E(
+                                'div',
+                                {
+                                  class:
+                                    'tachyon_dashboard-page__subscription-meta__progress',
+                                },
+                                [
+                                  E('div', {
+                                    class:
+                                      'tachyon_dashboard-page__subscription-meta__progress-bar',
+                                    style: `width: ${row.percent.toFixed(1)}%;`,
+                                  }),
+                                ],
+                              ),
+                            ]
+                          : []),
+                      ],
                     ),
-                    E(
-                      'span',
-                      {
-                        class:
-                          'tachyon_dashboard-page__subscription-meta__fact-value',
-                      },
-                      row.value,
-                    ),
-                  ],
-                ),
-              ),
-            )
-          : '',
-        actions.length
-          ? E(
-              'div',
-              { class: 'tachyon_dashboard-page__subscription-meta__actions' },
-              actions,
-            )
-          : '',
+                  ),
+                )
+              : '',
+            actions.length
+              ? E(
+                  'div',
+                  {
+                    class: 'tachyon_dashboard-page__subscription-meta__actions',
+                  },
+                  actions,
+                )
+              : '',
+          ],
+        ),
       ]),
       !isGroupCollapsed && metadata?.announce
-        ? E(
-            'blockquote',
-            { class: 'tachyon_dashboard-page__subscription-meta__announce' },
-            metadata.announce,
-          )
+        ? (() => {
+            const rawAnnounce = String(metadata.announce || '').trim();
+            const lines = rawAnnounce
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean);
+            const firstLine = lines[0] || rawAnnounce;
+            const isCollapsible = lines.length > 1 || rawAnnounce.length > 110;
+            const previewText =
+              firstLine.length > 110
+                ? `${firstLine.slice(0, 110)}…`
+                : lines.length > 1
+                  ? `${firstLine} …`
+                  : firstLine;
+            let expanded = false;
+            const textSpan = E(
+              'span',
+              { style: 'white-space: pre-line;' },
+              isCollapsible ? previewText : rawAnnounce,
+            );
+            const toggleHint = isCollapsible
+              ? E(
+                  'span',
+                  {
+                    style:
+                      'margin-left: 6px; font-size: 11px; color: var(--tachyon-accent-text, var(--tachyon-accent, #3b82f6)); font-weight: 500; cursor: pointer; white-space: nowrap;',
+                  },
+                  _('Show more'),
+                )
+              : '';
+            const block = E(
+              'blockquote',
+              {
+                class: 'tachyon_dashboard-page__subscription-meta__announce',
+                style: isCollapsible ? 'cursor: pointer;' : '',
+                title: isCollapsible ? rawAnnounce : undefined,
+                click: isCollapsible
+                  ? (ev: MouseEvent) => {
+                      ev.stopPropagation();
+                      expanded = !expanded;
+                      textSpan.textContent = expanded
+                        ? rawAnnounce
+                        : previewText;
+                      if (toggleHint && typeof toggleHint === 'object') {
+                        (toggleHint as HTMLElement).textContent = expanded
+                          ? _('Hide')
+                          : _('Show more');
+                      }
+                    }
+                  : undefined,
+              },
+              [textSpan, toggleHint],
+            );
+            return block;
+          })()
         : '',
     ],
   );
@@ -424,9 +1092,9 @@ function renderCountryChips(
       : undefined;
 
   const activeFilterSummary = activeCountryGroup
-    ? `${activeCountryGroup.countryFlag || '🌐'} ${activeCountryGroup.countryName || activeCountryGroup.countryCode}`
+    ? `${activeCountryGroup.countryFlag ? `${activeCountryGroup.countryFlag} ` : ''}${activeCountryGroup.countryName || activeCountryGroup.countryCode}`
     : activeRegionMeta
-      ? `${activeRegionMeta.flag} ${activeRegionMeta.label}`
+      ? `${activeRegionMeta.flag ? `${activeRegionMeta.flag} ` : ''}${activeRegionMeta.label}`
       : '';
 
   const container = E('div', {
@@ -509,7 +1177,16 @@ function renderCountryChips(
           },
         },
         [
-          E('span', { class: 'tachyon_dashboard-page__flag-emoji' }, reg.flag),
+          E(
+            'span',
+            {
+              class: 'tachyon_dashboard-page__flag-emoji',
+              style: reg.flag
+                ? undefined
+                : 'display: inline-flex; align-items: center;',
+            },
+            reg.flag || [renderGlobeIcon(12)],
+          ),
           E(
             'span',
             { class: 'tachyon_dashboard-page__region-tab__name' },
@@ -563,8 +1240,9 @@ function renderCountryChips(
         {
           class:
             'tachyon_dashboard-page__country-chip__flag tachyon_dashboard-page__flag-emoji',
+          style: 'display: inline-flex; align-items: center;',
         },
-        '🌐',
+        [renderGlobeIcon(12)],
       ),
       E(
         'span',
@@ -621,8 +1299,11 @@ function renderCountryChips(
           {
             class:
               'tachyon_dashboard-page__country-chip__flag tachyon_dashboard-page__flag-emoji',
+            style: group.countryFlag
+              ? undefined
+              : 'display: inline-flex; align-items: center;',
           },
-          group.countryFlag || '🌐',
+          group.countryFlag || [renderGlobeIcon(12)],
         ),
         E(
           'span',
@@ -956,6 +1637,10 @@ function renderDefaultState({
   onFilterCountry,
   activeRegionFilter,
   onFilterRegion,
+  sectionStats,
+  hideSectionHeader,
+  nodesViewMode,
+  showHidden = false,
 }: IRenderSectionsProps) {
   const isConnectionNode =
     !section.withTagSelect &&
@@ -974,35 +1659,16 @@ function renderDefaultState({
       'tewfai',
       'trusttunnel',
       'shadowtls',
+      'csqtt',
     ].includes(section.action || '');
   const isServiceNode =
-    ['zapret', 'zapret2', 'byedpi', 'desync', 'wdtt', 'olcrtc'].includes(
-      section.action || '',
-    ) || Boolean(section.serviceStatus);
+    section.action === 'desync' || Boolean(section.serviceStatus);
 
   if (isServiceNode) {
     const ss = section.serviceStatus;
     const serviceType =
-      ss?.serviceType ||
-      (['zapret', 'zapret2', 'byedpi', 'desync', 'wdtt', 'olcrtc'].includes(
-        section.action || '',
-      )
-        ? (section.action as Tachyon.ServiceStatus['serviceType'])
-        : 'zapret');
-    const typeLabel =
-      serviceType === 'zapret'
-        ? 'Zapret'
-        : serviceType === 'zapret2'
-          ? 'Zapret2'
-          : serviceType === 'byedpi'
-            ? 'ByeDPI'
-            : serviceType === 'wdtt'
-              ? 'WDTT'
-              : serviceType === 'olcrtc'
-                ? 'OlcRTC'
-                : serviceType === 'desync'
-                  ? _('Native Desync')
-                  : 'FPTN';
+      ss?.serviceType || (section.action === 'desync' ? 'desync' : 'fptn');
+    const typeLabel = serviceType === 'desync' ? _('Native Desync') : 'FPTN';
     const statusColor = ss
       ? ss.ready
         ? 'var(--success-color-medium, green)'
@@ -1035,35 +1701,40 @@ function renderDefaultState({
           .join(' '),
       },
       [
-        E(
-          'div',
-          {
-            class: 'tachyon_dashboard-page__outbound-section__title-section',
-            style: 'cursor: default;',
-          },
-          [
-            E(
-              'div',
-              {
-                class:
-                  'tachyon_dashboard-page__outbound-section__title-section__title',
-                style: 'display: flex; align-items: center; gap: 8px;',
-              },
-              [
-                E('span', {}, section.displayName),
-                renderConfigErrorBadge(section),
-                E(
-                  'span',
-                  {
-                    style:
-                      'font-size: 12px; opacity: 0.6; font-weight: normal;',
-                  },
-                  typeLabel,
-                ),
-              ],
-            ),
-          ],
-        ),
+        ...(hideSectionHeader
+          ? []
+          : [
+              E(
+                'div',
+                {
+                  class:
+                    'tachyon_dashboard-page__outbound-section__title-section',
+                  style: 'cursor: default;',
+                },
+                [
+                  E(
+                    'div',
+                    {
+                      class:
+                        'tachyon_dashboard-page__outbound-section__title-section__title',
+                      style: 'display: flex; align-items: center; gap: 8px;',
+                    },
+                    [
+                      E('span', {}, section.displayName),
+                      renderConfigErrorBadge(section),
+                      E(
+                        'span',
+                        {
+                          style:
+                            'font-size: 12px; opacity: 0.6; font-weight: normal;',
+                        },
+                        typeLabel,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ]),
         renderConfigErrorBanner(section),
         E(
           'div',
@@ -1177,7 +1848,7 @@ function renderDefaultState({
       }
 
       if (!outbound.latency) {
-        // Service nodes (desync, zapret2, …) have no measurable latency;
+        // Service nodes (desync, fptn, …) have no measurable latency;
         // colour the badge green when bypass is active, red when stopped.
         if (isServiceNode) {
           return section.serviceStatus?.ready
@@ -1238,6 +1909,9 @@ function renderDefaultState({
         : '',
       outboundSwitching
         ? 'tachyon_dashboard-page__outbound-grid__item--switching'
+        : '',
+      outbound.hidden
+        ? 'tachyon_dashboard-page__outbound-grid__item--hidden'
         : '',
     ]
       .filter(Boolean)
@@ -1369,6 +2043,10 @@ function renderDefaultState({
     const outboundDisplayTitle = isAutoGroup
       ? outbound.displayName
       : ensureOutboundDisplayFlag(outbound);
+    const pinnedDomains =
+      !isAutoGroup && !isServiceNode && !isConnectionNode
+        ? getPinnedDomainsForOutbound(section.sectionName, outbound, section)
+        : [];
 
     return E(
       'div',
@@ -1434,19 +2112,80 @@ function renderDefaultState({
                           class:
                             'tachyon_dashboard-page__outbound-grid__item__selected-badge',
                         },
-                        typeof document !== 'undefined' &&
+                        [
+                          renderCheckIcon(10),
+                          typeof document !== 'undefined' &&
                           (document.documentElement?.lang || '')
                             .toLowerCase()
                             .startsWith('ru')
-                          ? '✓ Активен'
-                          : typeof _ === 'function'
-                            ? _('✓ Active')
-                            : '✓ Active',
+                            ? 'Активен'
+                            : typeof _ === 'function'
+                              ? _('Active')
+                              : 'Active',
+                        ],
+                      ),
+                    ]
+                  : []),
+                ...(outbound.hidden ? [renderHiddenBadge()] : []),
+                ...(pinnedDomains.length > 0
+                  ? [
+                      E(
+                        'span',
+                        {
+                          class:
+                            'tachyon_dashboard-page__outbound-grid__item__prefix-badge',
+                          style:
+                            'background: rgba(56, 189, 248, 0.14); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 3px;',
+                          title: pinnedDomains.join(', '),
+                          click: (event: MouseEvent) => {
+                            event.stopPropagation();
+                            openPinSitesToServerModal(section, outbound);
+                          },
+                        },
+                        [
+                          renderPinIcon(10),
+                          E(
+                            'span',
+                            {},
+                            `${pinnedDomains.slice(0, 2).join(', ')}${pinnedDomains.length > 2 ? ` +${pinnedDomains.length - 2}` : ''}`,
+                          ),
+                        ],
                       ),
                     ]
                   : []),
               ],
             ),
+            ...(!isAutoGroup && !isServiceNode && !isConnectionNode
+              ? [
+                  E(
+                    'button',
+                    {
+                      type: 'button',
+                      class:
+                        'btn tachyon_dashboard-page__outbound-grid__item__copy-button',
+                      title:
+                        pinnedDomains.length > 0
+                          ? pinnedDomains.join(', ')
+                          : typeof document !== 'undefined' &&
+                              (document.documentElement?.lang || '')
+                                .toLowerCase()
+                                .startsWith('ru')
+                            ? 'Привязать отдельные сайты к этому серверу'
+                            : 'Pin specific sites to this server',
+                      'aria-label': 'Pin sites to server',
+                      style:
+                        pinnedDomains.length > 0
+                          ? 'color: #38bdf8;'
+                          : undefined,
+                      click: (event: MouseEvent) => {
+                        event.stopPropagation();
+                        openPinSitesToServerModal(section, outbound);
+                      },
+                    },
+                    renderGlobeIcon(16),
+                  ),
+                ]
+              : []),
             ...(canCopyLink
               ? [
                   E(
@@ -1585,6 +2324,402 @@ function renderDefaultState({
     );
   }
 
+  function renderServersTable(servers: Tachyon.Outbound[]): HTMLElement {
+    const isRu =
+      typeof document !== 'undefined' &&
+      (document.documentElement?.lang || '').toLowerCase().startsWith('ru');
+    const sortKey = section.code || section.sectionName || 'default';
+    const tbody = E('tbody', {});
+    const colBtns = new Map<
+      'name' | 'source' | 'type' | 'latency',
+      HTMLElement
+    >();
+
+    const updateHeaderIndicators = () => {
+      const current = sectionTableSortState.get(sortKey);
+      colBtns.forEach((spanEl, col) => {
+        if (current && current.col === col) {
+          spanEl.textContent = current.dir === 'asc' ? ' ↑' : ' ↓';
+          spanEl.style.opacity = '1';
+        } else {
+          spanEl.textContent = ' ↕';
+          spanEl.style.opacity = '0.4';
+        }
+      });
+    };
+
+    const renderTableRow = (outbound: Tachyon.Outbound): HTMLElement => {
+      const isTestingSingle = Boolean(
+        testingOutboundCodes && testingOutboundCodes[outbound.code],
+      );
+      const canCopyLink =
+        Boolean(outbound.canCopyLink) || isCopyableProxyLink(outbound.link);
+      const selectorSwitching = Boolean(selectorSwitchingTag);
+      const canChooseOutbound =
+        section.withTagSelect &&
+        outbound.runtimeAvailable !== false &&
+        !selectorSwitching &&
+        !outbound.selected;
+      const outboundDisplayTitle = ensureOutboundDisplayFlag(outbound);
+      const prefixStyle = outbound.prefix
+        ? resolvePrefixBadgeStyle(outbound.prefix)
+        : undefined;
+      const pinnedDomains = getPinnedDomainsForOutbound(
+        section.sectionName,
+        outbound,
+        section,
+      );
+
+      const getLatencyClass = () => {
+        if (!outbound.latency) {
+          return 'tachyon_dashboard-page__outbound-grid__item__latency tachyon_dashboard-page__outbound-grid__item__latency--empty';
+        }
+        if (outbound.latency === -1 || outbound.latency < 0) {
+          return 'tachyon_dashboard-page__outbound-grid__item__latency tachyon_dashboard-page__outbound-grid__item__latency--red';
+        }
+        if (outbound.latency < 800) {
+          return 'tachyon_dashboard-page__outbound-grid__item__latency tachyon_dashboard-page__outbound-grid__item__latency--green';
+        }
+        if (outbound.latency < 1500) {
+          return 'tachyon_dashboard-page__outbound-grid__item__latency tachyon_dashboard-page__outbound-grid__item__latency--yellow';
+        }
+        return 'tachyon_dashboard-page__outbound-grid__item__latency tachyon_dashboard-page__outbound-grid__item__latency--red';
+      };
+
+      return E(
+        'tr',
+        {
+          class: [
+            'tachyon-dashboard-nodes-table__row',
+            outbound.selected ? 'is-selected' : '',
+            canChooseOutbound ? 'is-selectable' : '',
+            outbound.hidden ? 'is-dashboard-hidden' : '',
+          ]
+            .filter(Boolean)
+            .join(' '),
+          click: () => {
+            if (!canChooseOutbound) return;
+            onChooseOutbound(section.sectionName, section.code, outbound.code);
+          },
+        },
+        [
+          E('td', { class: 'tachyon-dashboard-nodes-table__cell--name' }, [
+            E('div', { class: 'tachyon-dashboard-nodes-table__name-wrap' }, [
+              ...(section.withTagSelect
+                ? [
+                    E('span', {
+                      class: `tachyon-dashboard-nodes-table__radio ${
+                        outbound.selected ? 'is-selected' : ''
+                      }`,
+                    }),
+                  ]
+                : []),
+              E(
+                'span',
+                { class: 'tachyon-dashboard-nodes-table__name-text' },
+                renderFlagEmojis(outboundDisplayTitle),
+              ),
+              ...(outbound.selected
+                ? [
+                    E(
+                      'span',
+                      {
+                        class:
+                          'tachyon_dashboard-page__outbound-grid__item__selected-badge',
+                      },
+                      [
+                        renderCheckIcon(10),
+                        isRu
+                          ? 'Активен'
+                          : typeof _ === 'function'
+                            ? _('Active')
+                            : 'Active',
+                      ],
+                    ),
+                  ]
+                : []),
+              ...(outbound.hidden ? [renderHiddenBadge()] : []),
+              ...(pinnedDomains.length > 0
+                ? [
+                    E(
+                      'span',
+                      {
+                        class:
+                          'tachyon_dashboard-page__outbound-grid__item__prefix-badge',
+                        style:
+                          'background: rgba(56, 189, 248, 0.14); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 3px;',
+                        title: pinnedDomains.join(', '),
+                        click: (event: MouseEvent) => {
+                          event.stopPropagation();
+                          openPinSitesToServerModal(section, outbound);
+                        },
+                      },
+                      [
+                        renderPinIcon(10),
+                        E(
+                          'span',
+                          {},
+                          `${pinnedDomains.slice(0, 2).join(', ')}${
+                            pinnedDomains.length > 2
+                              ? ` +${pinnedDomains.length - 2}`
+                              : ''
+                          }`,
+                        ),
+                      ],
+                    ),
+                  ]
+                : []),
+            ]),
+          ]),
+          E('td', { class: 'tachyon-dashboard-nodes-table__cell--source' }, [
+            outbound.prefix && prefixStyle
+              ? E(
+                  'span',
+                  {
+                    class:
+                      'tachyon_dashboard-page__outbound-grid__item__prefix-badge',
+                    style: `background: ${prefixStyle.bg}; color: ${prefixStyle.color}; border: 1px solid ${prefixStyle.border}; font-weight: 600; cursor: pointer;`,
+                    title: _('Click to customize prefix colors'),
+                    click: (event: MouseEvent) => {
+                      event.stopPropagation();
+                      openPrefixColorPickerModal(outbound.prefix!, event);
+                    },
+                  },
+                  renderFlagEmojis(outbound.prefix),
+                )
+              : E('span', { style: 'opacity: 0.45;' }, '—'),
+          ]),
+          E('td', { class: 'tachyon-dashboard-nodes-table__cell--type' }, [
+            renderOutboundTypeWithPopover(
+              outbound.type,
+              outbound.transport,
+              outbound.details,
+              'tachyon_dashboard-page__outbound-grid__item__type',
+              '',
+            ),
+          ]),
+          E('td', { class: 'tachyon-dashboard-nodes-table__cell--latency' }, [
+            E(
+              'div',
+              {
+                class: [
+                  getLatencyClass(),
+                  !isConnectionNode
+                    ? 'tachyon_dashboard-page__outbound-grid__item__latency--clickable'
+                    : '',
+                  isTestingSingle
+                    ? 'tachyon_dashboard-page__outbound-grid__item__latency--testing'
+                    : '',
+                ]
+                  .filter(Boolean)
+                  .join(' '),
+                style: isConnectionNode
+                  ? 'display: inline-flex;'
+                  : 'cursor: pointer; display: inline-flex;',
+                title: isConnectionNode ? undefined : _('Test node latency'),
+                click: isConnectionNode
+                  ? undefined
+                  : (event?: MouseEvent) => {
+                      event?.stopPropagation?.();
+                      event?.preventDefault?.();
+                      if (isTestingSingle || latencyFetching) return;
+                      onTestSingleOutbound?.(
+                        section.sectionName,
+                        outbound.code,
+                      );
+                    },
+              },
+              isTestingSingle
+                ? [renderLoaderCircleIcon24(), E('span', {}, _('Checking...'))]
+                : outbound.latency && outbound.latency > 0
+                  ? `${outbound.latency}ms`
+                  : outbound.latency === -1 || outbound.latency < 0
+                    ? _('Not responding')
+                    : '—',
+            ),
+          ]),
+          E('td', { class: 'tachyon-dashboard-nodes-table__cell--actions' }, [
+            E('div', { class: 'tachyon-dashboard-nodes-table__actions-wrap' }, [
+              ...(!isServiceNode && !isConnectionNode
+                ? [
+                    E(
+                      'button',
+                      {
+                        type: 'button',
+                        class:
+                          'btn tachyon_dashboard-page__outbound-grid__item__copy-button',
+                        title:
+                          pinnedDomains.length > 0
+                            ? pinnedDomains.join(', ')
+                            : isRu
+                              ? 'Привязать отдельные сайты к этому серверу'
+                              : 'Pin specific sites to this server',
+                        style:
+                          pinnedDomains.length > 0
+                            ? 'color: #38bdf8;'
+                            : undefined,
+                        click: (event: MouseEvent) => {
+                          event.stopPropagation();
+                          openPinSitesToServerModal(section, outbound);
+                        },
+                      },
+                      renderGlobeIcon(16),
+                    ),
+                  ]
+                : []),
+              ...(canCopyLink
+                ? [
+                    E(
+                      'button',
+                      {
+                        type: 'button',
+                        class:
+                          'btn tachyon_dashboard-page__outbound-grid__item__copy-button',
+                        title: _('Copy proxy link'),
+                        'aria-label': _('Copy proxy link'),
+                        click: (event: MouseEvent) => {
+                          event.stopPropagation();
+                          onCopyOutbound(section, outbound);
+                        },
+                      },
+                      renderCopyIcon24(),
+                    ),
+                  ]
+                : []),
+            ]),
+          ]),
+        ],
+      );
+    };
+
+    const populateRows = () => {
+      const sortState = sectionTableSortState.get(sortKey);
+      const list = [...servers];
+      if (sortState) {
+        const dirMul = sortState.dir === 'asc' ? 1 : -1;
+        list.sort((a, b) => {
+          if (sortState.col === 'name') {
+            return (
+              dirMul *
+              String(a.displayName || a.code || '').localeCompare(
+                String(b.displayName || b.code || ''),
+              )
+            );
+          }
+          if (sortState.col === 'source') {
+            return (
+              dirMul *
+              String(a.prefix || a.sourceGroup || '').localeCompare(
+                String(b.prefix || b.sourceGroup || ''),
+              )
+            );
+          }
+          if (sortState.col === 'type') {
+            return (
+              dirMul * String(a.type || '').localeCompare(String(b.type || ''))
+            );
+          }
+          if (sortState.col === 'latency') {
+            const rankLat = (v?: number) => {
+              if (v && v > 0) return v;
+              if (v === -1 || (v && v < 0)) return 999999;
+              return 888888;
+            };
+            const la = rankLat(a.latency);
+            const lb = rankLat(b.latency);
+            if (la === lb) {
+              return String(a.displayName || '').localeCompare(
+                String(b.displayName || ''),
+              );
+            }
+            return dirMul * (la - lb);
+          }
+          return 0;
+        });
+      }
+      tbody.replaceChildren(...list.map(renderTableRow));
+      updateHeaderIndicators();
+    };
+
+    const makeSortableTh = (
+      col: 'name' | 'source' | 'type' | 'latency',
+      label: string,
+    ) => {
+      const ind = E('span', { class: 'tachyon-dashboard-nodes-table__sort' });
+      colBtns.set(col, ind);
+      return E(
+        'th',
+        {
+          class: `tachyon-dashboard-nodes-table__th tachyon-dashboard-nodes-table__th--sortable tachyon-dashboard-nodes-table__th--${col}`,
+          style: 'cursor: pointer; user-select: none;',
+          click: (e: MouseEvent) => {
+            e.preventDefault();
+            const cur = sectionTableSortState.get(sortKey);
+            if (cur && cur.col === col) {
+              sectionTableSortState.set(sortKey, {
+                col,
+                dir: cur.dir === 'asc' ? 'desc' : 'asc',
+              });
+            } else {
+              sectionTableSortState.set(sortKey, { col, dir: 'asc' });
+            }
+            populateRows();
+          },
+        },
+        [E('span', {}, label), ind],
+      );
+    };
+
+    const thead = E('thead', {}, [
+      E('tr', {}, [
+        makeSortableTh('name', isRu ? 'Сервер' : _('Server')),
+        makeSortableTh('source', isRu ? 'Источник' : _('Source')),
+        makeSortableTh('type', isRu ? 'Протокол' : _('Protocol')),
+        makeSortableTh('latency', isRu ? 'Задержка' : _('Latency')),
+        E(
+          'th',
+          {
+            class:
+              'tachyon-dashboard-nodes-table__th tachyon-dashboard-nodes-table__th--actions',
+          },
+          isRu ? 'Действия' : _('Actions'),
+        ),
+      ]),
+    ]);
+
+    populateRows();
+
+    return E(
+      'div',
+      {
+        class: 'tachyon-dashboard-nodes-table-wrap',
+        style: 'grid-column: 1 / -1; width: 100%; box-sizing: border-box;',
+      },
+      [E('table', { class: 'tachyon-dashboard-nodes-table' }, [thead, tbody])],
+    );
+  }
+
+  function renderOutboundsList(list: Tachyon.Outbound[]): HTMLElement[] {
+    if (nodesViewMode === 'table') {
+      const groups: Tachyon.Outbound[] = [];
+      const regularServers: Tachyon.Outbound[] = [];
+      for (const item of list) {
+        if (item.urlTestInfo || item.priorityInfo) {
+          groups.push(item);
+        } else {
+          regularServers.push(item);
+        }
+      }
+      return [
+        ...groups.map((g) => renderOutbound(g)),
+        ...(regularServers.length > 0
+          ? [renderServersTable(regularServers)]
+          : []),
+      ];
+    }
+    return list.map((ob) => renderOutbound(ob));
+  }
+
   const subscriptionUpdateAction = renderSubscriptionUpdateAction(
     section,
     subscriptionUpdating,
@@ -1595,7 +2730,7 @@ function renderDefaultState({
     const frozenOrder = gridFrozenOutboundOrders.get(section.code);
     let effectiveOutbounds = section.outbounds || [];
     if (
-      section.dashboardSettings?.hoverFreeze !== false &&
+      section.dashboardSettings?.hoverFreeze === true &&
       gridHoveredSections.has(section.code) &&
       frozenOrder &&
       frozenOrder.length > 0
@@ -1608,8 +2743,13 @@ function renderDefaultState({
       });
     }
 
-    const outbounds = effectiveOutbounds;
-    const metadataList = section.subscriptionMetadata || [];
+    const outbounds = showHidden
+      ? effectiveOutbounds
+      : effectiveOutbounds.filter((ob) => !ob.hidden);
+    const rawMetadataList = section.subscriptionMetadata || [];
+    const metadataList = showHidden
+      ? rawMetadataList
+      : rawMetadataList.filter((m) => !m.hidden);
     const subSourceCount = section.subscriptionSourceCount || 0;
     const countryGrouping =
       section.dashboardSettings?.countryGrouping || 'chips';
@@ -1662,7 +2802,24 @@ function renderDefaultState({
       (countryGroups.length === 1 && countryGroups[0].countryCode !== 'OTHER');
 
     const metadataNodes = metadataList
-      .map((metadata) => renderSubscriptionMetadata(metadata))
+      .map((metadata, idx) => {
+        const fallbackTitle =
+          serverOutbounds[0]?.prefix ||
+          (metadataList.length > 1
+            ? `${_('Subscription')} #${metadata.sourceIndex || idx + 1}`
+            : _('Subscription'));
+        const enrichedMeta: Tachyon.SubscriptionMetadata =
+          metadata.title || metadata.fileName
+            ? metadata
+            : { ...metadata, title: fallbackTitle };
+        return renderSubscriptionMetadata(enrichedMeta, {
+          onUpdateSubscription:
+            subSourceCount > 0
+              ? () => onUpdateSubscription(section)
+              : undefined,
+          subscriptionUpdating,
+        });
+      })
       .filter(Boolean) as HTMLElement[];
 
     const subMap = new Map<string, Tachyon.Outbound[]>();
@@ -1682,7 +2839,9 @@ function renderDefaultState({
 
     const hasSubTaggedOutbounds = subMap.size > 0;
     const hasMultipleSources =
-      subSourceCount > 1 ||
+      (!showHidden && rawMetadataList.some((m) => m.hidden)
+        ? Math.max(metadataList.length, subMap.size) > 1
+        : subSourceCount > 1) ||
       subMap.size > 1 ||
       (hasSubTaggedOutbounds && manualOutbounds.length > 0);
 
@@ -1729,7 +2888,7 @@ function renderDefaultState({
           ...metadataNodes,
           ...(autoBlock ? [autoBlock] : []),
           chipsBar,
-          ...visibleServers.map((ob) => renderOutbound(ob)),
+          ...renderOutboundsList(visibleServers),
         ];
       }
 
@@ -1741,6 +2900,20 @@ function renderDefaultState({
         ];
 
         for (const group of countryGroups) {
+          if (
+            activeCountryFilter &&
+            group.countryCode !== activeCountryFilter
+          ) {
+            continue;
+          }
+          if (
+            !activeCountryFilter &&
+            activeRegionFilter &&
+            activeRegionFilter !== 'all' &&
+            group.region !== activeRegionFilter
+          ) {
+            continue;
+          }
           const collapseKey = `countrygrp:${section.code}:${group.countryCode}`;
           const isCountryCollapsed = Boolean(
             collapsedSourceGroups?.has(collapseKey),
@@ -1753,9 +2926,7 @@ function renderDefaultState({
           );
 
           if (!isCountryCollapsed) {
-            for (const m of group.outbounds) {
-              nodes.push(renderOutbound(m));
-            }
+            nodes.push(...renderOutboundsList(group.outbounds));
           }
         }
 
@@ -1766,11 +2937,16 @@ function renderDefaultState({
         return [
           ...metadataNodes,
           autoBlock,
-          ...serverOutbounds.map((ob) => renderOutbound(ob)),
+          ...renderOutboundsList(
+            serverOutbounds.filter(isOutboundMatchingFilters),
+          ),
         ];
       }
 
-      return [...metadataNodes, ...outbounds.map((ob) => renderOutbound(ob))];
+      return [
+        ...metadataNodes,
+        ...renderOutboundsList(outbounds.filter(isOutboundMatchingFilters)),
+      ];
     }
 
     // Multiple subscription sources in one section: preserve source headers on each group
@@ -1819,36 +2995,55 @@ function renderDefaultState({
       return na - nb;
     });
 
+    const hasActiveCountryOrRegionFilter = Boolean(
+      activeCountryFilter ||
+        (chipsGrouping === 'regions' &&
+          activeRegionFilter &&
+          activeRegionFilter !== 'all'),
+    );
+
     for (const subKey of allSubKeys) {
       const members = subMap.get(subKey) || [];
+      const visibleMembers = members.filter(isOutboundMatchingFilters);
       const meta = metadataBySubKey.get(subKey);
       if (members.length === 0 && !meta) continue;
+      if (hasActiveCountryOrRegionFilter && visibleMembers.length === 0) {
+        continue;
+      }
 
       const collapseKey = `subgrp:${section.code}:${subKey}`;
       const isGroupCollapsed = Boolean(collapsedSourceGroups?.has(collapseKey));
-      const selectedMember = members.find((m) => m.selected);
+      const selectedMember = visibleMembers.find((m) => m.selected);
       const subNumber = Number(subKey.slice(4)) || 1;
       const fallbackSubTitle =
         allSubKeys.length > 1
           ? `${_('Subscription')} #${subNumber}`
           : _('Subscription');
 
-      const headerMeta =
+      const resolvedSubTitle =
+        meta?.title || members[0]?.prefix || meta?.fileName || fallbackSubTitle;
+      const headerMeta: Tachyon.SubscriptionMetadata =
         meta && Object.keys(meta).length > 1
-          ? meta
-          : ({
-              title: members[0]?.prefix || fallbackSubTitle,
+          ? {
+              ...meta,
+              title: meta.title || resolvedSubTitle,
+            }
+          : {
+              title: resolvedSubTitle,
               sourceIndex: subNumber,
-            } as Tachyon.SubscriptionMetadata);
+            };
 
       const metaHeader = renderSubscriptionMetadata(headerMeta, {
-        groupCount: members.length,
+        groupCount: visibleMembers.length,
         selectedOutbound: selectedMember,
         isGroupCollapsed,
         onToggleGroup:
-          members.length > 0
+          visibleMembers.length > 0
             ? () => onToggleSourceGroupCollapse?.(collapseKey)
             : undefined,
+        onUpdateSubscription:
+          subSourceCount > 0 ? () => onUpdateSubscription(section) : undefined,
+        subscriptionUpdating,
       });
 
       if (metaHeader) {
@@ -1856,105 +3051,90 @@ function renderDefaultState({
       }
 
       if (!isGroupCollapsed) {
-        const visibleMembers =
-          countryGrouping === 'chips'
-            ? members.filter(isOutboundMatchingFilters)
-            : members;
-        for (const m of visibleMembers) {
-          nodes.push(renderOutbound(m));
-        }
+        nodes.push(...renderOutboundsList(visibleMembers));
       }
     }
 
     if (manualOutbounds.length > 0) {
-      if (allSubKeys.length > 0) {
-        const collapseKey = `subgrp:${section.code}:manual`;
-        const isGroupCollapsed = Boolean(
-          collapsedSourceGroups?.has(collapseKey),
-        );
-        const selectedManual = manualOutbounds.find((m) => m.selected);
+      const visibleManual = manualOutbounds.filter(isOutboundMatchingFilters);
+      if (!hasActiveCountryOrRegionFilter || visibleManual.length > 0) {
+        if (allSubKeys.length > 0) {
+          const collapseKey = `subgrp:${section.code}:manual`;
+          const isGroupCollapsed = Boolean(
+            collapsedSourceGroups?.has(collapseKey),
+          );
+          const selectedManual = visibleManual.find((m) => m.selected);
 
-        nodes.push(
-          E(
-            'div',
-            {
-              class: [
-                'tachyon_dashboard-page__subscription-meta',
-                'tachyon_dashboard-page__subscription-meta--collapsible',
-                'tachyon_dashboard-page__source-group--manual',
-                isGroupCollapsed
-                  ? 'tachyon_dashboard-page__subscription-meta--collapsed'
-                  : '',
-              ]
-                .filter(Boolean)
-                .join(' '),
-              click: () => onToggleSourceGroupCollapse?.(collapseKey),
-            },
-            [
-              E(
-                'div',
-                { class: 'tachyon_dashboard-page__subscription-meta__main' },
-                [
-                  svgEl(
-                    'svg',
-                    {
-                      width: '15',
-                      height: '15',
-                      viewBox: '0 0 24 24',
-                      fill: 'none',
-                      stroke: 'currentColor',
-                      'stroke-width': '2',
-                      'stroke-linecap': 'round',
-                      'stroke-linejoin': 'round',
-                      style: `flex-shrink: 0; transition: transform 0.2s; transform: rotate(${isGroupCollapsed ? '-90deg' : '0deg'})`,
-                    },
-                    [svgEl('polyline', { points: '6 9 12 15 18 9' })],
-                  ),
-                  E(
-                    'div',
-                    {
-                      class:
-                        'tachyon_dashboard-page__subscription-meta__heading',
-                    },
-                    _('Standalone servers'),
-                  ),
-                  E(
-                    'span',
-                    { class: 'tachyon_dashboard-page__source-group__count' },
-                    `${manualOutbounds.length}`,
-                  ),
-                  isGroupCollapsed && selectedManual
-                    ? E(
-                        'span',
-                        {
-                          class:
-                            'tachyon_dashboard-page__source-group__active-badge',
-                        },
-                        `● ${selectedManual.displayName}`,
-                      )
+          nodes.push(
+            E(
+              'div',
+              {
+                class: [
+                  'tachyon_dashboard-page__subscription-meta',
+                  'tachyon_dashboard-page__subscription-meta--collapsible',
+                  'tachyon_dashboard-page__source-group--manual',
+                  isGroupCollapsed
+                    ? 'tachyon_dashboard-page__subscription-meta--collapsed'
                     : '',
-                ],
-              ),
-            ],
-          ),
-        );
+                ]
+                  .filter(Boolean)
+                  .join(' '),
+                click: () => onToggleSourceGroupCollapse?.(collapseKey),
+              },
+              [
+                E(
+                  'div',
+                  { class: 'tachyon_dashboard-page__subscription-meta__main' },
+                  [
+                    svgEl(
+                      'svg',
+                      {
+                        width: '15',
+                        height: '15',
+                        viewBox: '0 0 24 24',
+                        fill: 'none',
+                        stroke: 'currentColor',
+                        'stroke-width': '2',
+                        'stroke-linecap': 'round',
+                        'stroke-linejoin': 'round',
+                        style: `flex-shrink: 0; transition: transform 0.2s; transform: rotate(${isGroupCollapsed ? '-90deg' : '0deg'})`,
+                      },
+                      [svgEl('polyline', { points: '6 9 12 15 18 9' })],
+                    ),
+                    E(
+                      'div',
+                      {
+                        class:
+                          'tachyon_dashboard-page__subscription-meta__heading',
+                      },
+                      _('Standalone servers'),
+                    ),
+                    E(
+                      'span',
+                      { class: 'tachyon_dashboard-page__source-group__count' },
+                      `${visibleManual.length}`,
+                    ),
+                    isGroupCollapsed && selectedManual
+                      ? E(
+                          'span',
+                          {
+                            class:
+                              'tachyon_dashboard-page__source-group__active-badge',
+                          },
+                          `● ${selectedManual.displayName}`,
+                        )
+                      : '',
+                  ],
+                ),
+              ],
+            ),
+          );
 
-        if (!isGroupCollapsed) {
-          const visibleManual =
-            countryGrouping === 'chips'
-              ? manualOutbounds.filter(isOutboundMatchingFilters)
-              : manualOutbounds;
-          for (const m of visibleManual) {
-            nodes.push(renderOutbound(m));
+          if (!isGroupCollapsed) {
+            nodes.push(...renderOutboundsList(visibleManual));
           }
-        }
-      } else {
-        const visibleManual =
-          countryGrouping === 'chips'
-            ? manualOutbounds.filter(isOutboundMatchingFilters)
-            : manualOutbounds;
-        for (const m of visibleManual) {
-          nodes.push(renderOutbound(m));
+        } else {
+          nodes.push(...renderOutboundsList(visibleManual));
         }
       }
     }
@@ -1980,308 +3160,535 @@ function renderDefaultState({
         .join(' '),
     },
     [
-      // Title with test latency
-      E(
-        'div',
-        {
-          class: 'tachyon_dashboard-page__outbound-section__title-section',
-          click: (e: MouseEvent) => {
-            if (e.target && (e.target as Element).closest('button')) return;
-            onToggleCollapse?.();
-          },
-          style: 'cursor: pointer; user-select: none;',
-        },
-        [
-          E(
-            'div',
-            {
-              class:
-                'tachyon_dashboard-page__outbound-section__title-section__title',
-              style: 'display: flex; align-items: center; gap: 8px;',
-            },
-            [
-              svgEl(
-                'svg',
-                {
-                  width: '16',
-                  height: '16',
-                  viewBox: '0 0 24 24',
-                  fill: 'none',
-                  stroke: 'currentColor',
-                  'stroke-width': '2',
-                  'stroke-linecap': 'round',
-                  'stroke-linejoin': 'round',
-                  style: `transition: transform 0.2s; transform: rotate(${isCollapsed ? '-90deg' : '0deg'})`,
+      // Title with test latency (omitted when rendered inside accordion/modal with its own header)
+      ...(hideSectionHeader
+        ? []
+        : [
+            E(
+              'div',
+              {
+                class:
+                  'tachyon_dashboard-page__outbound-section__title-section',
+                click: (e: MouseEvent) => {
+                  if (e.target && (e.target as Element).closest('button'))
+                    return;
+                  onToggleCollapse?.();
                 },
-                [svgEl('polyline', { points: '6 9 12 15 18 9' })],
-              ),
-              E('span', {}, section.displayName),
-              renderConfigErrorBadge(section),
-              isCollapsed
-                ? (() => {
-                    const selectedOutbound = section.outbounds.find(
-                      (o) => o.selected,
-                    );
-                    if (!selectedOutbound) return '';
-
-                    const isConnectionNode =
-                      !section.withTagSelect &&
-                      [
-                        'vpn',
-                        'awg',
-                        'warp',
-                        'anytls',
-                        'snell',
-                        'mieru',
-                        'naive',
-                        'sudoku',
-                        'masque',
-                        'openvpn',
-                        'openconnect',
-                        'tewfai',
-                        'trusttunnel',
-                        'shadowtls',
-                        'desync',
-                      ].includes(section.action || '');
-
-                    const connectionTitle =
-                      (section.action &&
-                        CONNECTION_ACTION_LABELS[section.action]) ||
-                      selectedOutbound.displayName;
-
-                    const isAutoGroup = Boolean(
-                      selectedOutbound.urlTestInfo ||
-                        selectedOutbound.priorityInfo,
-                    );
-
-                    let latencyValue = selectedOutbound.latency;
-                    if ((!latencyValue || latencyValue <= 0) && isAutoGroup) {
-                      const info =
-                        selectedOutbound.urlTestInfo ||
-                        selectedOutbound.priorityInfo;
-                      const member = info?.outbounds?.find(
-                        (m) =>
-                          m.selected ||
-                          (info.selectedCode && m.code === info.selectedCode) ||
-                          (info.selectedName &&
-                            m.displayName === info.selectedName),
-                      );
-                      if (member && member.latency) {
-                        latencyValue = member.latency;
-                      }
-                    }
-
-                    function getLatencyColor() {
-                      if (isConnectionNode) {
-                        if (latencyFetching)
-                          return 'var(--warn-color-medium, orange)';
-                        if (latencyValue === -1)
-                          return 'var(--error-color-medium, red)';
-                        if (latencyValue && latencyValue > 0) {
-                          if (latencyValue < 800)
-                            return 'var(--success-color-medium, green)';
-                          if (latencyValue < 1500)
-                            return 'var(--warn-color-medium, orange)';
-                          return 'var(--error-color-medium, red)';
-                        }
-                        return selectedOutbound!.runtimeAvailable
-                          ? 'var(--success-color-medium, green)'
-                          : 'var(--error-color-medium, red)';
-                      }
-
-                      if (!latencyValue)
-                        return 'var(--primary-color-low, lightgray)';
-                      if (latencyValue === -1 || latencyValue < 0)
-                        return 'var(--error-color-medium, red)';
-                      if (latencyValue < 800)
-                        return 'var(--success-color-medium, green)';
-                      if (latencyValue < 1500)
-                        return 'var(--warn-color-medium, orange)';
-                      return 'var(--error-color-medium, red)';
-                    }
-
-                    let latencyText = '';
-                    if (isConnectionNode) {
-                      latencyText = latencyFetching
-                        ? _('Checking...')
-                        : latencyValue && latencyValue > 0
-                          ? `${latencyValue}ms`
-                          : latencyValue === -1 || latencyValue < 0
-                            ? _('Not responding')
-                            : selectedOutbound.runtimeAvailable
-                              ? _('Connected')
-                              : _('Not connected');
-                    } else {
-                      latencyText =
-                        latencyValue && latencyValue > 0
-                          ? `${latencyValue}ms`
-                          : latencyValue === -1 || latencyValue < 0
-                            ? _('Not responding')
-                            : '';
-                    }
-
-                    let badgeText = '';
-                    if (isAutoGroup) {
-                      const rawSubName =
-                        selectedOutbound.urlTestInfo?.selectedName ||
-                        selectedOutbound.priorityInfo?.selectedName ||
-                        selectedOutbound.urlTestInfo?.outbounds?.find(
-                          (m) =>
-                            m.selected ||
-                            (selectedOutbound.urlTestInfo?.selectedCode &&
-                              m.code ===
-                                selectedOutbound.urlTestInfo.selectedCode),
-                        )?.displayName ||
-                        selectedOutbound.priorityInfo?.outbounds?.find(
-                          (m) =>
-                            m.selected ||
-                            (selectedOutbound.priorityInfo?.selectedCode &&
-                              m.code ===
-                                selectedOutbound.priorityInfo.selectedCode),
-                        )?.displayName ||
-                        '';
-                      const matchedSubOutbound = section.outbounds.find(
-                        (o) =>
-                          (selectedOutbound.urlTestInfo?.selectedCode &&
-                            o.code ===
-                              selectedOutbound.urlTestInfo.selectedCode) ||
-                          (selectedOutbound.priorityInfo?.selectedCode &&
-                            o.code ===
-                              selectedOutbound.priorityInfo.selectedCode) ||
-                          (rawSubName && o.displayName === rawSubName),
-                      );
-                      const activeSubName = rawSubName
-                        ? ensureOutboundDisplayFlag({
-                            displayName: rawSubName,
-                            country: matchedSubOutbound?.country,
-                            prefix: matchedSubOutbound?.prefix,
-                          })
-                        : '';
-                      badgeText = `● ${selectedOutbound.displayName}${activeSubName ? ` → ${activeSubName}` : ''}`;
-                    } else if (isConnectionNode) {
-                      badgeText = `● ${connectionTitle}`;
-                    } else {
-                      const rawName =
-                        selectedOutbound.prefix ||
-                        selectedOutbound.displayName ||
-                        '';
-                      const activeName = ensureOutboundDisplayFlag({
-                        displayName: rawName,
-                        country: selectedOutbound.country,
-                        prefix: selectedOutbound.prefix,
-                      });
-                      badgeText = `● ${activeName}`;
-                    }
-
-                    return E(
-                      'span',
+                style: 'cursor: pointer; user-select: none;',
+              },
+              [
+                E(
+                  'div',
+                  {
+                    class:
+                      'tachyon_dashboard-page__outbound-section__title-section__title',
+                    style: 'display: flex; align-items: center; gap: 8px;',
+                  },
+                  [
+                    svgEl(
+                      'svg',
                       {
-                        class:
-                          'tachyon_dashboard-page__source-group__active-badge',
-                        style:
-                          'text-transform: none; letter-spacing: normal; max-width: min(380px, 50vw); margin-left: 8px;',
-                        title: `${badgeText.replace(/^●\s*/, '')}${latencyText ? ` • ${latencyText}` : ''}`,
+                        width: '16',
+                        height: '16',
+                        viewBox: '0 0 24 24',
+                        fill: 'none',
+                        stroke: 'currentColor',
+                        'stroke-width': '2',
+                        'stroke-linecap': 'round',
+                        'stroke-linejoin': 'round',
+                        style: `transition: transform 0.2s; transform: rotate(${isCollapsed ? '-90deg' : '0deg'})`,
                       },
-                      [
-                        ...renderFlagEmojis(badgeText),
-                        latencyText
-                          ? E(
-                              'span',
-                              {
-                                style: `color: ${getLatencyColor()}; margin-left: 4px; font-weight: 600;`,
-                              },
-                              `• ${latencyText}`,
-                            )
-                          : '',
-                      ],
-                    );
-                  })()
-                : isConnectionNode
-                  ? (() => {
-                      const selectedOutbound = section.outbounds.find(
-                        (o) => o.selected,
-                      );
-                      if (!selectedOutbound) return '';
-                      const connectionTitle =
-                        (section.action &&
-                          CONNECTION_ACTION_LABELS[section.action]) ||
-                        selectedOutbound.displayName;
-                      if (
-                        section.displayName.toLowerCase().trim() ===
-                        connectionTitle.toLowerCase().trim()
-                      ) {
-                        return '';
-                      }
-                      return E(
-                        'span',
-                        {
-                          style:
-                            'font-size: 13px; font-weight: normal; margin-left: 8px; opacity: 0.7;',
-                        },
-                        connectionTitle,
-                      );
-                    })()
-                  : '',
-            ],
-          ),
-          E(
-            'div',
-            {
-              class:
-                'tachyon_dashboard-page__outbound-section__title-section__actions',
-            },
-            [
-              ...(subscriptionUpdateAction ? [subscriptionUpdateAction] : []),
-              ...(canTestLatency
-                ? [
-                    E(
-                      'button',
-                      {
-                        type: 'button',
-                        class: 'btn dashboard-sections-grid-item-test-latency',
-                        'data-latency-section': section.sectionName,
-                        disabled: latencyFetching ? true : undefined,
-                        click: (event: MouseEvent) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          if (latencyFetching) {
-                            return;
+                      [svgEl('polyline', { points: '6 9 12 15 18 9' })],
+                    ),
+                    E('span', {}, section.displayName),
+                    renderConfigErrorBadge(section),
+                    isCollapsed
+                      ? (() => {
+                          const selectedOutbound = section.outbounds.find(
+                            (o) => o.selected,
+                          );
+                          if (!selectedOutbound) return '';
+
+                          const isConnectionNode =
+                            !section.withTagSelect &&
+                            [
+                              'vpn',
+                              'awg',
+                              'warp',
+                              'anytls',
+                              'snell',
+                              'mieru',
+                              'naive',
+                              'sudoku',
+                              'masque',
+                              'openvpn',
+                              'openconnect',
+                              'tewfai',
+                              'trusttunnel',
+                              'shadowtls',
+                              'desync',
+                            ].includes(section.action || '');
+
+                          const connectionTitle =
+                            (section.action &&
+                              CONNECTION_ACTION_LABELS[section.action]) ||
+                            selectedOutbound.displayName;
+
+                          const isAutoGroup = Boolean(
+                            selectedOutbound.urlTestInfo ||
+                              selectedOutbound.priorityInfo,
+                          );
+
+                          let latencyValue = selectedOutbound.latency;
+                          if (
+                            (!latencyValue || latencyValue <= 0) &&
+                            isAutoGroup
+                          ) {
+                            const info =
+                              selectedOutbound.urlTestInfo ||
+                              selectedOutbound.priorityInfo;
+                            const member = info?.outbounds?.find(
+                              (m) =>
+                                m.selected ||
+                                (info.selectedCode &&
+                                  m.code === info.selectedCode) ||
+                                (info.selectedName &&
+                                  m.displayName === info.selectedName),
+                            );
+                            if (member && member.latency) {
+                              latencyValue = member.latency;
+                            }
                           }
 
-                          testLatency();
-                        },
-                      },
-                      latencyFetching
-                        ? [
-                            renderLoaderCircleIcon24(),
-                            E(
-                              'span',
-                              {
-                                class:
-                                  'dashboard-sections-grid-item-test-latency__label',
-                              },
-                              isConnectionNode
-                                ? _('Checking...')
-                                : getLatencyTestLabel(latencyProgress),
-                            ),
-                          ]
-                        : E(
+                          function getLatencyColor() {
+                            if (isConnectionNode) {
+                              if (latencyFetching)
+                                return 'var(--warn-color-medium, orange)';
+                              if (latencyValue === -1)
+                                return 'var(--error-color-medium, red)';
+                              if (latencyValue && latencyValue > 0) {
+                                if (latencyValue < 800)
+                                  return 'var(--success-color-medium, green)';
+                                if (latencyValue < 1500)
+                                  return 'var(--warn-color-medium, orange)';
+                                return 'var(--error-color-medium, red)';
+                              }
+                              return selectedOutbound!.runtimeAvailable
+                                ? 'var(--success-color-medium, green)'
+                                : 'var(--error-color-medium, red)';
+                            }
+
+                            if (!latencyValue)
+                              return 'var(--primary-color-low, lightgray)';
+                            if (latencyValue === -1 || latencyValue < 0)
+                              return 'var(--error-color-medium, red)';
+                            if (latencyValue < 800)
+                              return 'var(--success-color-medium, green)';
+                            if (latencyValue < 1500)
+                              return 'var(--warn-color-medium, orange)';
+                            return 'var(--error-color-medium, red)';
+                          }
+
+                          let latencyText = '';
+                          if (isConnectionNode) {
+                            latencyText = latencyFetching
+                              ? _('Checking...')
+                              : latencyValue && latencyValue > 0
+                                ? `${latencyValue}ms`
+                                : latencyValue === -1 || latencyValue < 0
+                                  ? _('Not responding')
+                                  : selectedOutbound.runtimeAvailable
+                                    ? _('Connected')
+                                    : _('Not connected');
+                          } else {
+                            latencyText =
+                              latencyValue && latencyValue > 0
+                                ? `${latencyValue}ms`
+                                : latencyValue === -1 || latencyValue < 0
+                                  ? _('Not responding')
+                                  : '';
+                          }
+
+                          let badgeText = '';
+                          if (isAutoGroup) {
+                            const rawSubName =
+                              selectedOutbound.urlTestInfo?.selectedName ||
+                              selectedOutbound.priorityInfo?.selectedName ||
+                              selectedOutbound.urlTestInfo?.outbounds?.find(
+                                (m) =>
+                                  m.selected ||
+                                  (selectedOutbound.urlTestInfo?.selectedCode &&
+                                    m.code ===
+                                      selectedOutbound.urlTestInfo
+                                        .selectedCode),
+                              )?.displayName ||
+                              selectedOutbound.priorityInfo?.outbounds?.find(
+                                (m) =>
+                                  m.selected ||
+                                  (selectedOutbound.priorityInfo
+                                    ?.selectedCode &&
+                                    m.code ===
+                                      selectedOutbound.priorityInfo
+                                        .selectedCode),
+                              )?.displayName ||
+                              '';
+                            const matchedSubOutbound = section.outbounds.find(
+                              (o) =>
+                                (selectedOutbound.urlTestInfo?.selectedCode &&
+                                  o.code ===
+                                    selectedOutbound.urlTestInfo
+                                      .selectedCode) ||
+                                (selectedOutbound.priorityInfo?.selectedCode &&
+                                  o.code ===
+                                    selectedOutbound.priorityInfo
+                                      .selectedCode) ||
+                                (rawSubName && o.displayName === rawSubName),
+                            );
+                            const activeSubName = rawSubName
+                              ? ensureOutboundDisplayFlag({
+                                  displayName: rawSubName,
+                                  country: matchedSubOutbound?.country,
+                                  prefix: matchedSubOutbound?.prefix,
+                                })
+                              : '';
+                            badgeText = `● ${selectedOutbound.displayName}${activeSubName ? ` → ${activeSubName}` : ''}`;
+                          } else if (isConnectionNode) {
+                            badgeText = `● ${connectionTitle}`;
+                          } else {
+                            const rawName =
+                              selectedOutbound.prefix ||
+                              selectedOutbound.displayName ||
+                              '';
+                            const activeName = ensureOutboundDisplayFlag({
+                              displayName: rawName,
+                              country: selectedOutbound.country,
+                              prefix: selectedOutbound.prefix,
+                            });
+                            badgeText = `● ${activeName}`;
+                          }
+
+                          return E(
                             'span',
                             {
                               class:
-                                'dashboard-sections-grid-item-test-latency__label',
+                                'tachyon_dashboard-page__source-group__active-badge',
+                              style:
+                                'text-transform: none; letter-spacing: normal; max-width: min(380px, 50vw); margin-left: 8px;',
+                              title: `${badgeText.replace(/^●\s*/, '')}${latencyText ? ` • ${latencyText}` : ''}`,
                             },
-                            isConnectionNode
-                              ? _('Check Connection')
-                              : _('Test latency'),
+                            [
+                              ...renderFlagEmojis(badgeText),
+                              latencyText
+                                ? E(
+                                    'span',
+                                    {
+                                      style: `color: ${getLatencyColor()}; margin-left: 4px; font-weight: 600;`,
+                                    },
+                                    `• ${latencyText}`,
+                                  )
+                                : '',
+                            ],
+                          );
+                        })()
+                      : isConnectionNode
+                        ? (() => {
+                            const selectedOutbound = section.outbounds.find(
+                              (o) => o.selected,
+                            );
+                            if (!selectedOutbound) return '';
+                            const connectionTitle =
+                              (section.action &&
+                                CONNECTION_ACTION_LABELS[section.action]) ||
+                              selectedOutbound.displayName;
+                            if (
+                              section.displayName.toLowerCase().trim() ===
+                              connectionTitle.toLowerCase().trim()
+                            ) {
+                              return '';
+                            }
+                            return E(
+                              'span',
+                              {
+                                style:
+                                  'font-size: 13px; font-weight: normal; margin-left: 8px; opacity: 0.7;',
+                              },
+                              connectionTitle,
+                            );
+                          })()
+                        : '',
+                  ],
+                ),
+                sectionStats
+                  ? (() => {
+                      const isRu =
+                        typeof document !== 'undefined' &&
+                        (document.documentElement?.lang || '')
+                          .toLowerCase()
+                          .startsWith('ru');
+                      const selectedOutbound = section.outbounds.find(
+                        (o) => o.selected,
+                      );
+                      const hasUrlTest = Boolean(selectedOutbound?.urlTestInfo);
+                      const hasPriority = Boolean(
+                        selectedOutbound?.priorityInfo,
+                      );
+                      const isInteractiveSelector = hasUrlTest || hasPriority;
+                      const autoGroupInfo =
+                        selectedOutbound?.urlTestInfo ||
+                        selectedOutbound?.priorityInfo;
+                      const activeAutoMember =
+                        autoGroupInfo?.outbounds?.find(
+                          (m) =>
+                            m.selected ||
+                            (autoGroupInfo.selectedCode &&
+                              m.code === autoGroupInfo.selectedCode) ||
+                            (autoGroupInfo.selectedName &&
+                              m.displayName === autoGroupInfo.selectedName),
+                        ) ||
+                        autoGroupInfo?.outbounds?.find(
+                          (m) => m.latency && m.latency > 0,
+                        ) ||
+                        autoGroupInfo?.outbounds?.[0];
+                      const rawAutoServerName =
+                        autoGroupInfo?.selectedName ||
+                        activeAutoMember?.displayName ||
+                        '';
+                      const matchedAutoNode = rawAutoServerName
+                        ? section.outbounds.find(
+                            (o) =>
+                              (autoGroupInfo?.selectedCode &&
+                                o.code === autoGroupInfo.selectedCode) ||
+                              o.displayName === rawAutoServerName,
+                          )
+                        : undefined;
+                      const activeAutoServerLabel = rawAutoServerName
+                        ? ensureOutboundDisplayFlag({
+                            displayName: rawAutoServerName,
+                            country:
+                              activeAutoMember?.country ||
+                              matchedAutoNode?.country,
+                            prefix:
+                              activeAutoMember?.prefix ||
+                              matchedAutoNode?.prefix,
+                          })
+                        : '';
+                      const baseSelectorLabel = hasUrlTest
+                        ? selectedOutbound?.displayName || 'URLTest'
+                        : hasPriority
+                          ? selectedOutbound?.displayName || 'Priority'
+                          : isConnectionNode
+                            ? (section.action &&
+                                CONNECTION_ACTION_LABELS[section.action]) ||
+                              'Tunnel'
+                            : isRu
+                              ? 'Ручной выбор'
+                              : 'Manual';
+                      const selectorLabel =
+                        isInteractiveSelector && activeAutoServerLabel
+                          ? `${baseSelectorLabel} → ${activeAutoServerLabel}`
+                          : baseSelectorLabel;
+
+                      let latencyMs = selectedOutbound?.latency;
+                      if (
+                        (!latencyMs || latencyMs <= 0) &&
+                        isInteractiveSelector
+                      ) {
+                        const info =
+                          selectedOutbound?.urlTestInfo ||
+                          selectedOutbound?.priorityInfo;
+                        const member = info?.outbounds?.find(
+                          (m) =>
+                            m.selected ||
+                            (info.selectedCode &&
+                              m.code === info.selectedCode) ||
+                            (info.selectedName &&
+                              m.displayName === info.selectedName),
+                        );
+                        if (member && member.latency) {
+                          latencyMs = member.latency;
+                        }
+                      }
+
+                      const latencyBadgeClass =
+                        latencyMs && latencyMs > 0
+                          ? latencyMs <= 150
+                            ? 'tachyon-latency-pill tachyon-latency-pill--fast'
+                            : latencyMs <= 300
+                              ? 'tachyon-latency-pill tachyon-latency-pill--medium'
+                              : 'tachyon-latency-pill tachyon-latency-pill--slow'
+                          : 'tachyon-latency-pill tachyon-latency-pill--neutral';
+
+                      return E(
+                        'div',
+                        {
+                          class: 'tachyon-section-row__metrics',
+                          'data-section-row-metrics': section.sectionName,
+                        } as Record<string, unknown>,
+                        [
+                          E(
+                            isInteractiveSelector ? 'button' : 'span',
+                            {
+                              ...(isInteractiveSelector
+                                ? { type: 'button' }
+                                : {}),
+                              class: `tachyon-section-row__selector${
+                                isInteractiveSelector
+                                  ? ' tachyon-section-row__selector--interactive'
+                                  : ''
+                              }`,
+                              title: isInteractiveSelector
+                                ? isRu
+                                  ? 'Нажмите для просмотра деталей автовыбора'
+                                  : 'Click to inspect auto-selection details'
+                                : selectorLabel,
+                              click: isInteractiveSelector
+                                ? (ev: MouseEvent) => {
+                                    ev.preventDefault();
+                                    ev.stopPropagation();
+                                    if (!selectedOutbound) return;
+                                    if (hasUrlTest) {
+                                      onShowUrlTestInfo(
+                                        section,
+                                        selectedOutbound,
+                                      );
+                                    } else if (hasPriority) {
+                                      onShowPriorityInfo(
+                                        section,
+                                        selectedOutbound,
+                                      );
+                                    }
+                                  }
+                                : undefined,
+                            } as Record<string, unknown>,
+                            [
+                              E(
+                                'span',
+                                { class: 'tachyon-section-row__selector-dot' },
+                                [renderZapIcon(12)],
+                              ),
+                              E('span', {}, renderFlagEmojis(selectorLabel)),
+                              ...(isInteractiveSelector
+                                ? [renderInfoIcon24()]
+                                : []),
+                            ],
                           ),
-                    ),
-                  ]
-                : []),
-            ],
-          ),
-        ],
-      ),
+                          E(
+                            'div',
+                            {
+                              class: 'tachyon-section-row__traffic',
+                              'data-row-metric': 'traffic',
+                            } as Record<string, unknown>,
+                            [
+                              E(
+                                'span',
+                                {
+                                  class:
+                                    'tachyon-traffic-pill tachyon-traffic-pill--down',
+                                  'data-row-metric': 'session-down',
+                                } as Record<string, unknown>,
+                                `↓ ${prettyBytes(sectionStats.download || 0)}`,
+                              ),
+                              E(
+                                'span',
+                                {
+                                  class:
+                                    'tachyon-traffic-pill tachyon-traffic-pill--up',
+                                  'data-row-metric': 'session-up',
+                                } as Record<string, unknown>,
+                                `↑ ${prettyBytes(sectionStats.upload || 0)}`,
+                              ),
+                            ],
+                          ),
+                          E(
+                            'span',
+                            {
+                              class:
+                                'tachyon-stat-pill tachyon-stat-pill--conns',
+                              'data-row-metric': 'conns',
+                              title: isRu
+                                ? 'Активные соединения секции'
+                                : 'Active section connections',
+                            } as Record<string, unknown>,
+                            `${sectionStats.conns} ${isRu ? 'соед.' : 'conns'}`,
+                          ),
+                          E(
+                            'span',
+                            {
+                              class: latencyBadgeClass,
+                              'data-row-metric': 'latency',
+                            } as Record<string, unknown>,
+                            latencyMs && latencyMs > 0
+                              ? `${latencyMs} ms`
+                              : latencyFetching
+                                ? _('Checking...')
+                                : '—',
+                          ),
+                        ],
+                      );
+                    })()
+                  : '',
+                E(
+                  'div',
+                  {
+                    class:
+                      'tachyon_dashboard-page__outbound-section__title-section__actions',
+                  },
+                  [
+                    ...(subscriptionUpdateAction
+                      ? [subscriptionUpdateAction]
+                      : []),
+                    ...(canTestLatency
+                      ? [
+                          E(
+                            'button',
+                            {
+                              type: 'button',
+                              class:
+                                'btn dashboard-sections-grid-item-test-latency',
+                              'data-latency-section': section.sectionName,
+                              disabled: latencyFetching ? true : undefined,
+                              click: (event: MouseEvent) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                if (latencyFetching) {
+                                  return;
+                                }
+
+                                testLatency();
+                              },
+                            },
+                            latencyFetching
+                              ? [
+                                  renderLoaderCircleIcon24(),
+                                  E(
+                                    'span',
+                                    {
+                                      class:
+                                        'dashboard-sections-grid-item-test-latency__label',
+                                    },
+                                    isConnectionNode
+                                      ? _('Checking...')
+                                      : getLatencyTestLabel(latencyProgress),
+                                  ),
+                                ]
+                              : E(
+                                  'span',
+                                  {
+                                    class:
+                                      'dashboard-sections-grid-item-test-latency__label',
+                                  },
+                                  isConnectionNode
+                                    ? _('Check Connection')
+                                    : _('Test latency'),
+                                ),
+                          ),
+                        ]
+                      : []),
+                  ],
+                ),
+              ],
+            ),
+          ]),
       renderConfigErrorBanner(section),
       !isCollapsed
         ? E(
@@ -2289,24 +3696,22 @@ function renderDefaultState({
             {
               class: 'tachyon_dashboard-page__outbound-grid',
               mouseenter:
-                section.dashboardSettings?.hoverFreeze !== false
+                section.dashboardSettings?.hoverFreeze === true
                   ? () => {
                       gridHoveredSections.add(section.code);
-                      gridFrozenOutboundOrders.set(
-                        section.code,
-                        (section.outbounds || []).map((o) => o.code),
-                      );
+                      if (!gridFrozenOutboundOrders.has(section.code)) {
+                        gridFrozenOutboundOrders.set(
+                          section.code,
+                          (section.outbounds || []).map((o) => o.code),
+                        );
+                      }
                     }
                   : undefined,
               mouseleave:
-                section.dashboardSettings?.hoverFreeze !== false
+                section.dashboardSettings?.hoverFreeze === true
                   ? () => {
                       gridHoveredSections.delete(section.code);
-                      setTimeout(() => {
-                        if (!gridHoveredSections.has(section.code)) {
-                          gridFrozenOutboundOrders.delete(section.code);
-                        }
-                      }, 800);
+                      gridFrozenOutboundOrders.delete(section.code);
                     }
                   : undefined,
             },
@@ -2348,8 +3753,18 @@ function renderConfigErrorBanner(section: Tachyon.OutboundGroup) {
         {
           class:
             'tachyon_dashboard-page__outbound-section__error-banner__title',
+          style: 'display: flex; align-items: center; gap: 6px;',
         },
-        `⚠️ ${_('Section quarantined due to error (other sections continue working):')}`,
+        [
+          renderAlertTriangleIcon(14),
+          E(
+            'span',
+            {},
+            _(
+              'Section quarantined due to error (other sections continue working):',
+            ),
+          ),
+        ],
       ),
       E(
         'div',

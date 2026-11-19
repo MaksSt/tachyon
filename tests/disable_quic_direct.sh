@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# disable_quic has to reach traffic that never reaches sing-box, and since the
+# disable_quic has to reach traffic that never reaches tachyon-core, and since the
 # option became three modes (off/tunneled/all) every layer has to agree on them.
 #
-# singbox/route.uc rejects UDP/443 inside the engine, which only helps for
+# tachyon_core/route.uc rejects UDP/443 inside the engine, which only helps for
 # connections the tproxy rules handed over. A client whose destination is not
 # marked keeps using HTTP/3 straight out of br-lan, where the local DPI mangles
 # it - the measured symptom was the VK app loading nothing while Telegram, which
@@ -38,8 +38,8 @@ export NFT_LOG
 # reject with icmpx, not drop: a client whose QUIC is dropped waits out its own
 # timeout before falling back to TCP, an ICMP port-unreachable makes it
 # immediate.
-QUIC_TUNNELED_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tmeta\tmark\t&\t0x00100000\t==\t0x00100000\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
-QUIC_ALL_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
+QUIC_TUNNELED_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tmeta\tmark\t&\t0x00100000\t==\t0x00100000\tmeta\tmark\tset\tmeta\tmark\t&\t0xffefffff\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
+QUIC_ALL_RULE=$'nft\tadd\trule\tinet\tTachyonTable\tmangle\tiifname\t@tachyon_interfaces\tmeta\tl4proto\tudp\tth\tdport\t443\tmeta\tmark\tset\tmeta\tmark\t&\t0xffefffff\tcounter\treject\twith\ticmpx\ttype\tport-unreachable'
 
 base_args=(nft-create-runtime-base TachyonTable localv4 tachyon_subnets
   tachyon_ports tachyon_ip_ports tachyon_interfaces "br-lan" 0x00100000

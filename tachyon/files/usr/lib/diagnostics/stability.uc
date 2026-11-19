@@ -122,7 +122,7 @@ function scan_proc_comm_map() {
     if (proc_dir) {
         let ent;
         while ((ent = proc_dir.read()) != null) {
-            if (match(ent, /^[0-9]+$/)) {
+            if (ltrim(ent, "0123456789") == "") {
                 let comm = safe_read_file("/proc/" + ent + "/comm");
                 if (comm != "") {
                     if (!cached_proc_map[comm])
@@ -139,7 +139,7 @@ function scan_proc_comm_map() {
 function get_daemon_pids(name) {
     let pmap = scan_proc_comm_map();
 
-    if (name == "tachyon-core" || name == "sing-box") {
+    if (name == "tachyon-core") {
         let pids = [];
         let seen = {};
         let proc = require("core.process");
@@ -254,76 +254,6 @@ function get_daemon_pids(name) {
         return pids;
     }
 
-    if (name == "steer") {
-        let pids = [];
-        let seen = {};
-        let val = safe_read_file("/var/run/steer.pid");
-        if (val != "" && match(val, /^[0-9]+$/) && fs.stat("/proc/" + val) != null) {
-            push(pids, val);
-            seen[val] = true;
-        }
-        for (let pid in (pmap["steer"] || [])) {
-            if (!seen[pid]) {
-                push(pids, pid);
-                seen[pid] = true;
-            }
-        }
-        return pids;
-    }
-
-    if (name == "wdtt") {
-        let pids = [];
-        for (let comm_name in [ "qwdtt-client", "qwdtt", "wdtt" ]) {
-            for (let pid in (pmap[comm_name] || []))
-                push(pids, pid);
-        }
-        return pids;
-    }
-
-    if (name == "fptn") {
-        let pids = [];
-        let seen = {};
-        let val = safe_read_file("/var/run/tachyon/fptn/fptn.pid");
-        if (val != "" && match(val, /^[0-9]+$/) && fs.stat("/proc/" + val) != null) {
-            push(pids, val);
-            seen[val] = true;
-        }
-        for (let comm_name in [ "fptn-client-cli", "fptn-client" ]) {
-            for (let pid in (pmap[comm_name] || [])) {
-                if (!seen[pid]) {
-                    push(pids, pid);
-                    seen[pid] = true;
-                }
-            }
-        }
-        return pids;
-    }
-
-    if (name == "tailscale") {
-        return pmap["tailscaled"] || [];
-    }
-
-    if (name == "sing-box") {
-        let pids = [];
-        let seen = {};
-        for (let p in (pmap["sing-box"] || [])) {
-            push(pids, p);
-            seen[p] = true;
-        }
-        let marker = safe_read_file(constants.SB_VARIANT_STATE_FILE || "/etc/tachyon/tachyon-core-variant");
-        if (marker == "" && getenv("SB_VARIANT_STATE_FILE") == null)
-            marker = safe_read_file("/etc/tachyon/sing-box-variant");
-        if (marker != "tachyon-core") {
-            for (let p in (pmap["tachyon-core"] || [])) {
-                if (!seen[p]) {
-                    push(pids, p);
-                    seen[p] = true;
-                }
-            }
-        }
-        return pids;
-    }
-
     return pmap[name] || [];
 }
 
@@ -335,26 +265,9 @@ function find_named_pid(name) {
 function get_relevant_daemons() {
     let cfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "settings"));
     let tg_cfg = common.object_or_empty(uci_core.get_all(CONFIG_NAME, "telegram"));
-    let sections = uci_core.section_objects(CONFIG_NAME, "section") || [];
-    let servers = uci_core.section_objects(CONFIG_NAME, "server") || [];
 
-    let active_engine = "tachyon-core";
-    try {
-        active_engine = require("core.engine").get_active();
-    } catch (e) {}
-
-    let is_steer = (active_engine == "steer" || active_engine == "steer-extended");
     let list = [];
-
-    if (is_steer) {
-        push(list, "steer");
-    } else {
-        let marker = safe_read_file(constants.SB_VARIANT_STATE_FILE || "/etc/tachyon/tachyon-core-variant");
-        if (marker == "" && getenv("SB_VARIANT_STATE_FILE") == null)
-            marker = safe_read_file("/etc/tachyon/sing-box-variant");
-        let is_core = (marker == "tachyon-core");
-        push(list, is_core ? "tachyon-core" : "sing-box");
-    }
+    push(list, "tachyon-core");
 
     if (length(get_daemon_pids("tachyon")) > 0)
         push(list, "tachyon");
@@ -364,50 +277,6 @@ function get_relevant_daemons() {
 
     if (tg_cfg.enabled == "1" || length(get_daemon_pids("telegram")) > 0)
         push(list, "telegram");
-
-    let has_action = function(act) {
-        for (let s in sections) {
-            if (s.enabled != "0" && s.action == act)
-                return true;
-        }
-        return false;
-    };
-
-    let has_bin = function(paths) {
-        for (let p in paths) {
-            if (p && fs.stat(p) != null)
-                return true;
-        }
-        return false;
-    };
-
-    if ((has_action("zapret2") && has_bin([ constants.ZAPRET2_PROVIDER_NFQWS2_BIN, "/opt/zapret2/nfq2/nfqws2", "/usr/bin/nfqws2" ])) || length(get_daemon_pids("nfqws2")) > 0)
-        push(list, "nfqws2");
-
-    if ((has_action("zapret") && has_bin([ constants.ZAPRET_PROVIDER_NFQWS_BIN, "/opt/zapret/nfq/nfqws", "/usr/bin/nfqws" ])) || length(get_daemon_pids("nfqws")) > 0)
-        push(list, "nfqws");
-
-    if ((has_action("byedpi") && has_bin([ constants.BYEDPI_BIN, "/usr/bin/ciadpi" ])) || length(get_daemon_pids("ciadpi")) > 0)
-        push(list, "ciadpi");
-
-    if ((has_action("wdtt") && has_bin([ "/usr/bin/qwdtt-client", "/usr/bin/qwdtt", "/usr/bin/wdtt" ])) || length(get_daemon_pids("wdtt")) > 0)
-        push(list, "wdtt");
-
-    if ((has_action("olcrtc") && has_bin([ "/usr/bin/olcrtc" ])) || length(get_daemon_pids("olcrtc")) > 0)
-        push(list, "olcrtc");
-
-    if ((has_action("fptn") && has_bin([ "/usr/bin/fptn-client-cli", "/usr/bin/fptn-client" ])) || length(get_daemon_pids("fptn")) > 0)
-        push(list, "fptn");
-
-    let has_native_ts = false;
-    for (let srv in servers) {
-        if (srv.enabled != "0" && srv.protocol == "tailscale" && srv.tailscale_mode == "native") {
-            has_native_ts = true;
-            break;
-        }
-    }
-    if ((has_native_ts && has_bin([ "/usr/sbin/tailscaled", "/usr/bin/tailscaled" ])) || length(get_daemon_pids("tailscale")) > 0)
-        push(list, "tailscale");
 
     push(list, "dnsmasq");
     if (length(get_daemon_pids("AdGuardHome")) > 0)
@@ -459,7 +328,7 @@ function get_daemon_uptimes() {
 
 // --- Memory & Resource Pressure ---
 
-function get_memory_pressure() {
+function get_memory_pressure(daemon_uptimes) {
     let meminfo = safe_read_file("/proc/meminfo");
     let total = 0;
     let free = 0;
@@ -496,10 +365,12 @@ function get_memory_pressure() {
     else if (used_pct >= 75) pressure = "warning";
 
     // VmRSS per daemon (de-duplicating shared RssFile across multi-worker daemons)
-    let daemons = get_relevant_daemons();
+    let daemons = type(daemon_uptimes) == "object" ? keys(daemon_uptimes) : get_relevant_daemons();
     let daemon_rss = {};
     for (let d in daemons) {
-        let pids = get_daemon_pids(d);
+        let pids = (type(daemon_uptimes) == "object" && type(daemon_uptimes[d]?.pids) == "array")
+            ? map(daemon_uptimes[d].pids, function(p) { return as_string(p); })
+            : get_daemon_pids(d);
         if (length(pids) > 0) {
             let sum_anon = 0;
             let max_file = 0;
@@ -540,7 +411,7 @@ function get_memory_pressure() {
 
 // --- File Descriptors & Orphan Detection ---
 
-function get_fd_stats() {
+function get_fd_stats(daemon_uptimes) {
     let fnr = safe_read_file("/proc/sys/fs/file-nr");
     let parts = split(fnr, /[ \t]+/);
     let allocated = 0;
@@ -550,10 +421,12 @@ function get_fd_stats() {
         max = int(parts[2]) || 0;
     }
 
-    let daemons = get_relevant_daemons();
+    let daemons = type(daemon_uptimes) == "object" ? keys(daemon_uptimes) : get_relevant_daemons();
     let daemon_fds = {};
     for (let d in daemons) {
-        let pids = get_daemon_pids(d);
+        let pids = (type(daemon_uptimes) == "object" && type(daemon_uptimes[d]?.pids) == "array")
+            ? map(daemon_uptimes[d].pids, function(p) { return as_string(p); })
+            : get_daemon_pids(d);
         if (length(pids) > 0) {
             let fds = 0;
             for (let pid in pids) {
@@ -580,12 +453,12 @@ function get_fd_stats() {
 
 function get_orphan_processes() {
     let orphans = [];
-    let tracked = [ "curl", "nfqws", "nfqws2", "ciadpi" ];
+    let tracked = [ "curl" ];
     let proc_dir = fs.opendir("/proc");
     if (proc_dir) {
         let ent;
         while ((ent = proc_dir.read()) != null) {
-            if (match(ent, /^[0-9]+$/)) {
+            if (ltrim(ent, "0123456789") == "") {
                 let comm = safe_read_file("/proc/" + ent + "/comm");
                 for (let t in tracked) {
                     if (comm == t) {
@@ -667,7 +540,7 @@ function analyze_incidents_and_logs() {
             wan_flaps++;
         if (index(l, "wan.down") >= 0 || index(l, "watchdog: wan check failed") >= 0)
             wan_flaps++;
-        if ((index(l, "sing-box") >= 0 || index(l, "tachyon-core") >= 0 || index(l, "steer") >= 0) &&
+        if (index(l, "tachyon-core") >= 0 &&
             (index(l, "panic:") >= 0 || index(l, "fatal error:") >= 0 || index(l, "sigsegv") >= 0 || index(l, "died unexpectedly") >= 0))
             engine_crashes++;
         if (index(l, "dnsmasq") >= 0 &&
@@ -765,7 +638,7 @@ function compute_stability_score(incidents, memory, servers, jobs, daemons) {
     let penalties = [];
 
     // 1. Process health: engine and (if enabled) watchdog must be running
-    if (!daemons["tachyon-core"]?.running && !daemons["sing-box"]?.running && !daemons["steer"]?.running) {
+    if (!daemons["tachyon-core"]?.running) {
         score -= 40;
         push(penalties, "Routing engine is not running (-40)");
     }
@@ -842,8 +715,8 @@ function get_stability_report() {
     cached_proc_map = null;
     let sys_uptime = get_system_uptime();
     let daemons = get_daemon_uptimes();
-    let memory = get_memory_pressure();
-    let fd_stats = get_fd_stats();
+    let memory = get_memory_pressure(daemons);
+    let fd_stats = get_fd_stats(daemons);
     let orphans = get_orphan_processes();
     let incidents = analyze_incidents_and_logs();
     let jobs = get_jobs_metrics();

@@ -3,7 +3,6 @@
 let fs = require("fs");
 let common = require("core.common");
 let runtime_constants = require("tachyon_core.constants");
-let variant_state = require("tachyon_core.variant_state");
 let core_ip = require("core.ip");
 
 let as_string = common.as_string;
@@ -99,7 +98,7 @@ function users(section, protocol) {
             password: p
         }];
     }
-    if (protocol == "mieru") {
+    if (protocol == "mieru" || protocol == "wdtt") {
         let u = option(section, "server_username", "");
         let p = option(section, "server_password", "");
         return [{
@@ -125,7 +124,7 @@ function users(section, protocol) {
         }];
     }
     if (protocol == "mtproto") {
-        // MTProxyUser is { name, secret } in sing-box-extended.
+        // MTProtoUser { name, secret }.
         let user = { secret: mtproto_secret(section) };
         if (name != "")
             user.name = name;
@@ -157,7 +156,7 @@ function effective_security(section, protocol) {
     if (protocol == "shadowsocks" || protocol == "socks" || protocol == "mtproto" ||
         protocol == "tailscale" || protocol == "json_inbound" || protocol == "awg" ||
         protocol == "shadowtls" || protocol == "http" || protocol == "mixed" ||
-        protocol == "mieru")
+        protocol == "mieru" || protocol == "wdtt")
         return "none";
     if (protocol == "hysteria2" || protocol == "tuic" || protocol == "anytls" ||
         protocol == "naive" || protocol == "fptn" || protocol == "trusttunnel" ||
@@ -196,21 +195,6 @@ const REALITY_FALLBACK_KEY = [
     "hFabBa+twWj0O1utbGaZtK3HOZrYIFDVgSyo5BthogqAf2XeUwKxBdiZ",
     "-----END PRIVATE KEY-----"
 ];
-
-// True when an explicit sing-box 1.x version/marker is recorded on disk (e.g.
-// sing-box-lx 1.14.3-lx.23, sing-box-extended, stock sing-box). Those builds
-// reject tls.certificate / tls.key on a Reality inbound with
-// `certificate is unavailable in reality`, whereas tachyon-core <= 0.1.3
-// requires certificate and key in validate_server_tls even when reality is enabled.
-function is_sing_box_1x() {
-    if (variant_state.is_tachyon_core())
-        return false;
-    let version = variant_state.read_version_state();
-    let marker = variant_state.read_variant_marker();
-    if (version == "" && marker == "")
-        return false;
-    return true;
-}
 
 function apply_tls(inbound, section, protocol) {
     let security = effective_security(section, protocol);
@@ -269,23 +253,18 @@ function apply_tls(inbound, section, protocol) {
         maybe_string(reality, "max_time_difference", option(section, "reality_max_time_difference", "1m"));
         tls.reality = reality;
 
-        // tachyon-core's validate_server_tls (still current at 0.1.3) rejects a server
-        // TLS block with a missing certificate or a missing key, and it never looks at
-        // tls.reality: both sides are checked independently, with no key-vs-cert match.
-        // Go sing-box 1.x (upstream, lx, extended) is the opposite and rejects a
-        // reality inbound carrying certificate/key with `certificate is unavailable in reality`.
-        if (!is_sing_box_1x()) {
-            let cert_path = option(section, "tls_certificate_path", "");
-            let k_path = option(section, "tls_key_path", "");
-            if (cert_path != "")
-                maybe_string(tls, "certificate_path", cert_path);
-            else
-                tls.certificate = REALITY_FALLBACK_CERTIFICATE;
-            if (k_path != "")
-                maybe_string(tls, "key_path", k_path);
-            else
-                tls.key = REALITY_FALLBACK_KEY;
-        }
+        // tachyon-core's validate_server_tls checks certificate and key independently
+        // from tls.reality, so both must be populated on Reality inbounds.
+        let cert_path = option(section, "tls_certificate_path", "");
+        let k_path = option(section, "tls_key_path", "");
+        if (cert_path != "")
+            maybe_string(tls, "certificate_path", cert_path);
+        else
+            tls.certificate = REALITY_FALLBACK_CERTIFICATE;
+        if (k_path != "")
+            maybe_string(tls, "key_path", k_path);
+        else
+            tls.key = REALITY_FALLBACK_KEY;
     }
 
     inbound.tls = tls;
@@ -345,15 +324,11 @@ function shadowtls_inner_port(section) {
 }
 
 function add_standard_inbound(config, section, protocol, tag_name) {
-    // Function scope, deliberately: the AWG block below is nested, and a let
-    // declared there would not be visible where the endpoint/inbound split
-    // happens at the end of this function.
-    let endpoint_schema = variant_state.awg_endpoint_schema();
     let inbound = {
         type: protocol,
         tag: tag_name,
         listen: option(section, "listen", "0.0.0.0"),
-        listen_port: int_option(section, "listen_port", "443")
+        listen_port: int_option(section, "listen_port", protocol == "wdtt" ? "46000" : "443")
     };
 
     if (protocol == "shadowsocks") {
@@ -409,7 +384,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
             };
         }
         let detour_tag = trim(as_string(option(section, "shadowtls_detour", "")));
-        if (detour_tag == "" && variant_state.is_tachyon_core()) {
+        if (detour_tag == "") {
             detour_tag = tag_name + "-inner";
             push(config.inbounds, {
                 type: "shadowsocks",
@@ -432,7 +407,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
         let raw_lp = trim(as_string(option(section, "listen_port", "443")));
         let lp_ranges = [];
         let first_port = 0;
-        for (let token in split(replace(raw_lp, /[,\s]+/g, " "), " ")) {
+        for (let token in split(replace(raw_lp, /[, \t\r\n]+/g, " "), " ")) {
             token = trim(replace(token, ":", "-"));
             if (token == "")
                 continue;
@@ -455,7 +430,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
         }
         if (first_port > 0)
             inbound.listen_port = first_port;
-        if (variant_state.is_tachyon_core() && (length(lp_ranges) > 1 || (length(lp_ranges) == 1 && index(lp_ranges[0], "-") >= 0)))
+        if (length(lp_ranges) > 1 || (length(lp_ranges) == 1 && index(lp_ranges[0], "-") >= 0))
             inbound.listen_ports = lp_ranges;
     }
     else if (protocol == "trusttunnel") {
@@ -477,7 +452,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
         if (tr == "quic")
             inbound.quic = { enabled: true };
         let cipher = lc(trim(as_string(option(section, "tewfai_inner_cipher", ""))));
-        if (cipher == "aes-256-gcm" || cipher == "none")
+        if (cipher == "aes-256-gcm" || cipher == "none" || cipher == "null")
             inbound.inner_cipher = cipher;
         let max_streams = int_option(section, "tewfai_max_streams", "0");
         if (max_streams > 0)
@@ -498,11 +473,37 @@ function add_standard_inbound(config, section, protocol, tag_name) {
         if (mtu > 0)
             inbound.mtu = mtu;
     }
+    else if (protocol == "wdtt") {
+        let mode = lc(trim(as_string(option(section, "wdtt_mode", "csqtt"))));
+        if (mode == "all" || mode == "wg" || mode == "raw" || mode == "csqtt" || mode == "csqtt_v1")
+            inbound.mode = mode;
+        else
+            inbound.mode = "csqtt";
+        let obfs = lc(trim(as_string(option(section, "wdtt_obfs", "audio"))));
+        if (obfs == "audio" || obfs == "video" || obfs == "unified")
+            inbound.obfs = obfs;
+        let pw = option(section, "server_password", "");
+        if (pw != "")
+            inbound.password = pw;
+        let u = users(section, protocol);
+        if (length(u) > 0 && u[0].password != "")
+            inbound.users = u;
+        let raw_port = int_option(section, "wdtt_raw_port", "0");
+        if (raw_port > 0 && raw_port <= 65535)
+            inbound.raw_port = raw_port;
+        let net = trim(as_string(option(section, "wdtt_network", "10.66.0.1/16")));
+        if (net != "")
+            inbound.network = net;
+        maybe_string(inbound, "ipv4_pool", option(section, "wdtt_ipv4_pool", ""));
+        maybe_string(inbound, "raw_ipv4_pool", option(section, "wdtt_raw_ipv4_pool", ""));
+        maybe_string(inbound, "client_dns", option(section, "wdtt_client_dns", ""));
+        let mtu = int_option(section, "wdtt_mtu", "0");
+        if (mtu >= 576 && mtu <= 1500)
+            inbound.mtu = mtu;
+    }
     else if (protocol == "masque") {
         // tachyon-core's MASQUEInboundOptions: tls, users, ipv4_pool,
-        // ipv6_pool, mtu — no private_key/peers/local_address (that was the
-        // wireguard-flavoured masque of sing-box forks and is rejected by
-        // tachyon-core's strict decoder).
+        // ipv6_pool, mtu.
         let u = users(section, protocol);
         if (length(u) > 0)
             inbound.users = u;
@@ -555,35 +556,15 @@ function add_standard_inbound(config, section, protocol, tag_name) {
             inbound.users = u;
     }
     else if (protocol == "mtproto") {
-        if (variant_state.is_tachyon_core()) {
-            // tachyon-core registers this inbound as "mtproto" with 32-hex secret.
-            inbound.type = "mtproto";
-            let srv_users = users(section, protocol);
-            for (let u in srv_users) {
-                let s = lc(trim(as_string(u.secret || "")));
-                if (length(s) >= 34 && (substr(s, 0, 2) == "ee" || substr(s, 0, 2) == "dd"))
-                    u.secret = substr(s, 2, 32);
-            }
-            inbound.users = srv_users;
-        } else {
-            // sing-box-extended registers this inbound as "mtproxy" and expects
-            // MTProxyUser { name, secret }. It must never fall back to a
-            // shadowsocks-2022 shape: SS2022 parses passwords as base64 PSKs and
-            // aborts with "decode psk" on hex secrets (#23).
-            inbound.type = "mtproxy";
-            inbound.users = users(section, protocol);
-            let concurrency = option(section, "mtproto_concurrency", "");
-            if (concurrency != "")
-                inbound.concurrency = int(concurrency, 10);
-            maybe_string(inbound, "prefer_ip", option(section, "mtproto_prefer_ip", "prefer-ipv4"));
-            if (bool_option(section, "mtproto_auto_update", false))
-                inbound.auto_update = true;
-            if (bool_option(section, "mtproto_allow_fallback_on_unknown_dc", false))
-                inbound.allow_fallback_on_unknown_dc = true;
-            maybe_string(inbound, "tolerate_time_skewness", option(section, "mtproto_tolerate_time_skewness", "3s"));
-            maybe_string(inbound, "idle_timeout", option(section, "mtproto_idle_timeout", "5m"));
-            maybe_string(inbound, "handshake_timeout", option(section, "mtproto_handshake_timeout", "10s"));
+        // tachyon-core registers this inbound as "mtproto" with 32-hex secret.
+        inbound.type = "mtproto";
+        let srv_users = users(section, protocol);
+        for (let u in srv_users) {
+            let s = lc(trim(as_string(u.secret || "")));
+            if (length(s) >= 34 && (substr(s, 0, 2) == "ee" || substr(s, 0, 2) == "dd"))
+                u.secret = substr(s, 2, 32);
         }
+        inbound.users = srv_users;
     }
     else if (protocol == "awg") {
         inbound.type = "wireguard";
@@ -601,7 +582,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
         if (length(allowed_ips) == 0) {
             let allowed_str = option(section, "awg_peer_allowed_ips", option(section, "awg_allowed_ips", ""));
             if (allowed_str != "") {
-                allowed_ips = split(allowed_str, /[,\s]+/);
+                allowed_ips = split(allowed_str, /[, \t\r\n]+/);
             } else {
                 let cli_addr = option(section, "awg_client_address", "");
                 if (cli_addr != "")
@@ -643,8 +624,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
             jmax: jmax,
             s1: int_option(section, "awg_s1", "0"),
             s2: int_option(section, "awg_s2", "0"),
-            // H1-H4 use badoption.Range on both sing-box-extended and
-            // sing-box-lx, so a "min-max" string passes through.
+            // H1-H4 use Range on tachyon-core, so a "min-max" string passes through.
             h1: int_or_range_option(section, "awg_h1", 1),
             h2: int_or_range_option(section, "awg_h2", 2),
             h3: int_or_range_option(section, "awg_h3", 3),
@@ -658,12 +638,8 @@ function add_standard_inbound(config, section, protocol, tag_name) {
         let i3 = awg_cps_option(section, "awg_i3");
         let i4 = awg_cps_option(section, "awg_i4");
         let i5 = awg_cps_option(section, "awg_i5");
-        let j1 = awg_cps_option(section, "awg_j1");
-        let j2 = awg_cps_option(section, "awg_j2");
-        let j3 = awg_cps_option(section, "awg_j3");
-        let itime = int_option(section, "awg_itime", "0");
 
-        // AmneziaWG version handling: 2.0, 3.0, and 3.1 (sing-box-lx v1.14.0-lx.32+)
+        // AmneziaWG version handling: 2.0, 3.0, and 3.1
         let awg_ver = option(section, "awg_version", "");
         if (awg_ver == "") {
             if (option(section, "awg_rekey_after_time", "") != "" || option(section, "awg_rekey_timeout", "") != "" ||
@@ -678,113 +654,60 @@ function add_standard_inbound(config, section, protocol, tag_name) {
             }
         }
 
-        if (endpoint_schema) {
-            // sing-box-lx and tachyon-core expect AWG fields at the endpoint root (AWG 2.0 schema);
-            // magic headers accept a single value or an AWG 2.0 "min-max" range.
-            // j1-j3/itime are sing-box-extended-only and are not emitted here.
-            inbound.jc = amnezia.jc;
-            inbound.jmin = amnezia.jmin;
-            inbound.jmax = amnezia.jmax;
-            inbound.s1 = amnezia.s1;
-            inbound.s2 = amnezia.s2;
-            inbound.h1 = amnezia.h1;
-            inbound.h2 = amnezia.h2;
-            inbound.h3 = amnezia.h3;
-            inbound.h4 = amnezia.h4;
-            inbound.s3 = amnezia.s3;
-            inbound.s4 = amnezia.s4;
-            if (i1 != "") inbound.i1 = i1;
-            if (i2 != "") inbound.i2 = i2;
-            if (i3 != "" && i3 != "0") inbound.i3 = i3;
-            if (i4 != "" && i4 != "0") inbound.i4 = i4;
-            if (i5 != "" && i5 != "0") inbound.i5 = i5;
+        // tachyon-core expects AWG fields at the endpoint root;
+        // magic headers accept a single value or a "min-max" range.
+        inbound.jc = amnezia.jc;
+        inbound.jmin = amnezia.jmin;
+        inbound.jmax = amnezia.jmax;
+        inbound.s1 = amnezia.s1;
+        inbound.s2 = amnezia.s2;
+        inbound.h1 = amnezia.h1;
+        inbound.h2 = amnezia.h2;
+        inbound.h3 = amnezia.h3;
+        inbound.h4 = amnezia.h4;
+        inbound.s3 = amnezia.s3;
+        inbound.s4 = amnezia.s4;
+        if (i1 != "") inbound.i1 = i1;
+        if (i2 != "") inbound.i2 = i2;
+        if (i3 != "" && i3 != "0") inbound.i3 = i3;
+        if (i4 != "" && i4 != "0") inbound.i4 = i4;
+        if (i5 != "" && i5 != "0") inbound.i5 = i5;
 
-            if (awg_ver == "3.0" || awg_ver == "3.1") {
-                let hpk = option(section, "awg_header_protection_key", "");
-                if (hpk != "") {
-                    // Ensure S1-S4 are >= 12 if header_protection_key is set (sing-box-lx schema requirement)
-                    if (inbound.s1 < 12) inbound.s1 = 20;
-                    if (inbound.s2 < 12) inbound.s2 = 20;
-                    if (inbound.s3 < 12) inbound.s3 = 20;
-                    if (inbound.s4 < 12) inbound.s4 = 20;
-                    inbound.header_protection_key = hpk;
-                }
-
-                let cpa = option(section, "awg_content_padding_addition", "");
-                if (cpa != "") inbound.content_padding_addition = cpa;
+        if (awg_ver == "3.0" || awg_ver == "3.1") {
+            let hpk = option(section, "awg_header_protection_key", "");
+            if (hpk != "") {
+                // Ensure S1-S4 are >= 12 if header_protection_key is set
+                if (inbound.s1 < 12) inbound.s1 = 20;
+                if (inbound.s2 < 12) inbound.s2 = 20;
+                if (inbound.s3 < 12) inbound.s3 = 20;
+                if (inbound.s4 < 12) inbound.s4 = 20;
+                inbound.header_protection_key = hpk;
             }
 
-            if (awg_ver == "3.1") {
-                let rka = option(section, "awg_rekey_after_time", "");
-                if (rka != "") inbound.rekey_after_time = rka;
+            let cpa = option(section, "awg_content_padding_addition", "");
+            if (cpa != "") inbound.content_padding_addition = cpa;
+        }
 
-                let rkt = option(section, "awg_rekey_timeout", "");
-                if (rkt != "") inbound.rekey_timeout = rkt;
+        if (awg_ver == "3.1") {
+            let rka = option(section, "awg_rekey_after_time", "");
+            if (rka != "") inbound.rekey_after_time = rka;
 
-                let rja = option(section, "awg_reject_after_time", "");
-                if (rja != "") inbound.reject_after_time = rja;
+            let rkt = option(section, "awg_rekey_timeout", "");
+            if (rkt != "") inbound.rekey_timeout = rkt;
 
-                let kpt = option(section, "awg_keepalive_timeout", "");
-                if (kpt != "") inbound.keepalive_timeout = kpt;
+            let rja = option(section, "awg_reject_after_time", "");
+            if (rja != "") inbound.reject_after_time = rja;
 
-                let mha = option(section, "awg_max_handshake_attempts", "");
-                if (mha != "") inbound.max_handshake_attempts = mha;
+            let kpt = option(section, "awg_keepalive_timeout", "");
+            if (kpt != "") inbound.keepalive_timeout = kpt;
 
-                if (bool_option(section, "awg_random_trailers", false))
-                    inbound.random_trailers = true;
-                if (bool_option(section, "awg_disable_cookies", false))
-                    inbound.disable_cookies = true;
-            }
-        } else {
-            if (i1 != "") amnezia.i1 = i1;
-            if (i2 != "") amnezia.i2 = i2;
-            if (i3 != "" && i3 != "0") amnezia.i3 = i3;
-            if (i4 != "" && i4 != "0") amnezia.i4 = i4;
-            if (i5 != "" && i5 != "0") amnezia.i5 = i5;
-            // j1-j3/itime were removed from the extended schema in 2.6.1 and
-            // sing-box fatals on unknown fields, so emit them only for builds
-            // whose schema still accepts them.
-            let sb_version = variant_state.read_version_state();
-            if (common.extended_awg_schema_has_junk_signatures(sb_version)) {
-                if (j1 != "") amnezia.j1 = j1;
-                if (j2 != "") amnezia.j2 = j2;
-                if (j3 != "") amnezia.j3 = j3;
-                if (itime > 0) amnezia.itime = itime;
-            }
+            let mha = option(section, "awg_max_handshake_attempts", "");
+            if (mha != "") inbound.max_handshake_attempts = mha;
 
-            // sing-box-extended 2.7.0+ supports AWG 3.0 / 3.1 inside the amnezia object
-            if (awg_ver == "3.0" || awg_ver == "3.1") {
-                let hpk = option(section, "awg_header_protection_key", "");
-                if (hpk != "") {
-                    if (amnezia.s1 < 12) amnezia.s1 = 20;
-                    if (amnezia.s2 < 12) amnezia.s2 = 20;
-                    if (amnezia.s3 < 12) amnezia.s3 = 20;
-                    if (amnezia.s4 < 12) amnezia.s4 = 20;
-                    amnezia.header_protection_key = hpk;
-                }
-
-                let cpa = option(section, "awg_content_padding_addition", "");
-                if (cpa != "") amnezia.content_padding_addition = cpa;
-            }
-
-            if (awg_ver == "3.1") {
-                let rka = option(section, "awg_rekey_after_time", "");
-                if (rka != "") amnezia.rekey_after_time = rka;
-
-                let rkt = option(section, "awg_rekey_timeout", "");
-                if (rkt != "") amnezia.rekey_timeout = rkt;
-
-                let rja = option(section, "awg_reject_after_time", "");
-                if (rja != "") amnezia.reject_after_time = rja;
-
-                let kpt = option(section, "awg_keepalive_timeout", "");
-                if (kpt != "") amnezia.keepalive_timeout = kpt;
-
-                let mha = option(section, "awg_max_handshake_attempts", "");
-                if (mha != "") amnezia.max_handshake_attempts = mha;
-            }
-
-            inbound.amnezia = amnezia;
+            if (bool_option(section, "awg_random_trailers", false))
+                inbound.random_trailers = true;
+            if (bool_option(section, "awg_disable_cookies", false))
+                inbound.disable_cookies = true;
         }
     }
     else {
@@ -797,7 +720,7 @@ function add_standard_inbound(config, section, protocol, tag_name) {
         let server_port = int_option(section, "awg_server_port", int_option(section, "listen_port", 51820));
         inbound.listen_port = server_port;
     }
-    if (protocol == "awg" && endpoint_schema) {
+    if (protocol == "awg") {
         delete inbound.listen;
         if (!config.endpoints)
             config.endpoints = [];
@@ -823,35 +746,61 @@ function add_json_inbound(config, section, tag_name) {
 
 function add_tailscale_endpoint(config, section, tag_name) {
     let section_name = section[".name"];
+    let ephemeral = bool_option(section, "tailscale_ephemeral", false);
+    let safe_name = safe_filename(section_name);
+    let state_dir = (ephemeral ? "/var/run/tachyon/tailscale/" : "/etc/tachyon/tailscale/") + safe_name;
     let endpoint = {
         type: "tailscale",
         tag: tag_name,
-        state_directory: "/etc/tachyon/tailscale/" + safe_filename(section_name),
-        auth_key: option(section, "tailscale_auth_key", ""),
+        state_directory: state_dir,
         control_url: option(section, "tailscale_control_url", "https://controlplane.tailscale.com"),
-        hostname: option(section, "tailscale_hostname", "tachyon-" + safe_filename(section_name))
+        hostname: option(section, "tailscale_hostname", "tachyon-" + safe_name)
     };
+    let auth_key = trim(option(section, "tailscale_auth_key", ""));
+    if (auth_key != "")
+        endpoint.auth_key = auth_key;
+    if (ephemeral)
+        endpoint.ephemeral = true;
     if (bool_option(section, "tailscale_accept_routes", false))
         endpoint.accept_routes = true;
+    let exit_node = trim(option(section, "tailscale_exit_node", ""));
+    if (exit_node != "")
+        endpoint.exit_node = exit_node;
+    if (bool_option(section, "tailscale_exit_node_allow_lan_access", false))
+        endpoint.exit_node_allow_lan_access = true;
     let advertise_routes = list_option(section, "tailscale_advertise_routes");
     if (length(advertise_routes) > 0)
         endpoint.advertise_routes = advertise_routes;
     if (bool_option(section, "tailscale_advertise_exit_node", false))
         endpoint.advertise_exit_node = true;
+    let relay_port = int_option(section, "tailscale_relay_server_port", 0);
+    if (relay_port > 0)
+        endpoint.relay_server_port = relay_port;
+    let relay_endpoints = list_option(section, "tailscale_relay_server_static_endpoints");
+    if (length(relay_endpoints) > 0)
+        endpoint.relay_server_static_endpoints = relay_endpoints;
+    if (bool_option(section, "tailscale_system_interface", false)) {
+        endpoint.system_interface = true;
+        let sys_iface_name = trim(option(section, "tailscale_system_interface_name", ""));
+        if (sys_iface_name != "")
+            endpoint.system_interface_name = sys_iface_name;
+        let sys_iface_mtu = int_option(section, "tailscale_system_interface_mtu", 0);
+        if (sys_iface_mtu > 0)
+            endpoint.system_interface_mtu = sys_iface_mtu;
+    }
+    let udp_timeout = trim(option(section, "tailscale_udp_timeout", ""));
+    if (udp_timeout != "")
+        endpoint.udp_timeout = udp_timeout;
+    if (!config.endpoints)
+        config.endpoints = [];
     push(config.endpoints, endpoint);
-}
-
-function is_native_tailscale(section) {
-    return option(section, "protocol", "vless") == "tailscale" &&
-        option(section, "tailscale_mode", "singbox") == "native";
 }
 
 function add_dns_bypass(config, section) {
     if (option(section, "protocol", "vless") != "tailscale")
         return;
-    // Native mode runs tailscaled outside sing-box; MagicDNS is served by
-    // dnsmasq instead of a sing-box DNS server.
-    if (is_native_tailscale(section))
+
+    if (!bool_option(section, "tailscale_accept_dns", true))
         return;
 
     let section_name = section[".name"];
@@ -862,19 +811,27 @@ function add_dns_bypass(config, section) {
         type: "tailscale",
         tag: dns_tag,
         endpoint: inbound,
-        accept_default_resolvers: true
+        accept_default_resolvers: bool_option(section, "tailscale_accept_default_resolvers", true)
     });
-    push(config.dns.rules, {
-        action: "route",
-        server: dns_tag,
-        inbound,
-        __service_tag: rule_tag
-    });
+    if (!bool_option(section, "tailscale_advertise_exit_node", false)) {
+        push(config.dns.rules, {
+            action: "route",
+            server: dns_tag,
+            inbound,
+            __service_tag: rule_tag
+        });
+    }
     push(config.dns.rules, {
         action: "route",
         server: dns_tag,
         domain_suffix: [ "ts.net" ],
         __service_tag: rule_tag + "-magicdns"
+    });
+    push(config.dns.rules, {
+        action: "route",
+        server: dns_tag,
+        preferred_by: inbound,
+        __service_tag: rule_tag + "-preferred"
     });
 }
 
@@ -883,11 +840,8 @@ function add_server(config, section) {
     let protocol = option(section, "protocol", "vless");
     let tag_name = runtime_constants.server_inbound_tag(section_name);
 
-    if (protocol == "tailscale") {
-        if (is_native_tailscale(section))
-            return;
+    if (protocol == "tailscale")
         add_tailscale_endpoint(config, section, tag_name);
-    }
     else if (protocol == "json_inbound")
         add_json_inbound(config, section, tag_name);
     else
@@ -917,7 +871,6 @@ function value_contains(value, item) {
 function add_sniff_rule(config, section) {
     let base_tag = runtime_constants.server_inbound_tag(section[".name"]);
     let tag = (option(section, "protocol", "vless") == "shadowtls" &&
-        variant_state.is_tachyon_core() &&
         trim(as_string(option(section, "shadowtls_detour", ""))) == "")
         ? (base_tag + "-inner")
         : base_tag;
@@ -947,60 +900,97 @@ function add_sniff_rule(config, section) {
     config.route.rules = result;
 }
 
+function clone_rule_value(val) {
+    let t = type(val);
+    if (t == "array") {
+        let out = [];
+        for (let item in val)
+            push(out, clone_rule_value(item));
+        return out;
+    }
+    if (t == "object") {
+        let out = {};
+        for (let k, v in val)
+            out[k] = clone_rule_value(v);
+        return out;
+    }
+    return val;
+}
+
+function rule_has_inbound(rule, inbound_tag) {
+    if (type(rule) != "object")
+        return false;
+    if (value_contains(rule.inbound, inbound_tag))
+        return true;
+    if (rule.type == "logical" && type(rule.rules) == "array") {
+        for (let child in rule.rules) {
+            if (rule_has_inbound(child, inbound_tag))
+                return true;
+        }
+    }
+    return false;
+}
+
+function rule_contains_domain(rule, domain_name) {
+    if (type(rule) != "object" || domain_name == "")
+        return false;
+    if (value_contains(rule.domain, domain_name))
+        return true;
+    if (rule.type == "logical" && type(rule.rules) == "array") {
+        for (let child in rule.rules) {
+            if (rule_contains_domain(child, domain_name))
+                return true;
+        }
+    }
+    return false;
+}
+
+function rule_has_positive_source_ip(rule) {
+    if (type(rule) != "object")
+        return false;
+    if (rule.source_ip_cidr != null && !rule.invert)
+        return true;
+    if (rule.type == "logical" && rule.mode == "and" && type(rule.rules) == "array") {
+        for (let child in rule.rules) {
+            if (rule_has_positive_source_ip(child))
+                return true;
+        }
+    }
+    return false;
+}
+
+function rewrite_rule_inbound(rule, source_inbound, target_inbound) {
+    if (type(rule) != "object")
+        return;
+    if (value_contains(rule.inbound, source_inbound))
+        rule.inbound = target_inbound;
+    if (rule.type == "logical" && type(rule.rules) == "array") {
+        for (let child in rule.rules)
+            rewrite_rule_inbound(child, source_inbound, target_inbound);
+    }
+}
+
 function clone_rules_for_inbound(config, source_inbound, target_inbound, skip_domain) {
     let cloned_rules = [];
     for (let rule in array_or_empty(config.route.rules)) {
         if (type(rule) != "object")
             continue;
+        if (rule.__skip_server_clone)
+            continue;
         if (rule.action != "route" && rule.action != "reject" && rule.action != "resolve")
             continue;
-        let matches = value_contains(rule.inbound, source_inbound);
-        if (rule.type == "logical" && rule.mode == "and" && type(rule.rules) == "array") {
-            for (let child in rule.rules) {
-                if (type(child) == "object" && value_contains(child.inbound, source_inbound))
-                    matches = true;
-            }
-        }
-        if (!matches)
+        if (!rule_has_inbound(rule, source_inbound))
+            continue;
+        if (rule_contains_domain(rule, skip_domain))
+            continue;
+        if (rule.source_ip_cidr != null || rule_has_positive_source_ip(rule))
             continue;
 
-        let skips_domain = false;
-        if (skip_domain != "") {
-            if (value_contains(rule.domain, skip_domain))
-                skips_domain = true;
-            if (rule.type == "logical" && type(rule.rules) == "array") {
-                for (let child in rule.rules) {
-                    if (type(child) == "object" && value_contains(child.domain, skip_domain))
-                        skips_domain = true;
-                }
-            }
-        }
-        if (skips_domain)
-            continue;
-
-        if (rule.source_ip_cidr != null)
-            continue;
-        let has_positive_source_ip = false;
-        if (rule.type == "logical" && rule.mode == "and" && type(rule.rules) == "array") {
-            for (let child in rule.rules) {
-                if (type(child) == "object" && child.source_ip_cidr != null && !child.invert)
-                    has_positive_source_ip = true;
-            }
-        }
-        if (has_positive_source_ip)
-            continue;
-
-        let cloned = json(sprintf("%J", rule));
+        let cloned = clone_rule_value(rule);
         if (type(cloned) != "object")
             continue;
-        if (value_contains(cloned.inbound, source_inbound))
-            cloned.inbound = target_inbound;
-        if (cloned.type == "logical" && cloned.mode == "and" && type(cloned.rules) == "array") {
-            for (let child in cloned.rules) {
-                if (type(child) == "object" && value_contains(child.inbound, source_inbound))
-                    child.inbound = target_inbound;
-            }
-        }
+        delete cloned.__skip_server_clone;
+        rewrite_rule_inbound(cloned, source_inbound, target_inbound);
         push(cloned_rules, cloned);
     }
     for (let cloned_rule in cloned_rules)
@@ -1011,6 +1001,5 @@ return {
     add_server,
     add_sniff_rule,
     clone_rules_for_inbound,
-    is_native_tailscale,
     shadowtls_inner_port
 };

@@ -52,15 +52,7 @@ function background_command(command) {
         as_string(command) + "; } </dev/null >/dev/null 2>&1 &";
 }
 
-function normalize_status(status) {
-    status = int(status);
-    if (status == -1)
-        return 255;
-    let signal = status & 127;
-    if (signal != 0)
-        return 128 + signal;
-    return (status >> 8) & 255;
-}
+let normalize_status = common.normalize_status;
 
 let command_status = common.command_status;
 
@@ -166,7 +158,7 @@ function pid_alive(pid) {
     if (match(pid, /^[0-9]+$/) == null || !command_success_from_args([ "kill", "-0", pid ]))
         return false;
     let cmd = fs.readfile("/proc/" + pid + "/cmdline");
-    if (cmd != null && match(cmd, /ucode|tachyon|sh|sing-box/) == null)
+    if (cmd != null && match(cmd, /ucode|tachyon|sh/) == null)
         return false;
     return true;
 }
@@ -334,15 +326,16 @@ function run_pending_reload_if_requested(path, init_script) {
     // One launch site for both outcomes, so this file does not grow a second
     // background invocation.
     let apply_in_place = reason == PENDING_RELOAD_SOFT_APPLY_REASON;
-    let message = apply_in_place ? "Applying pending subscription recovery in place" : "Applying pending Tachyon reload";
+    let reload_arg = reason == "force" ? "force" : "pending";
     let command = apply_in_place
         ? command_from_args([
             "ucode", "-L", LIB_DIR, LIB_DIR + "/components/updates.uc",
             "subscription-deferred-recovery-apply"
         ])
-        : shell_quote(init_script) + " reload pending";
+        : shell_quote(init_script) + " reload " + reload_arg;
 
-    command_success_from_args([ "logger", "-t", SERVICE_NAME, "[info] " + message ]);
+    if (apply_in_place)
+        command_success_from_args([ "logger", "-t", SERVICE_NAME, "[info] Applying pending subscription recovery in place" ]);
     system(background_command(command));
 }
 
@@ -520,9 +513,13 @@ function retry_start_on_wan_up_action(runtime_running_value, service_enabled_val
 }
 
 function retry_start_on_wan_up(owner_pid) {
+    if (file_exists(RUNTIME_STATE_DIR + "/reset-stopped") || file_exists(RUNTIME_STATE_DIR + "/starting"))
+        return 0;
+    let retry_pending = start_retry_pending(START_RETRY_FILE);
+    if (!file_exists(BOOT_COMPLETED_FILE) && !retry_pending)
+        return 0;
     let running = runtime_is_running();
     let enabled = service_is_enabled();
-    let retry_pending = start_retry_pending(START_RETRY_FILE);
     let shutdown_correctly = option(uci_settings(), "shutdown_correctly", "1");
     let action = retry_start_on_wan_up_action(
         running ? "1" : "0",
@@ -549,7 +546,15 @@ function retry_start_on_wan_up(owner_pid) {
     // duration of the init.d script, so a nested /etc/init.d/tachyon call would
     // block forever waiting for that same lock (recursive flock self-deadlock).
     // Call BIN_PATH directly, the same way start_service and stop_service do.
-    return command_status_from_args([ BIN_PATH, "restart" ]);
+    let rc = command_status_from_args([ BIN_PATH, "restart" ]);
+    if (rc == 0) {
+        clear_start_retry(START_RETRY_FILE);
+        cancel_scheduled_start_retry(START_RETRY_PID_FILE);
+    } else {
+        mark_start_retry(START_RETRY_FILE, "retry_failed");
+        schedule_start_retry(START_RETRY_PID_FILE, "60");
+    }
+    return rc;
 }
 
 function active_service_action_value() {
@@ -607,7 +612,7 @@ function system_uptime_seconds() {
     return int(field);
 }
 
-// Cold boot and WAN-up retries race the network coming up, so sing-box can take far
+// Cold boot and WAN-up retries race the network coming up, so tachyon-core can take far
 // longer to reach a stable state than on a start the user asked for. rc.common calls
 // boot() as a plain argument-less start, so the reason alone cannot tell the two
 // apart: a start early in uptime is treated as cold. Those paths keep the generous
@@ -649,7 +654,7 @@ function boot_service(owner_pid) {
     ensure_parent_dir(BOOT_COMPLETED_FILE);
     write_text_file(BOOT_COMPLETED_FILE, "1\n");
     let settings = uci_settings();
-    if (option(settings, "shutdown_correctly", "1") == "0") {
+    if (!runtime_is_running() && !file_exists(RUNTIME_STATE_DIR + "/starting") && option(settings, "shutdown_correctly", "1") == "0") {
         command_success_from_args([ "logger", "-t", SERVICE_NAME, "[warn] Unclean reboot detected; restoring dnsmasq to failsafe" ]);
         restore_dnsmasq_failsafe();
     }
@@ -666,7 +671,7 @@ function start_service(reason, owner_pid) {
     let verify_timeout = start_verify_timeout(reason, null);
     let start_command = command_from_args([ BIN_PATH, "start" ]);
     if (verify_timeout != "")
-        start_command = "TACHYON_SING_BOX_START_VERIFY_TIMEOUT=" +
+        start_command = "TACHYON_CORE_START_VERIFY_TIMEOUT=" +
             shell_quote(verify_timeout) + " " + start_command;
 
     let status = command_status(start_command);
@@ -716,7 +721,12 @@ function stop_service(owner_pid) {
         return 1;
     }
 
-    let status = command_status_from_args([ BIN_PATH, "stop" ]);
+    let status = 0;
+    if (file_exists(RUNTIME_STATE_DIR + "/reset-stopped")) {
+        unlink_file(RUNTIME_STATE_DIR + "/reset-stopped");
+    } else {
+        status = command_status_from_args([ BIN_PATH, "stop" ]);
+    }
     // These survive tachyon stop because background subprocesses (reload_firewall,
     // restart) inherit the logread pipe read-end, preventing SIGPIPE delivery.
     // BusyBox lacks pkill, so we use pgrep + kill via common.kill_orphaned_logread().
@@ -773,6 +783,7 @@ function reload_begin_value(reason, owner_pid, runtime_running_value, service_en
             return { action: "skip", job_id: "" };
         }
 
+        command_success_from_args([ "logger", "-t", SERVICE_NAME, "[info] Applying pending Tachyon reload" ]);
         unlink_file(SERVICE_TRIGGER_SYNC_FILE);
         let job_id = begin_external_service_action("reload", "initd", owner_pid);
         return { action: "run", job_id };
@@ -852,7 +863,7 @@ function trigger_plan(settings) {
 
     print("delay\t", delay, "\n");
     print("config\tconfig.change\t", CONFIG_NAME, "\t", SERVICE_INIT, "\treload\t", CONFIG_CHANGE_REASON, "\n");
-    let retry_ifaces = [ "wan", "wwan", "lte", "modem", "lan" ];
+    let retry_ifaces = [ "wan", "wan2", "secondwan", "wwan", "tethering", "lte", "modem", "lan" ];
     for (let iface in retry_ifaces)
         print("interface\tinterface.*.up\t", iface, "\t", SERVICE_INIT, "\tretry_start_on_wan_up\t\n");
 

@@ -3,13 +3,14 @@
 // Tachyon Service Check - probe engine for Tachyon.
 //
 // Проверяет доступность сервисов так, как это делает клиент сети: имя резолвится
-// через тот же dnsmasq -> sing-box, а соединение уходит из роутера и попадает в
+// через тот же dnsmasq -> tachyon-core, а соединение уходит из роутера и попадает в
 // цепочку mangle_output -> tproxy, то есть тем же путём, что трафик из LAN.
 // В режиме netns трафик реально входит через br-lan из отдельного namespace,
 // что дополнительно воспроизводит правила секций, привязанные к source IP.
 
 let fs = require("fs");
 let common = require("core.common");
+let core_ip = require("core.ip");
 let uci_core = require("core.uci");
 let connections = require("config.connections");
 
@@ -19,7 +20,7 @@ const PROFILES_OVERRIDE = "/etc/tachyon/servicecheck_profiles.json";
 const PROFILES_DEFAULT = "/usr/share/tachyon/servicecheck_profiles.json";
 const STATE_DIR = "/var/run/tachyon-servicecheck";
 const TACHYON_BIN = "/usr/bin/tachyon";
-const DEFAULT_SING_BOX_CONFIG = "/etc/tachyon-core/config.json";
+const DEFAULT_TACHYON_CORE_CONFIG = "/etc/tachyon-core/config.json";
 const NETNS_NAME = "fkpsc";
 const NETNS_VETH_HOST = "fkpsc0";
 const NETNS_VETH_PEER = "fkpsc1";
@@ -206,7 +207,7 @@ function download_profiles_from_repo() {
 }
 
 function load_profiles_data() {
-    let override = getenv("TACHYON_SC_PROFILES") || getenv("FORKOP_SC_PROFILES");
+    let override = getenv("TACHYON_SC_PROFILES");
     if (as_string(override) != "") {
         let data = fs.readfile(as_string(override));
         if (data != null && length(trim(data)) > 0) return data;
@@ -226,7 +227,7 @@ function load_profiles_data() {
 }
 
 function profiles_file() {
-    let override = getenv("TACHYON_SC_PROFILES") || getenv("FORKOP_SC_PROFILES");
+    let override = getenv("TACHYON_SC_PROFILES");
     if (as_string(override) != "")
         return as_string(override);
     if (fs.stat(PROFILES_OVERRIDE) != null)
@@ -349,11 +350,11 @@ function backend_name(id) {
     id = as_string(id);
     if (id == "tachyon")
         return "Tachyon";
-    return "Sing-box";
+    return "Tachyon Core";
 }
 
-function sing_box_config_path() {
-    let overridden = trim(as_string(getenv("TACHYON_SC_SING_BOX_CONFIG")));
+function tachyon_core_config_path() {
+    let overridden = trim(as_string(getenv("TACHYON_SC_CORE_CONFIG")));
     if (overridden != "")
         return overridden;
 
@@ -363,7 +364,7 @@ function sing_box_config_path() {
             return configured;
     }
 
-    return DEFAULT_SING_BOX_CONFIG;
+    return DEFAULT_TACHYON_CORE_CONFIG;
 }
 
 function lan_interface() {
@@ -385,7 +386,7 @@ function interface_ipv4(interface) {
 
 function fakeip_ranges() {
     let ranges = [];
-    let config = read_json_file(sing_box_config_path());
+    let config = read_json_file(tachyon_core_config_path());
     let dns = object_or_empty(object_or_empty(config).dns);
 
     for (let server in array_or_empty(dns.servers)) {
@@ -406,20 +407,131 @@ function fakeip_ranges() {
     return ranges;
 }
 
-function forkop_running() {
+function fakeip6_ranges() {
+    let ranges = [];
+    let config = read_json_file(tachyon_core_config_path());
+    let dns = object_or_empty(object_or_empty(config).dns);
+
+    for (let server in array_or_empty(dns.servers)) {
+        server = object_or_empty(server);
+        if (as_string(server.type) == "fakeip") {
+            if (as_string(server.inet6_range) != "")
+                push(ranges, as_string(server.inet6_range));
+        }
+    }
+
+    let legacy = object_or_empty(dns.fakeip);
+    if (as_string(legacy.inet6_range) != "")
+        push(ranges, as_string(legacy.inet6_range));
+
+    if (length(ranges) == 0)
+        push(ranges, "fc00::/18");
+
+    return ranges;
+}
+
+function expand_ipv6_groups(ip_str) {
+    let clean = lc(trim(as_string(ip_str)));
+    let zone = index(clean, "%");
+    if (zone >= 0)
+        clean = substr(clean, 0, zone);
+    if (!core_ip.valid_ipv6(clean))
+        return null;
+
+    let halves = split(clean, "::");
+    if (length(halves) > 2)
+        return null;
+
+    let parse_side = function(part) {
+        let out = [];
+        if (part == "")
+            return out;
+        for (let seg in split(part, ":")) {
+            if (seg == "" || !match(seg, /^[0-9a-f]{1,4}$/))
+                return null;
+            push(out, int(seg, 16));
+        }
+        return out;
+    };
+
+    let left = parse_side(halves[0]);
+    if (left == null)
+        return null;
+    if (length(halves) == 1)
+        return length(left) == 8 ? left : null;
+
+    let right = parse_side(halves[1]);
+    if (right == null)
+        return null;
+    let missing = 8 - length(left) - length(right);
+    if (missing < 0)
+        return null;
+
+    let groups = [];
+    for (let v in left)
+        push(groups, v);
+    for (let i = 0; i < missing; i++)
+        push(groups, 0);
+    for (let v in right)
+        push(groups, v);
+    return length(groups) == 8 ? groups : null;
+}
+
+function ipv6_in_cidr(ip_str, cidr_str) {
+    cidr_str = trim(as_string(cidr_str));
+    let slash = index(cidr_str, "/");
+    let net_ip = slash >= 0 ? substr(cidr_str, 0, slash) : cidr_str;
+    let mask_bits = slash >= 0 ? int(substr(cidr_str, slash + 1)) : 128;
+    if (mask_bits < 0 || mask_bits > 128)
+        return false;
+
+    let ip_groups = expand_ipv6_groups(ip_str);
+    let net_groups = expand_ipv6_groups(net_ip);
+    if (ip_groups == null || net_groups == null)
+        return false;
+    if (mask_bits == 0)
+        return true;
+
+    let full_groups = int(mask_bits / 16);
+    for (let i = 0; i < full_groups; i++) {
+        if (ip_groups[i] != net_groups[i])
+            return false;
+    }
+
+    let rem = mask_bits % 16;
+    if (rem > 0) {
+        let shift = 16 - rem;
+        let div = 1;
+        for (let i = 0; i < shift; i++)
+            div = div * 2;
+        if (int(ip_groups[full_groups] / div) != int(net_groups[full_groups] / div))
+            return false;
+    }
+    return true;
+}
+
+function ipv6_in_any_cidr(ip_str, cidrs) {
+    for (let cidr in (type(cidrs) == "array" ? cidrs : [ "fc00::/18" ])) {
+        if (ipv6_in_cidr(ip_str, cidr))
+            return true;
+    }
+    return false;
+}
+
+function tachyon_running() {
     let backend = backend_id();
     if (backend != "tachyon")
         return false;
 
     let result = capture_args([ TACHYON_BIN, "get_status" ], false);
     if (result.status != 0)
-        return run_quiet([ "pgrep", "-f", "tachyon-core|sing-box" ]);
+        return run_quiet([ "pgrep", "-f", "tachyon-core" ]);
 
     let status = object_or_empty(parse_json(result.output));
     if (status.running === true || int(status.running) == 1)
         return true;
     if (status.running == null)
-        return run_quiet([ "pgrep", "-f", "tachyon-core|sing-box" ]);
+        return run_quiet([ "pgrep", "-f", "tachyon-core" ]);
     return false;
 }
 
@@ -443,7 +555,7 @@ function detect_nc_mode() {
 
 function capabilities() {
     let backend = backend_id();
-    let running = forkop_running();
+    let running = tachyon_running();
     let interface = lan_interface();
     let address = interface_ipv4(interface);
     let nc_mode = detect_nc_mode();
@@ -461,16 +573,13 @@ function capabilities() {
         lan_address: address == null ? "" : address.address,
         lan_prefix: address == null ? 0 : address.prefix,
         fakeip_ranges: fakeip_ranges(),
+        fakeip6_ranges: fakeip6_ranges(),
         backend,
         backend_name: backend_name(backend),
         backend_installed: backend != "none",
         backend_running: running,
-        forkop_installed: false,
-        podkop_installed: false,
         fixes_available: false,
-        sing_box_config: sing_box_config_path(),
-        // Старое поле оставлено для совместимости со страницей предыдущих версий.
-        forkop_running: running,
+        tachyon_core_config: tachyon_core_config_path(),
         profiles_version: int(object_or_empty(read_json_file(profiles_file())).version || 0)
     };
 }
@@ -556,8 +665,8 @@ function profiles_save(payload) {
         return 1;
     }
 
-    if (!run_quiet([ "mkdir", "-p", "/etc/forkop-servicecheck" ])) {
-        write_json({ success: false, message: "не удалось создать /etc/forkop-servicecheck" });
+    if (!run_quiet([ "mkdir", "-p", "/etc/tachyon" ])) {
+        write_json({ success: false, message: "не удалось создать /etc/tachyon" });
         return 1;
     }
 
@@ -618,11 +727,12 @@ function prefixed_args(ctx, args) {
 }
 
 function probe_dns(ctx, host) {
-    if (valid_ipv4(host))
+    if (valid_ipv4(host) || core_ip.valid_ipv6(host))
         return { ok: true, ip: host, fakeip: false, ms: 0, error: "", skipped: true };
 
     let started = now_ms();
     let addresses = [];
+    let addresses6 = [];
 
     if (ctx.tools.dig) {
         let result = capture_args(prefixed_args(ctx, [
@@ -647,10 +757,46 @@ function probe_dns(ctx, host) {
         }
     }
 
+    if (length(addresses) == 0) {
+        let eff_v6 = common.resolve_effective_ipv6_state(uci_core.get_all("tachyon", "settings") || {}, null);
+        if (eff_v6.ipv6_active) {
+            if (ctx.tools.dig) {
+                let res6 = capture_args(prefixed_args(ctx, [
+                    "dig", "@" + ctx.resolver, as_string(host), "AAAA", "+short",
+                    "+timeout=" + as_string(DNS_TIMEOUT), "+tries=1"
+                ]), false);
+                for (let line in split(res6.output, "\n")) {
+                    line = trim(as_string(line));
+                    if (core_ip.valid_ipv6(line))
+                        push(addresses6, line);
+                }
+            }
+            else if (ctx.tools.nslookup) {
+                let res6 = capture_args(prefixed_args(ctx, [ "nslookup", "-type=aaaa", as_string(host), ctx.resolver ]), true);
+                for (let line in split(res6.output, "\n")) {
+                    let matched6 = match(trim(as_string(line)), /^Address[ \t0-9]*:[ \t]+([0-9a-fA-F:]+)/);
+                    if (matched6 != null && core_ip.valid_ipv6(matched6[1]) && matched6[1] != ctx.resolver)
+                        push(addresses6, matched6[1]);
+                }
+            }
+        }
+    }
+
     let elapsed = now_ms() - started;
 
-    if (length(addresses) == 0)
+    if (length(addresses) == 0) {
+        if (length(addresses6) > 0) {
+            return {
+                ok: true,
+                ip: addresses6[0],
+                all: addresses6,
+                fakeip: ipv6_in_any_cidr(addresses6[0], ctx.fakeip6_ranges || [ "fc00::/18" ]),
+                ms: elapsed,
+                error: ""
+            };
+        }
         return { ok: false, ip: "", fakeip: false, ms: elapsed, error: "нет A-записи" };
+    }
 
     return {
         ok: true,
@@ -672,11 +818,11 @@ function curl_failure_verdict(status, output) {
     if (status == 28)
         return { verdict: "timeout", message: "таймаут соединения" };
     // Три "ошибки TLS" у curl имеют совершенно разные причины, и валить их в одну
-    // строку - значит прятать диагноз. 35 - хендшейк оборвали (типовая подпись DPI),
+    // строку - значит прятать диагноз. 35 - хендшейк оборвали (сетевой сброс на маршруте),
     // 51 - сертификат отклонён, 60 - сертификат не удалось проверить, а это почти
     // всегда сбитые часы роутера (нет RTC) или отсутствующий ca-bundle.
     if (status == 35)
-        return { verdict: "tls_handshake", message: "TLS-хендшейк оборван — похоже на DPI или несовместимый TLS" };
+        return { verdict: "tls_handshake", message: "TLS-хендшейк оборван на транзитном узле или из-за несовместимого TLS" };
     if (status == 51)
         return { verdict: "tls_cert_rejected", message: "сертификат сервера отклонён" };
     if (status == 60)
@@ -1091,7 +1237,7 @@ function clash_connections() {
     if (backend == "tachyon") {
         result = capture_args([ TACHYON_BIN, "clash_api", "get_connections" ], false);
         if (result.status != 0) {
-            let config = object_or_empty(read_json_file(sing_box_config_path()));
+            let config = object_or_empty(read_json_file(tachyon_core_config_path()));
             let clash = object_or_empty(object_or_empty(config.experimental).clash_api);
             let controller = trim(as_string(clash.external_controller));
             let secret = as_string(clash.secret);
@@ -1434,7 +1580,6 @@ function build_context(mode, client_ip) {
         backend: caps.backend,
         backend_name: caps.backend_name,
         backend_running: caps.backend_running,
-        forkop_running: caps.forkop_running,
         client_ip: "",
         netns_error: ""
     };
@@ -1548,37 +1693,37 @@ function custom_check(host, port, mode, client_ip) {
         label: host + ":" + as_string(port)
     });
 
-    let through_sing_box = null;
+    let through_tachyon_core = null;
     let route_status = "unknown";
     let route_message = "Маршрут не удалось подтвердить через Clash API.";
     let evidence = "";
 
     if (!ctx.backend_running) {
-        through_sing_box = false;
+        through_tachyon_core = false;
         route_status = "direct";
         evidence = "backend_stopped";
-        route_message = ctx.backend_name + " остановлен: соединение не проходит через sing-box.";
+        route_message = ctx.backend_name + " остановлен: соединение не проходит через " + ctx.backend_name + ".";
     }
     else if (live_route.seen) {
-        through_sing_box = true;
+        through_tachyon_core = true;
         route_status = "tachyon-core";
         evidence = "clash_api";
         item.outbound = live_route.outbound;
         route_message = live_route.outbound != ""
-            ? "Соединение найдено в sing-box; outbound: " + live_route.outbound
-            : "Соединение найдено среди активных соединений sing-box.";
+            ? "Соединение найдено в " + ctx.backend_name + "; outbound: " + live_route.outbound
+            : "Соединение найдено среди активных соединений " + ctx.backend_name + ".";
     }
     else if (item.dns_fakeip) {
-        through_sing_box = true;
+        through_tachyon_core = true;
         route_status = "tachyon-core";
         evidence = "fakeip";
-        route_message = "Домен получил FakeIP, который обслуживается sing-box.";
+        route_message = "Домен получил FakeIP, который обслуживается " + ctx.backend_name + ".";
     }
     else if (live_route.attempted && item.state != "error" && item.state != "skipped") {
-        through_sing_box = false;
+        through_tachyon_core = false;
         route_status = "direct";
         evidence = "clash_api_absent";
-        route_message = "Соединение доступно, но за время теста не появилось в Clash API: маршрут идёт мимо sing-box.";
+        route_message = "Соединение доступно, но за время теста не появилось в Clash API: маршрут идёт мимо " + ctx.backend_name + ".";
     }
     else if (item.state == "error") {
         route_message = "Соединение не установлено, поэтому определить маршрут нельзя.";
@@ -1598,10 +1743,9 @@ function custom_check(host, port, mode, client_ip) {
         backend: ctx.backend,
         backend_name: ctx.backend_name,
         backend_running: ctx.backend_running,
-        forkop_running: ctx.forkop_running,
         route: {
             status: route_status,
-            through_sing_box,
+            through_tachyon_core,
             outbound: as_string(item.outbound),
             evidence,
             message: route_message
@@ -1687,7 +1831,6 @@ function run_check(ids, mode, client_ip, progress_path) {
         backend: ctx.backend,
         backend_name: ctx.backend_name,
         backend_running: ctx.backend_running,
-        forkop_running: ctx.forkop_running,
         tools: ctx.tools,
         fakeip_ranges: ctx.fakeip_ranges,
         progress: { done, total },
@@ -1776,7 +1919,6 @@ function worker(path, ids, mode, client_ip) {
     state.backend = result.backend;
     state.backend_name = result.backend_name;
     state.backend_running = result.backend_running;
-    state.forkop_running = result.forkop_running;
 
     write_state(path, state);
     return 0;
@@ -1886,25 +2028,17 @@ function collect_section_custom_domains(s) {
 
 function resolve_section_route_type(s) {
     let route_type = s.action || "direct";
-    if (s.action == "zapret" && s.zapret_strategy)
-        return "zapret (" + s.zapret_strategy + ")";
-    if (s.action == "zapret2" && s.zapret2_strategy)
-        return "zapret2 (" + s.zapret2_strategy + ")";
-    if (s.action == "byedpi" && s.byedpi_strategy)
-        return "byedpi (" + s.byedpi_strategy + ")";
-    if (s.action == "desync" && s.desync_mode)
-        return "desync (" + s.desync_mode + ")";
+    if (s.action == "desync") {
+        let dp = (s.desync_preset && s.desync_preset != "custom") ? s.desync_preset : (s.desync_mode || s.desync_preset || "auto");
+        return "desync (" + dp + ")";
+    }
     if (s.action == "connection") {
         for (let src in (connections.section_effective_outbound_sources(s) || [])) {
             let st = lc(trim(as_string(src.source_type || "")));
-            if (st == "zapret2")
-                return src.zapret2_strategy ? ("zapret2 (" + src.zapret2_strategy + ")") : "zapret2";
-            if (st == "zapret")
-                return src.zapret_strategy ? ("zapret (" + src.zapret_strategy + ")") : "zapret";
-            if (st == "byedpi")
-                return src.byedpi_args ? ("byedpi (" + src.byedpi_args + ")") : "byedpi";
-            if (st == "desync")
-                return src.desync_mode ? ("desync (" + src.desync_mode + ")") : "desync";
+            if (st == "desync") {
+                let dp = (src.desync_preset && src.desync_preset != "custom") ? src.desync_preset : (src.desync_mode || src.desync_preset || "auto");
+                return "desync (" + dp + ")";
+            }
         }
     }
     return route_type;
@@ -1987,10 +2121,104 @@ function tachyon_get_targets(all_mode) {
         "twitter": "x",
         "cloudflare": "baseline",
         "google_ai": "gemini",
+        "ai_all": "chatgpt",
+        "openai": "chatgpt",
+        "anthropic": "claude",
+        "xai": "grok",
+        "openrouter": "chatgpt",
+        "cursor": "chatgpt",
+        "perplexity": "chatgpt",
+        "copilot": "github",
+        "deepseek": "chatgpt",
+        "qwen": "chatgpt",
+        "kimi": "chatgpt",
+        "midjourney": "chatgpt",
+        "elevenlabs": "chatgpt",
+        "huggingface": "chatgpt",
+        "soundcloud_music": "spotify",
+        "rutracker_lampa": "rutracker",
+        "patreon_creators": "blocked_ru",
+        "whatsapp": "instagram",
+        "messengers": "discord",
+        "zoom_teams": "google",
+        "google_meet": "google",
+        "linkedin": "blocked_ru",
+        "games_all": "steam",
+        "ubisoft": "steam",
+        "warthunder": "steam",
+        "blizzard": "steam",
+        "xbox": "microsoft",
+        "playstation": "steam",
+        "nintendo": "steam",
+        "gog": "steam",
+        "wargaming": "steam",
+        "hoyoverse": "steam",
+        "minecraft": "microsoft",
+        "rockstar": "steam",
+        "pubg": "steam",
+        "jetbrains": "github",
+        "gitlab_notion": "notion",
+        "figma_adobe": "figma",
+        "pkg_registries": "github",
+        "paas_db": "github",
+        "kick": "youtube",
+        "speedtest": "cloudflare",
+        "crypto": "cloudflare",
+        "paypal_fintech": "blocked_ru",
         "geoblock": "blocked_ru",
+        "roscomvpn_geoblock": "blocked_ru",
         "russia_inside": "blocked_ru",
         "russia_outside": "blocked_ru",
-        "hodca": "hdrezka"
+        "ukraine_inside": "blocked_ru",
+        "ru_blocked": "blocked_ru",
+        "ru_blocked_all": "blocked_ru",
+        "antifilter": "blocked_ru",
+        "runetfreedom_blocked": "blocked_ru",
+        "runetfreedom_blocked_all": "blocked_ru",
+        "antifilter_community": "blocked_ru",
+        "refilter": "blocked_ru",
+        "torrent": "rutracker",
+        "hodca": "hdrezka",
+        "belarus_inside": "blocked_ru",
+        "steam_cdn": "steam",
+        "captive_ntp_stun": "google",
+        "ai_video": "chatgpt",
+        "ai_cloud_gpu": "chatgpt",
+        "youtube_images": "youtube",
+        "tmdb_metadata": "hdrezka",
+        "streaming_west": "netflix",
+        "books_archives": "rutracker",
+        "podcasts_radio": "spotify",
+        "discord_voice": "discord",
+        "callofduty": "steam",
+        "game_backends": "steam",
+        "cs2_dota2": "steam",
+        "survival_coop": "steam",
+        "mmorpg": "steam",
+        "netease_tencent_games": "steam",
+        "japanese_publishers": "steam",
+        "fighting_racing": "steam",
+        "strategy_sim": "steam",
+        "meta_quest": "instagram",
+        "chess_boardgames": "blocked_ru",
+        "gaming_mods_stats": "steam",
+        "google_services": "google",
+        "captcha_auth": "cloudflare",
+        "cloud_gaming_remote": "steam",
+        "cloud_storage": "blocked_ru",
+        "gamedev_3d": "figma",
+        "security_passwords": "blocked_ru",
+        "smarthome_iot": "github",
+        "smarttv_apps": "netflix",
+        "smart_cars": "google",
+        "linux_repos": "github",
+        "doh_dot_dns": "cloudflare",
+        "vps_clouds": "cloudflare",
+        "travel_booking": "blocked_ru",
+        "shopping_global": "blocked_ru",
+        "edtech_learning": "blocked_ru",
+        "freelance_remote": "blocked_ru",
+        "sports_fitness": "blocked_ru"
     };
 
     for (let s in sections) {
@@ -2007,7 +2235,7 @@ function tachyon_get_targets(all_mode) {
 
         for (let item in comm_items) {
             if (!item) continue;
-            for (let part in split(as_string(item), /[\s,]+/)) {
+            for (let part in split(as_string(item), /[ \t\r\n,]+/)) {
                 let id = trim(part);
                 let p = resolve_profile(id);
                 if (p) push(profiles_to_check, p);

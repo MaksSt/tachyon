@@ -14,7 +14,7 @@ let helpers = require("core.helpers");
 let common = require("core.common");
 
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
-const SING_BOX_BIN = getenv("TACHYON_SING_BOX_BIN") || "/usr/bin/tachyon-core";
+const TACHYON_CORE_BIN = getenv("TACHYON_CORE_BIN") || "/usr/bin/tachyon-core";
 const TMP_STALE_TTL_MINUTES = getenv("UPDATES_TMP_STALE_TTL_MINUTES") || "30";
 const TMP_FILE_STALE_TTL_MINUTES = getenv("UPDATES_TMP_FILE_STALE_TTL_MINUTES") || "10";
 const JOB_HEARTBEAT_INTERVAL = int(getenv("TACHYON_JOB_HEARTBEAT_INTERVAL") || "5");
@@ -45,6 +45,15 @@ function str_startswith(value, prefix) {
     if (length(prefix) == 0)
         return true;
     return length(value) >= length(prefix) && substr(value, 0, length(prefix)) == prefix;
+}
+
+function str_endswith(value, suffix) {
+    value = as_string(value);
+    suffix = as_string(suffix);
+    if (length(suffix) == 0)
+        return true;
+    return length(value) >= length(suffix) &&
+        substr(value, length(value) - length(suffix), length(suffix)) == suffix;
 }
 
 function command_env(assignments) {
@@ -203,7 +212,7 @@ function sanitize_package_log_line(message) {
         return null;
 
     // Suppress raw wget failure messages triggered during repository index refresh (apk / opkg)
-    // and harmless upstream zapret2 postinst nftables IPv6/IPv4 exclude set warnings (#205)
+    // and harmless IPv6/IPv4 address lines from feed warnings.
     if (match(str, /^ERROR:[ \t]+wget:[ \t]+exited with error/i) ||
         match(str, /^\*?[ \t]*wget(:[ \t]+|Failed)/i) ||
         match(str, /^Collected errors:/i) ||
@@ -211,8 +220,7 @@ function sanitize_package_log_line(message) {
         match(str, /^\*?[ \t]*sh:[ \t]+write error:[ \t]+Broken pipe/i) ||
         match(str, /^\*?[ \t]*\/dev\/stdin:[0-9]+:[0-9-]+:[ \t]+Error:[ \t]+Could not resolve hostname:[ \t]+Name has no usable address/i) ||
         match(str, /^\*?[ \t]*(::1|fc00::\/7|fe80::\/10),?[ \t]*$/i) ||
-        match(str, /^\*?[ \t]*\^+[ \t]*$/) ||
-        match(str, /^\*?[ \t]*Notice:[ \t]+Service[ \t]+\/etc\/init\.d\/zapret2\b.*option[ \t]+run_on_boot[ \t]+is[ \t]+not[ \t]+set/i))
+        match(str, /^\*?[ \t]*\^+[ \t]*$/))
         return null;
 
     // Format apk/opkg repository index warnings into calm, informative notices
@@ -269,6 +277,11 @@ function update_job_phase(phase, message) {
         state.phase_started_at = job_phase_started_at;
         state.heartbeat_at = now_seconds();
         state.updated_at = now_seconds();
+        if (as_string(state.pid || "") == "") {
+            let sidecar_pid = trim(read_file(state_path + ".pid"));
+            if (sidecar_pid != "")
+                state.pid = sidecar_pid;
+        }
         if (as_string(message) != "")
             state.message = as_string(message);
         let tmp = state_path + ".hb." + owner_pid();
@@ -290,6 +303,11 @@ function job_heartbeat() {
             return;
         state.heartbeat_at = now_seconds();
         state.updated_at = now_seconds();
+        if (as_string(state.pid || "") == "") {
+            let sidecar_pid = trim(read_file(state_path + ".pid"));
+            if (sidecar_pid != "")
+                state.pid = sidecar_pid;
+        }
         let tmp = state_path + ".hb." + owner_pid();
         write_file(tmp, sprintf("%J\n", state));
         fs.rename(tmp, state_path);
@@ -326,8 +344,8 @@ function preflight_storage_check(component, asset_size_bytes, backup_required) {
     let needed_tmp_kb = int((asset_size_bytes || 0) / 1024) + 2048;
     if (backup_required) {
         let bin_size = 0;
-        if (component == "sing_box" && file_exists(SING_BOX_BIN)) {
-            let st = fs.stat(SING_BOX_BIN);
+        if (component == "tachyon-core" && file_exists(TACHYON_CORE_BIN)) {
+            let st = fs.stat(TACHYON_CORE_BIN);
             bin_size = (st && st.size) ? st.size : 0;
         }
         needed_tmp_kb += int(bin_size / 1024) + 1024;
@@ -344,8 +362,8 @@ function preflight_backup_space_check(component) {
     if (!get_component_backup_enabled())
         return true;
     let st = null;
-    if (component == "sing_box" && file_exists(SING_BOX_BIN))
-        st = fs.stat(SING_BOX_BIN);
+    if (component == "tachyon-core" && file_exists(TACHYON_CORE_BIN))
+        st = fs.stat(TACHYON_CORE_BIN);
     if (st == null)
         return true;
     let size = (st.size) ? st.size : 0;
@@ -412,7 +430,7 @@ function cleanup_stale_tmp_files() {
     // tachyon-??????" is the exact shape `mktemp /tmp/tachyon-XXXXXX` produces, and
     // four call sites create one: components/updates.uc, nft/apply.uc,
     // service/lifecycle.uc and tachyon_core/runtime.uc - the last three being the
-    // sing-box config candidates and rule lists. The sweeper only knew about the
+    // tachyon-core config candidates and rule lists. The sweeper only knew about the
     // two tachyon-updates-* patterns, so none of those were ever reclaimed.
     // Measured on 192.168.1.1: ten of them, 968 KB, seven days old, sitting in a
     // 363 MB tmpfs.
@@ -508,27 +526,46 @@ function pkg_is_installed(package_name) {
 }
 
 // Drop stale references to managed packages from /etc/apk/world so
-// that subsequent package transactions do not trip over removed variants
+// that subsequent package transactions do not trip over removed packages
 // or pinned hash/version constraints from local package installations.
 function sanitize_apk_world() {
-    if (!is_apk() || !file_exists("/etc/apk/world"))
+    let world_file = getenv("TACHYON_APK_WORLD_FILE") || "/etc/apk/world";
+    if (!is_apk() || !file_exists(world_file))
         return;
     let removable_if_uninstalled = [
-        "sing-box-extended", "sing-box", "sing-box-tiny", "sing-box-lx",
-        "steer-extended", "steer", "steer-core",
-        "steer-obfs", "steer-tgws", "steer-vless", "steer-xsteer", "steer-proxy", "steer-hysteria2",
-        "zapret2", "zapret",
-        "byedpi",
+        "tachyon-core",
         "luci-i18n-tachyon-ru"
     ];
     for (let pkg in removable_if_uninstalled) {
         if (!pkg_is_installed(pkg))
-            command_success("sed -i -E " + shell_quote("/^" + pkg + "([><= ].*)?$/d") + " /etc/apk/world 2>/dev/null");
+            command_success("sed -i -E " + shell_quote("/^" + pkg + "([><= ].*)?$/d") + " " + shell_quote(world_file) + " 2>/dev/null");
     }
+    if (pkg_is_installed("ip-full") || !pkg_is_installed("ip-tiny"))
+        command_success("sed -i -E " + shell_quote("/^ip-tiny([><=~ \t].*)?$/d") + " " + shell_quote(world_file) + " 2>/dev/null");
     // Strip pinned version/hash constraints (e.g. pkg><HASH= or pkg=ver)
     // from /etc/apk/world for all managed packages so local .apk upgrades succeed
-    let pattern = "^(tachyon|luci-app-tachyon|luci-i18n-tachyon-[a-z_-]+|steer|steer-extended|steer-core|steer-(obfs|tgws|vless|xsteer|proxy|hysteria2)|zapret|zapret2|byedpi|sing-box|sing-box-extended|sing-box-tiny|sing-box-lx)[><=].*$";
-    command_success("sed -i -E " + shell_quote("s/" + pattern + "/\\1/") + " /etc/apk/world 2>/dev/null");
+    let pattern = "^(tachyon|tachyon-core|luci-app-tachyon|luci-i18n-tachyon-[a-z_-]+)[><=].*$";
+    command_success("sed -i -E " + shell_quote("s/" + pattern + "/\\1/") + " " + shell_quote(world_file) + " 2>/dev/null");
+
+    // Heal any remaining broken world entries (e.g. third-party packages no longer
+    // in repositories or stale version pins) so subsequent apk transactions succeed.
+    if (!command_success_from_args([ "apk", "add", "--simulate", "--no-network", "--repositories-file", "/dev/null" ])) {
+        let sim_out = command_output_lenient(command_from_args([ "apk", "add", "--simulate", "--no-network", "--repositories-file", "/dev/null" ]) + " 2>&1");
+        let seen = {};
+        for (let line in split(sim_out, "\n")) {
+            let m = match(as_string(line), /world\[([A-Za-z0-9._+-]+)/);
+            if (!m || !m[1])
+                continue;
+            let bad_pkg = as_string(m[1]);
+            if (seen[bad_pkg] == true)
+                continue;
+            seen[bad_pkg] = true;
+            if (pkg_is_installed(bad_pkg))
+                command_success("sed -i -E " + shell_quote("s/^" + bad_pkg + "[><=~ \t].*$/" + bad_pkg + "/") + " " + shell_quote(world_file) + " 2>/dev/null");
+            else
+                command_success("sed -i -E " + shell_quote("/^" + bad_pkg + "([><=~ \t].*)?$/d") + " " + shell_quote(world_file) + " 2>/dev/null");
+        }
+    }
 }
 
 // ============================================================================
@@ -688,7 +725,7 @@ function service_proxy_address() {
     if (!file_exists(LIB_DIR + "/tachyon_core/runtime.uc"))
         return "";
     if (file_exists(LIB_DIR + "/service/state.uc") &&
-        !module_success([ LIB_DIR + "/service/state.uc", "sing-box-service-running" ]))
+        !module_success([ LIB_DIR + "/service/state.uc", "tachyon-core-service-running" ]))
         return "";
     return trim(module_output([ LIB_DIR + "/tachyon_core/runtime.uc", "service-proxy-address", "components" ]));
 }
@@ -698,8 +735,9 @@ function service_proxy_address() {
 function module_exports() {
     return {
         LIB_DIR,
-        SING_BOX_BIN,
+        TACHYON_CORE_BIN,
         str_startswith,
+        str_endswith,
         command_env,
         command_output_lenient,
         command_exists,

@@ -5,6 +5,7 @@ let core_ip = require("core.ip");
 let core_url = require("core.url");
 let uci = require("core.uci");
 let common = require("core.common");
+let network_mod = require("diagnostics.network");
 let as_string = common.as_string;
 let shell_quote = common.shell_quote;
 let read_json_file = common.read_json_file;
@@ -503,10 +504,11 @@ function reality_keypair_response(private_key, public_key) {
     });
 }
 
-function tls_fingerprint_response(fingerprint) {
+function tls_fingerprint_response(fingerprint, md5) {
     write_json({
         success: true,
-        sha256: as_string(fingerprint)
+        sha256: as_string(fingerprint),
+        md5: as_string(md5 || "")
     });
 }
 
@@ -594,6 +596,10 @@ function valid_sha256_hex(value) {
     return regex_matches(value, "^[0-9a-f]{64}$");
 }
 
+function valid_md5_hex(value) {
+    return regex_matches(value, "^[0-9a-f]{32}$");
+}
+
 function command_first_nonempty_line(command) {
     for (let line in split(output(command), "\n"))
         if (trim(as_string(line)) != "")
@@ -602,19 +608,19 @@ function command_first_nonempty_line(command) {
 }
 
 function server_generate_uuid() {
-    return command_first_nonempty_line("tachyon-core generate uuid 2>/dev/null || sing-box generate uuid 2>/dev/null");
+    return command_first_nonempty_line("tachyon-core generate uuid 2>/dev/null");
 }
 
 function server_generate_password() {
-    return replace(output("tachyon-core generate rand --base64 18 2>/dev/null || sing-box generate rand --base64 18 2>/dev/null"), /\n/g, "");
+    return replace(output("tachyon-core generate rand --base64 18 2>/dev/null"), /\n/g, "");
 }
 
 function server_generate_short_id() {
-    return replace(output("tachyon-core generate rand --hex 4 2>/dev/null || sing-box generate rand --hex 4 2>/dev/null"), /\n/g, "");
+    return replace(output("tachyon-core generate rand --hex 4 2>/dev/null"), /\n/g, "");
 }
 
 function server_generate_mtproto_secret() {
-    let random_hex = replace(output("tachyon-core generate rand --hex 16 2>/dev/null || sing-box generate rand --hex 16 2>/dev/null"), /\n/g, "");
+    let random_hex = replace(output("tachyon-core generate rand --hex 16 2>/dev/null"), /\n/g, "");
     if (random_hex == "")
         random_hex = replace(output("head -c 16 /dev/urandom | hexdump -ve '1/1 \"%02x\"' 2>/dev/null"), /\n/g, "");
     if (random_hex == "00000000000000000000000000000000")
@@ -640,7 +646,7 @@ function server_effective_security_value(section, protocol) {
     if (security == "")
         security = default_security_value(protocol);
 
-    if (protocol == "shadowsocks" || protocol == "socks" || protocol == "mtproto" || protocol == "tailscale" || protocol == "json_inbound" || protocol == "awg" || protocol == "shadowtls" || protocol == "http" || protocol == "mixed" || protocol == "mieru")
+    if (protocol == "shadowsocks" || protocol == "socks" || protocol == "mtproto" || protocol == "tailscale" || protocol == "json_inbound" || protocol == "awg" || protocol == "shadowtls" || protocol == "http" || protocol == "mixed" || protocol == "mieru" || protocol == "wdtt")
         security = "none";
     else if (protocol == "hysteria2" || protocol == "tuic" || protocol == "anytls" || protocol == "naive" || protocol == "fptn" || protocol == "trusttunnel" || protocol == "tewfai" || protocol == "masque" || protocol == "openconnect")
         security = "tls";
@@ -655,7 +661,7 @@ function print_effective_security(section, protocol) {
 }
 
 function generate_reality_keypair_values() {
-    let data = output("tachyon-core generate reality-keypair 2>/dev/null || sing-box generate reality-keypair 2>/dev/null");
+    let data = output("tachyon-core generate reality-keypair 2>/dev/null");
     let private_key = first_key_value_line_value(data, "PrivateKey");
     let public_key = first_key_value_line_value(data, "PublicKey");
 
@@ -669,7 +675,7 @@ function generate_reality_keypair_values() {
 }
 
 function generate_wg_keypair_values() {
-    let data = output("tachyon-core generate wg-keypair 2>/dev/null || sing-box generate wg-keypair 2>/dev/null");
+    let data = output("tachyon-core generate wg-keypair 2>/dev/null");
     let private_key = first_key_value_line_value(data, "PrivateKey");
     let public_key = first_key_value_line_value(data, "PublicKey");
 
@@ -744,7 +750,7 @@ function server_generate_tls_keypair_files(server_name, certificate_path, key_pa
         return true;
     }
 
-    let data = output("tachyon-core generate tls-keypair " + shell_quote(clean_name) + " 2>/dev/null || sing-box generate tls-keypair " + shell_quote(clean_name) + " 2>/dev/null");
+    let data = output("tachyon-core generate tls-keypair " + shell_quote(clean_name) + " 2>/dev/null");
     if (data == "")
         return false;
 
@@ -773,26 +779,33 @@ function certificate_base64_text(path) {
     return length(lines) == 0 ? "" : join("\n", lines) + "\n";
 }
 
-function server_tls_certificate_sha256_from_file(certificate_path) {
+function server_tls_certificate_fingerprints_from_file(certificate_path) {
+    let empty = { sha256: "", md5: "" };
     if (!valid_file_path(certificate_path))
-        return "";
+        return empty;
     let base64_text = certificate_base64_text(certificate_path);
     if (base64_text == "")
-        return "";
+        return empty;
 
     let tmp_path = output("mktemp 2>/dev/null");
     if (tmp_path == "")
-        return "";
+        return empty;
 
     if (!fs.writefile(tmp_path, base64_text)) {
         fs.unlink(tmp_path);
-        return "";
+        return empty;
     }
 
-    let fingerprint = output("base64 -d " + shell_quote(tmp_path) + " 2>/dev/null | sha256sum 2>/dev/null");
+    let raw_sha256 = lc(output("base64 -d " + shell_quote(tmp_path) + " 2>/dev/null | sha256sum 2>/dev/null"));
+    let raw_md5 = lc(output("base64 -d " + shell_quote(tmp_path) + " 2>/dev/null | md5sum 2>/dev/null"));
     fs.unlink(tmp_path);
-    fingerprint = substr(fingerprint, 0, index(fingerprint, " ") >= 0 ? index(fingerprint, " ") : length(fingerprint));
-    return valid_sha256_hex(fingerprint) ? fingerprint : "";
+
+    let sha256 = substr(raw_sha256, 0, index(raw_sha256, " ") >= 0 ? index(raw_sha256, " ") : length(raw_sha256));
+    let md5 = substr(raw_md5, 0, index(raw_md5, " ") >= 0 ? index(raw_md5, " ") : length(raw_md5));
+    return {
+        sha256: valid_sha256_hex(sha256) ? sha256 : "",
+        md5: valid_md5_hex(md5) ? md5 : ""
+    };
 }
 
 
@@ -836,6 +849,17 @@ function is_udp_port_busy(port) {
 }
 
 function generate_awg_header_int() {
+    let f = fs.open("/dev/urandom", "r");
+    if (f) {
+        let bytes = f.read(4);
+        f.close();
+        if (bytes != null && length(bytes) == 4) {
+            let val = ((ord(bytes, 0) & 0x7F) << 24) | (ord(bytes, 1) << 16) | (ord(bytes, 2) << 8) | ord(bytes, 3);
+            if (val < 100000000)
+                val += 100000000;
+            return as_string(val);
+        }
+    }
     let hex = replace(output("head -c 4 /dev/urandom | hexdump -ve '1/1 \"%02x\"' 2>/dev/null"), /\n/g, "");
     if (hex != "" && length(hex) == 8) {
         let val = int(hex, 16);
@@ -846,7 +870,7 @@ function generate_awg_header_int() {
             return as_string(val);
         }
     }
-    let rand_hex = replace(output("tachyon-core generate rand --hex 3 2>/dev/null || sing-box generate rand --hex 3 2>/dev/null"), /\n/g, "");
+    let rand_hex = replace(output("tachyon-core generate rand --hex 3 2>/dev/null"), /\n/g, "");
     if (rand_hex != "") {
         let fallback_val = 100000000 + (int(rand_hex, 16) || 0);
         return as_string(fallback_val);
@@ -933,6 +957,16 @@ function get_router_wan_ips() {
                             }
                         }
                     }
+                    let addrs6 = item["ipv6-address"];
+                    if (type(addrs6) == "array") {
+                        for (let addr_obj in addrs6) {
+                            let addr = network_mod.strip_cidr_suffix(addr_obj.address || "");
+                            if (network_mod.is_non_local_ipv6(addr) && !network_mod.is_ula_ipv6(addr) && !seen[addr]) {
+                                seen[addr] = true;
+                                push(result, addr);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -955,6 +989,16 @@ function get_router_wan_ips() {
                     }
                 }
             }
+            let addrs6 = parsed["ipv6-address"];
+            if (type(addrs6) == "array") {
+                for (let item in addrs6) {
+                    let addr = network_mod.strip_cidr_suffix(item.address || "");
+                    if (network_mod.is_non_local_ipv6(addr) && !network_mod.is_ula_ipv6(addr) && !seen[addr]) {
+                        seen[addr] = true;
+                        push(result, addr);
+                    }
+                }
+            }
         }
         catch (e) {}
     }
@@ -972,6 +1016,25 @@ function get_router_wan_ips() {
                     if (!seen[ip]) {
                         seen[ip] = true;
                         unshift(result, ip);
+                    }
+                }
+            }
+        }
+    }
+
+    let route6 = output("ip -6 route show default 2>/dev/null");
+    if (route6 != "") {
+        let m6 = match(route6, /dev[ \t]+([a-zA-Z0-9_.-]+)/);
+        if (m6 && m6[1]) {
+            let ifdev6 = m6[1];
+            let addr6_out = output("ip -6 -o addr show dev " + shell_quote(ifdev6) + " scope global 2>/dev/null");
+            for (let line in split(addr6_out, "\n")) {
+                let matched = match(trim(line), /(^|[ \t])inet6[ \t]+([0-9a-fA-F:]+)(\/[0-9]+)?/);
+                if (matched && network_mod.is_non_local_ipv6(matched[2]) && !network_mod.is_ula_ipv6(matched[2])) {
+                    let ip6 = matched[2];
+                    if (!seen[ip6]) {
+                        seen[ip6] = true;
+                        push(result, ip6);
                     }
                 }
             }
@@ -1012,10 +1075,22 @@ function detect_router_country() {
     return "RU";
 }
 
+let _cached_router_network_env = null;
+
 function get_router_network_env() {
+    if (_cached_router_network_env != null)
+        return _cached_router_network_env;
+
     let ddns_domain = get_router_ddns_domain();
     let has_ddns = ddns_domain != "";
     let wan_ips = get_router_wan_ips();
+    let settings_cfg = uci.get_all(CONFIG_NAME, "settings") || {};
+    let v6_info = network_mod.get_ipv6_runtime_telemetry(settings_cfg);
+    let wan_ipv6 = network_mod.first_ipv6_from_list(wan_ips);
+    if (wan_ipv6 == "" && v6_info.wan_ipv6 != "") {
+        wan_ipv6 = v6_info.wan_ipv6;
+        push(wan_ips, wan_ipv6);
+    }
     let cached_external_ip = get_cached_external_wan_ip();
     let lan_ip = as_string(uci.get("network.lan.ipaddr") || "192.168.1.1");
     let country_code = detect_router_country();
@@ -1034,6 +1109,15 @@ function get_router_network_env() {
                 public_host = ip;
                 is_public_ip = true;
                 break;
+            }
+        }
+        if (public_host == "") {
+            for (let ip in wan_ips) {
+                if (network_mod.valid_public_ipv6(ip)) {
+                    public_host = ip;
+                    is_public_ip = true;
+                    break;
+                }
             }
         }
         if (public_host == "" && length(wan_ips) > 0) {
@@ -1055,13 +1139,19 @@ function get_router_network_env() {
 
     let terminating_sni = has_ddns ? ddns_domain : (valid_domain(public_host) ? public_host : "tachyon.lan");
 
-    return {
+    _cached_router_network_env = {
         public_host: public_host,
         country_code: country_code,
         is_public_ip: is_public_ip,
         has_ddns: has_ddns,
         ddns_domain: ddns_domain,
         wan_ips: wan_ips,
+        wan_ipv6: wan_ipv6,
+        lan_ipv6: v6_info.lan_ipv6,
+        wan6_prefix: v6_info.wan6_prefix,
+        wan6_pd: v6_info.wan6_pd,
+        ipv6_effective_state: v6_info.ipv6_effective_state,
+        router_hostname: v6_info.router_hostname,
         cached_external_ip: cached_external_ip,
         lan_ip: lan_ip,
         tcp_443_busy: tcp_443_busy,
@@ -1083,11 +1173,12 @@ function get_router_network_env() {
             http: 8080,
             mixed: 8080,
             mtproto: standard_tls_port,
-            mieru: 8443,
+            mieru: "2012-2022",
             trusttunnel: standard_tls_port,
             tewfai: standard_tls_port,
             masque: standard_quic_port,
-            openconnect: standard_tls_port
+            openconnect: standard_tls_port,
+            wdtt: 46000
         },
         recommended_sni: {
             reality: "www.microsoft.com",
@@ -1104,6 +1195,12 @@ function get_router_network_env() {
             h4: awg_headers[3]
         }
     };
+    return _cached_router_network_env;
+}
+
+function nonempty_file(path) {
+    let st = fs.stat(as_string(path));
+    return st != null && int(st.size || 0) > 0;
 }
 
 function server_detect_default_public_host() {
@@ -1148,17 +1245,17 @@ function get_tls_certificate_sha256_cli(section) {
             uci_commit(CONFIG_NAME);
     }
 
-    if (!run("[ -s " + shell_quote(certificate_path) + " ] && [ -s " + shell_quote(key_path) + " ]")) {
+    if (!(nonempty_file(certificate_path) && nonempty_file(key_path))) {
         server_generate_tls_keypair_files(tls_server_name, certificate_path, key_path);
     }
 
-    let fingerprint = server_tls_certificate_sha256_from_file(certificate_path);
-    if (fingerprint == "") {
+    let fps = server_tls_certificate_fingerprints_from_file(certificate_path);
+    if (fps.sha256 == "") {
         error_response("Failed to read TLS certificate fingerprint");
         exit(1);
     }
 
-    tls_fingerprint_response(fingerprint);
+    tls_fingerprint_response(fps.sha256, fps.md5);
 }
 
 function generate_tls_keypair_cli(section) {
@@ -1178,15 +1275,15 @@ function generate_tls_keypair_cli(section) {
     let certificate_path = config_get(section, "tls_certificate_path", default_dir + "/" + safe_name + ".crt");
     let key_path = config_get(section, "tls_key_path", default_dir + "/" + safe_name + ".key");
 
-    if (!run("[ -s " + shell_quote(certificate_path) + " ] && [ -s " + shell_quote(key_path) + " ]")) {
+    if (!(nonempty_file(certificate_path) && nonempty_file(key_path))) {
         if (!server_generate_tls_keypair_files(tls_server_name, certificate_path, key_path)) {
             error_response("Failed to generate TLS certificate");
             exit(1);
         }
     }
 
-    let fingerprint = server_tls_certificate_sha256_from_file(certificate_path);
-    tls_fingerprint_response(fingerprint);
+    let fps = server_tls_certificate_fingerprints_from_file(certificate_path);
+    tls_fingerprint_response(fps.sha256, fps.md5);
 }
 
 function first_server_user(section) {
@@ -1261,7 +1358,7 @@ function server_prepare_tls_defaults(section, protocol, security) {
     if (certificate_path == key_path)
         fatal("Server '" + section + "' has the same TLS certificate and key path. Specify different files. Aborted.");
 
-    if (!run("[ -s " + shell_quote(certificate_path) + " ] && [ -s " + shell_quote(key_path) + " ]")) {
+    if (!(nonempty_file(certificate_path) && nonempty_file(key_path))) {
         log("Generating self-signed TLS certificate for server '" + section + "'", "info");
         if (!server_generate_tls_keypair_files(tls_server_name, certificate_path, key_path))
             fatal("Failed to generate TLS certificate for server '" + section + "'. Aborted.");
@@ -1275,13 +1372,24 @@ function prepare_server_defaults(section) {
         protocol == "json_inbound" || protocol == "awg" || protocol == "tuic" || protocol == "anytls" ||
         protocol == "naive" || protocol == "shadowtls" || protocol == "fptn" || protocol == "http" ||
         protocol == "mixed" || protocol == "mieru" || protocol == "trusttunnel" || protocol == "tewfai" ||
-        protocol == "masque" || protocol == "openconnect"))
+        protocol == "masque" || protocol == "openconnect" || protocol == "wdtt"))
         fatal("Server '" + section + "' has unsupported protocol '" + protocol + "'. Aborted.");
 
     server_default_set_option(section, "protocol", protocol);
     server_default_set_option(section, "label", section);
     server_default_set_option(section, "enabled", "1");
     server_default_set_option(section, "routing_mode", "rules");
+
+    if (protocol == "tailscale") {
+        let safe_name = safe_filename_string(section);
+        server_set_option(section, "security", "none");
+        server_default_set_option(section, "tailscale_control_url", "https://controlplane.tailscale.com");
+        server_default_set_option(section, "tailscale_hostname", "tachyon-" + safe_name);
+        server_default_set_option(section, "tailscale_advertise_exit_node", "1");
+        server_default_set_option(section, "tailscale_auto_firewall", "1");
+        return;
+    }
+
     server_default_set_option(section, "open_firewall_port", "1");
 
     if (protocol == "json_inbound") {
@@ -1292,21 +1400,41 @@ function prepare_server_defaults(section) {
     let env = get_router_network_env();
 
     server_default_set_option(section, "listen", "0.0.0.0");
-    let rec_port = int(env.recommended_ports[protocol] ?? 443);
-    if (uci_get(config_path(section, "listen_port")) == "") {
-        let used_ports = {};
-        for (let other in uci_sections("server")) {
-            if (other == section)
-                continue;
-            let op = uci_get(config_path(other, "listen_port"));
-            if (op != "")
-                used_ports[as_string(op)] = true;
+    if (protocol == "mieru") {
+        let rec_range = as_string(env.recommended_ports[protocol] ?? "2012-2022");
+        if (uci_get(config_path(section, "listen_port")) == "") {
+            let used_ports = {};
+            for (let other in uci_sections("server")) {
+                if (other == section)
+                    continue;
+                let op = uci_get(config_path(other, "listen_port"));
+                if (op != "")
+                    used_ports[as_string(op)] = true;
+            }
+            let base_p = 2012;
+            while (used_ports[rec_range] || used_ports[as_string(base_p)]) {
+                base_p += 20;
+                rec_range = base_p + "-" + (base_p + 10);
+            }
         }
-        while (used_ports[as_string(rec_port)] || rec_port == 1602 || rec_port == 1053 || rec_port == 5354) {
-            rec_port = (rec_port == 443) ? 8443 : (rec_port + 1);
+        server_default_set_option(section, "listen_port", rec_range);
+    } else {
+        let rec_port = int(env.recommended_ports[protocol] ?? 443);
+        if (uci_get(config_path(section, "listen_port")) == "") {
+            let used_ports = {};
+            for (let other in uci_sections("server")) {
+                if (other == section)
+                    continue;
+                let op = uci_get(config_path(other, "listen_port"));
+                if (op != "")
+                    used_ports[as_string(op)] = true;
+            }
+            while (used_ports[as_string(rec_port)] || rec_port == 1602 || rec_port == 1053 || rec_port == 5354) {
+                rec_port = (rec_port == 443) ? 8443 : (rec_port + 1);
+            }
         }
+        server_default_set_option(section, "listen_port", as_string(rec_port));
     }
-    server_default_set_option(section, "listen_port", as_string(rec_port));
     server_default_set_option(section, "public_host", env.public_host);
     server_default_set_option(section, "server_country", env.country_code || "RU");
 
@@ -1323,14 +1451,14 @@ function prepare_server_defaults(section) {
     if (protocol == "shadowsocks" || protocol == "socks" || protocol == "trojan" || protocol == "hysteria2" ||
         protocol == "tuic" || protocol == "anytls" || protocol == "naive" || protocol == "shadowtls" ||
         protocol == "fptn" || protocol == "http" || protocol == "mixed" || protocol == "mieru" ||
-        protocol == "trusttunnel" || protocol == "masque") {
+        protocol == "trusttunnel" || protocol == "masque" || protocol == "wdtt") {
         if (uci_get(config_path(section, "server_password")) == "") {
             let password = server_generate_password();
             server_default_set_option(section, "server_password", password);
         }
     }
     if (protocol == "socks" || protocol == "naive" || protocol == "fptn" || protocol == "http" ||
-        protocol == "mixed" || protocol == "mieru" || protocol == "trusttunnel" || protocol == "masque") {
+        protocol == "mixed" || protocol == "mieru" || protocol == "trusttunnel" || protocol == "masque" || protocol == "wdtt") {
         if (uci_get(config_path(section, "server_username")) == "")
             server_default_set_option(section, "server_username", config_get(section, "label", section));
     }
@@ -1347,8 +1475,10 @@ function prepare_server_defaults(section) {
         if (cur_tr == "" || cur_tr == "auto")
             server_set_option(section, "tewfai_inbound_transport", "tcp");
         let cur_cipher = uci_get(config_path(section, "tewfai_inner_cipher"));
-        if (cur_cipher != "" && cur_cipher != "aes-256-gcm" && cur_cipher != "none")
+        if (cur_cipher != "" && cur_cipher != "aes-256-gcm" && cur_cipher != "none" && cur_cipher != "null")
             server_set_option(section, "tewfai_inner_cipher", "aes-256-gcm");
+        if (uci_get(config_path(section, "tewfai_morph_profile")) == "")
+            server_default_set_option(section, "tewfai_morph_profile", "auto");
     }
     if (protocol == "masque") {
         server_default_set_option(section, "masque_ipv4_pool", "172.16.0.0/24");
@@ -1360,6 +1490,12 @@ function prepare_server_defaults(section) {
         server_default_set_option(section, "openconnect_flavor", "anyconnect");
         server_default_set_option(section, "openconnect_address", "172.16.1.2/24");
         server_default_set_option(section, "openconnect_mtu", "1400");
+    }
+    if (protocol == "wdtt") {
+        server_default_set_option(section, "wdtt_mode", "csqtt");
+        server_default_set_option(section, "wdtt_obfs", "audio");
+        server_default_set_option(section, "wdtt_network", "10.66.0.1/16");
+        server_default_set_option(section, "wdtt_mtu", "1360");
     }
     if (protocol == "tuic") {
         server_default_set_option(section, "tuic_congestion_control", "bbr");
@@ -1403,6 +1539,10 @@ function prepare_server_defaults(section) {
     if (protocol == "shadowsocks")
         server_default_set_option(section, "shadowsocks_method", "aes-128-gcm");
     if (protocol == "awg") {
+        let awg_ver = uci_get(config_path(section, "awg_version"));
+        let awg_hpk = uci_get(config_path(section, "awg_header_protection_key"));
+        let needs_min_s = (awg_ver == "3.0" || awg_ver == "3.1" || awg_hpk != "");
+        let default_s = needs_min_s ? "20" : "0";
         server_default_set_option(section, "listen_port", "51820");
         server_default_set_option(section, "awg_mtu", "1280");
         server_default_set_option(section, "awg_local_address", env.awg.local_address);
@@ -1411,10 +1551,17 @@ function prepare_server_defaults(section) {
         server_default_set_option(section, "awg_jc", "4");
         server_default_set_option(section, "awg_jmin", "40");
         server_default_set_option(section, "awg_jmax", "70");
-        server_default_set_option(section, "awg_s1", "0");
-        server_default_set_option(section, "awg_s2", "0");
-        server_default_set_option(section, "awg_s3", "0");
-        server_default_set_option(section, "awg_s4", "0");
+        server_default_set_option(section, "awg_s1", default_s);
+        server_default_set_option(section, "awg_s2", default_s);
+        server_default_set_option(section, "awg_s3", default_s);
+        server_default_set_option(section, "awg_s4", default_s);
+        if (needs_min_s) {
+            for (let sk in [ "awg_s1", "awg_s2", "awg_s3", "awg_s4" ]) {
+                let cur_s = int(uci_get(config_path(section, sk)) || "0", 10);
+                if (cur_s < 12)
+                    server_set_option(section, sk, "20");
+            }
+        }
         server_default_set_option(section, "awg_h1", env.awg.h1);
         server_default_set_option(section, "awg_h2", env.awg.h2);
         server_default_set_option(section, "awg_h3", env.awg.h3);
@@ -1435,13 +1582,6 @@ function prepare_server_defaults(section) {
                 server_set_option(section, "awg_peer_public_key", cli_pair.public_key);
             }
         }
-    }
-    if (protocol == "tailscale") {
-        let safe_name = safe_filename_string(section);
-        server_default_set_option(section, "tailscale_control_url", "https://controlplane.tailscale.com");
-        server_default_set_option(section, "tailscale_hostname", "tachyon-" + safe_name);
-        server_default_set_option(section, "tailscale_advertise_exit_node", "1");
-        server_default_set_option(section, "tailscale_auto_firewall", "1");
     }
 
     if (security == "reality") {

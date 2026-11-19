@@ -34,11 +34,15 @@ function base64_encode(value) {
     return replace(b64enc(as_string(value)), /=+$/, "");
 }
 
-function host_port(server, port) {
+function uri_host(server) {
     server = as_string(server);
     if (index(server, ":") >= 0 && !starts_with(server, "["))
-        server = "[" + server + "]";
-    return server + ":" + as_string(port);
+        return "[" + server + "]";
+    return server;
+}
+
+function host_port(server, port) {
+    return uri_host(server) + ":" + as_string(port);
 }
 
 function hysteria2_server_port_entry(value) {
@@ -92,11 +96,17 @@ function add_xhttp_extra_query(params, transport) {
     for (let item in [
         ["xPaddingBytes", "x_padding_bytes"],
         ["noGRPCHeader", "no_grpc_header"],
+        ["noSSEHeader", "no_sse_header"],
         ["scMaxEachPostBytes", "sc_max_each_post_bytes"],
         ["scMinPostsIntervalMs", "sc_min_posts_interval_ms"],
+        ["scMaxBufferedPosts", "sc_max_buffered_posts"],
+        ["scMaxConcurrentPosts", "sc_max_concurrent_posts"],
+        ["serverMaxHeaderBytes", "server_max_header_bytes"],
         ["scStreamUpServerSecs", "sc_stream_up_server_secs"],
         ["sessionPlacement", "session_placement"],
         ["sessionKey", "session_key"],
+        ["sessionTable", "session_table"],
+        ["sessionLength", "session_length"],
         ["seqPlacement", "seq_placement"],
         ["seqKey", "seq_key"],
         ["uplinkDataPlacement", "uplink_data_placement"],
@@ -112,6 +122,9 @@ function add_xhttp_extra_query(params, transport) {
         if (transport[item[1]] != null)
             extra[item[0]] = transport[item[1]];
     }
+
+    if (type(transport.headers) == "object" && length(keys(transport.headers)) > 0)
+        extra.headers = transport.headers;
 
     if (type(transport.xmux) == "object") {
         let xmux = {};
@@ -308,7 +321,17 @@ function serialize_hysteria2(outbound) {
     if (type(outbound.obfs) == "object") {
         add_query(params, "obfs", outbound.obfs.type);
         add_query(params, "obfs-password", outbound.obfs.password);
+        if (outbound.obfs.min_packet_size != null && int(outbound.obfs.min_packet_size) > 0)
+            add_query(params, "min_packet_size", outbound.obfs.min_packet_size);
+        if (outbound.obfs.max_packet_size != null && int(outbound.obfs.max_packet_size) > 0)
+            add_query(params, "max_packet_size", outbound.obfs.max_packet_size);
     }
+    if (outbound.up_mbps != null && int(outbound.up_mbps) > 0)
+        add_query(params, "upmbps", outbound.up_mbps);
+    if (outbound.down_mbps != null && int(outbound.down_mbps) > 0)
+        add_query(params, "downmbps", outbound.down_mbps);
+    if (as_string(outbound.hop_interval || "") != "")
+        add_query(params, "mport_hop", outbound.hop_interval);
 
     return "hysteria2://" + uri_encode(outbound.password) + "@" +
         host_port(outbound.server, port) + query_string(params) + fragment(outbound);
@@ -436,6 +459,8 @@ function serialize_naive(outbound) {
         add_query(params, "quic_congestion_control", outbound.quic_congestion_control);
     if (outbound.insecure_concurrency != null)
         add_query(params, "insecure_concurrency", outbound.insecure_concurrency);
+    if (outbound.udp_over_tcp === true || (type(outbound.udp_over_tcp) == "object" && outbound.udp_over_tcp.enabled === true))
+        add_query(params, "uot", "1");
     return scheme + "://" + auth + host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
 }
 
@@ -456,16 +481,37 @@ function serialize_snell(outbound) {
 }
 
 function serialize_mieru(outbound) {
+    let port_specs = [];
+    if (type(outbound.server_ports) == "array" && length(outbound.server_ports) > 0) {
+        for (let p in outbound.server_ports) {
+            let spec = replace(trim(as_string(p)), ":", "-");
+            if (spec != "")
+                push(port_specs, spec);
+        }
+    }
+    if (length(port_specs) == 0 && outbound.server_port != null) {
+        let sp = int(outbound.server_port);
+        if (sp >= 1 && sp <= 65535)
+            push(port_specs, as_string(sp));
+    }
     if (as_string(outbound.username) == "" || as_string(outbound.password) == "" ||
-        as_string(outbound.server) == "" || outbound.server_port == null)
+        as_string(outbound.server) == "" || length(port_specs) == 0)
         return "";
     let params = [];
-    add_query(params, "port", outbound.server_port);
-    add_query(params, "protocol", outbound.transport || "TCP");
+    let tag_val = as_string(outbound.tag || "");
+    if (tag_val != "")
+        add_query(params, "profile", tag_val);
+    for (let spec in port_specs)
+        add_query(params, "port", spec);
+    add_query(params, "protocol", uc(as_string(outbound.transport || "TCP")));
     if (as_string(outbound.multiplexing || "") != "")
         add_query(params, "multiplexing", outbound.multiplexing);
+    if (as_string(outbound.handshake_mode || "") != "")
+        add_query(params, "handshake-mode", outbound.handshake_mode);
+    if (as_string(outbound.traffic_pattern || "") != "")
+        add_query(params, "traffic-pattern", outbound.traffic_pattern);
     let userinfo = uri_encode(outbound.username) + ":" + uri_encode(outbound.password);
-    return "mierus://" + userinfo + "@" + host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
+    return "mierus://" + userinfo + "@" + uri_host(outbound.server) + query_string(params) + fragment(outbound);
 }
 
 function serialize_mtproto(outbound) {
@@ -504,14 +550,25 @@ function serialize_tewfai(outbound) {
     add_query(params, "morph_profile", outbound.morph_profile);
     if (outbound.pqc === true || (type(outbound.pqc) == "object" && outbound.pqc.enabled === true))
         add_query(params, "pqc", "1");
-    if (outbound.handover === true || (type(outbound.handover) == "object" && outbound.handover.enabled === true))
+    if (outbound.handover === true || (type(outbound.handover) == "object" && outbound.handover.enabled !== false)) {
         add_query(params, "handover", "1");
+        if (type(outbound.handover) == "object") {
+            if (int(outbound.handover.rotate_secs || 0) > 0)
+                add_query(params, "rotate_secs", as_string(outbound.handover.rotate_secs));
+            if (int(outbound.handover.rotate_mb || 0) > 0)
+                add_query(params, "rotate_mb", as_string(outbound.handover.rotate_mb));
+        }
+    }
     if (outbound.fec === true || (type(outbound.fec) == "object" && outbound.fec.enabled === true))
         add_query(params, "fec", "1");
+    if (outbound.desync === true || (type(outbound.desync) == "object" && outbound.desync.enabled === true))
+        add_query(params, "desync", "1");
     if (type(outbound.shaper) == "object" && (outbound.shaper.enabled === true || outbound.shaper.mode != null)) {
         add_query(params, "shaper", "1");
         add_query(params, "shaper_profile", outbound.shaper.mode || outbound.shaper.profile);
     }
+    if (int(outbound.mtu || 0) > 0)
+        add_query(params, "mtu", as_string(outbound.mtu));
     return "tewfai://" + userinfo + "@" +
         host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
 }
@@ -600,6 +657,68 @@ function serialize_openconnect(outbound) {
     return "openconnect://" + auth + host_port(outbound.server, outbound.server_port) + query_string(params) + fragment(outbound);
 }
 
+function serialize_wdtt(outbound) {
+    let server = as_string(outbound.server || "");
+    let pass = as_string(outbound.password || "");
+    if (server == "" || pass == "")
+        return "";
+    let mode = lc(as_string(outbound.mode || "wg"));
+    let port = int(outbound.server_port || ((mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000));
+    if (port < 1 || port > 65535)
+        port = (mode == "csqtt" || mode == "csqtt_v1") ? 46000 : 56000;
+
+    if (mode == "csqtt" || mode == "csqtt_v1") {
+        let params = [];
+        add_query(params, "v", mode == "csqtt_v1" ? "1" : "2");
+        add_query(params, "host", server);
+        add_query(params, "peer", port);
+        add_query(params, "password", pass);
+        if (mode == "csqtt_v1")
+            add_query(params, "mode", "csqtt_v1");
+        if (type(outbound.hashes) == "string" && trim(outbound.hashes) != "")
+            add_query(params, "hashes", trim(outbound.hashes));
+        else if (type(outbound.hashes) == "array" && length(outbound.hashes) > 0) {
+            let enc = [];
+            for (let h in outbound.hashes) {
+                h = trim(as_string(h));
+                if (h != "")
+                    push(enc, uri_encode(h));
+            }
+            if (length(enc) > 0)
+                push(params, "hashes=" + join("+", enc));
+        }
+        add_query(params, "token", outbound.vk_token);
+        if (outbound.workers != null && int(outbound.workers) >= 1 && int(outbound.workers) <= 126)
+            add_query(params, "workers", int(outbound.workers));
+        add_query(params, "obfs", outbound.obfs);
+        add_query(params, "did", outbound.device_id);
+        add_query(params, "turn_transport", outbound.turn_transport);
+        return "csqtt://connect?" + join("&", params) + fragment(outbound);
+    }
+
+    let payload = {
+        v: 1,
+        ip: server,
+        dtls: port,
+        pass: pass
+    };
+    if (outbound.raw_port != null && int(outbound.raw_port) > 0)
+        payload.raw = int(outbound.raw_port);
+    if (mode != "" && mode != "wg")
+        payload.vpn = mode;
+    if (as_string(outbound.obfs || "") != "" && lc(as_string(outbound.obfs)) != "audio")
+        payload.obfs = outbound.obfs;
+    if (as_string(outbound.device_id || "") != "")
+        payload.did = outbound.device_id;
+    if (outbound.workers != null && int(outbound.workers) > 0)
+        payload.workers = int(outbound.workers);
+    if (type(outbound.hashes) == "string" && outbound.hashes != "")
+        payload.hash = outbound.hashes;
+    else if (type(outbound.hashes) == "array" && length(outbound.hashes) > 0)
+        payload.hash = join(",", outbound.hashes);
+    return "wdtt://" + base64_encode(sprintf("%J", payload)) + fragment(outbound);
+}
+
 function serialize_outbound_link(outbound) {
     if (type(outbound) != "object")
         return "";
@@ -641,6 +760,8 @@ function serialize_outbound_link(outbound) {
         return serialize_masque(outbound);
     if (outbound_type == "openconnect")
         return serialize_openconnect(outbound);
+    if (outbound_type == "wdtt")
+        return serialize_wdtt(outbound);
     return "";
 }
 
@@ -656,7 +777,8 @@ function is_copyable_link(value) {
         "snell://", "mieru://", "mierus://",
         "tg://", "mtproto://", "shadowtls://",
         "tewfai://", "trusttunnel://", "masque://",
-        "openconnect://", "anyconnect://"
+        "openconnect://", "anyconnect://",
+        "csqtt://", "wdtt://", "qwdtt://"
     ];
     for (let prefix in prefixes) {
         if (starts_with(value, prefix))

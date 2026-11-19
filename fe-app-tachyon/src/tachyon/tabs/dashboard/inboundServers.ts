@@ -11,6 +11,8 @@ import { tr } from '../../helpers/i18n';
 import { isActiveLuciTab } from '../../helpers/isActiveLuciTab';
 import { TachyonShellMethods } from '../../methods';
 import { store } from '../../services';
+import { activateAppShellNavKey } from '../../services/tab.service';
+import { getWidgetViewMode } from './dashboardLayout';
 import { renderFlagEmojis } from './partials/renderFlagEmojis';
 import { readSectionErrors } from '../../methods/custom/getDashboardSections';
 import {
@@ -18,6 +20,7 @@ import {
   createInitialTrafficRatesState,
   TrafficRatesState,
 } from './metrics';
+import { renderUsersIcon, renderAlertTriangleIcon } from '../../../icons';
 
 const UCI_PACKAGE = 'tachyon';
 const RECENT_CLIENT_TTL_MS = 45_000;
@@ -65,6 +68,7 @@ export interface IInboundRuntimeStats {
   upSpeed: number;
   downSpeed: number;
   clients: IInboundConnectedClient[];
+  meshRunning?: boolean;
 }
 
 export interface IAllInboundsSummary {
@@ -186,7 +190,7 @@ const DEFAULT_PORTS_BY_PROTOCOL: Record<string, string> = {
   shadowtls: '443',
   fptn: '443',
   mtproto: '443',
-  mieru: '8443',
+  mieru: '2012-2022',
   trusttunnel: '443',
   tewfai: '443',
   masque: '443',
@@ -654,6 +658,15 @@ export function computeInboundsRuntimeSummary(
 
     const sectionUpload = closedSec.upload + activeUpload;
     const sectionDownload = closedSec.download + activeDownload;
+    let meshRunning = false;
+
+    const isEmbeddedTailscale =
+      server.enabled && server.protocol === 'tailscale';
+
+    if (isEmbeddedTailscale) {
+      const svcInfo = store.get()?.servicesInfoWidget?.data;
+      meshRunning = Boolean(svcInfo?.tachyonRunning || svcInfo?.tachyonCore);
+    }
 
     const prevRateState =
       sectionRatesStates.get(sectionId) || createInitialTrafficRatesState();
@@ -669,9 +682,7 @@ export function computeInboundsRuntimeSummary(
         const clientUp = (closedRec?.upload || 0) + info.activeUpload;
         const clientDown = (closedRec?.download || 0) + info.activeDownload;
         const isOnline = info.activeConns > 0;
-        if (isOnline && ip !== 'unknown') {
-          globalClientIps.add(ip);
-        } else if (ip !== 'unknown') {
+        if (ip !== 'unknown') {
           globalClientIps.add(ip);
         }
         return {
@@ -694,7 +705,8 @@ export function computeInboundsRuntimeSummary(
       });
 
     const activeConns = rawSecConns.length;
-    if (activeConns > 0 || clients.length > 0) {
+    const activeClientsCount = clients.length;
+    if (activeConns > 0 || activeClientsCount > 0) {
       activeInboundsCount += 1;
     }
 
@@ -707,12 +719,17 @@ export function computeInboundsRuntimeSummary(
     bySection.set(sectionId, {
       sectionId,
       activeConns,
-      activeClientsCount: clients.length,
+      activeClientsCount,
       upload: sectionUpload,
       download: sectionDownload,
       upSpeed: secRates.up,
       downSpeed: secRates.down,
       clients,
+      ...(isEmbeddedTailscale
+        ? {
+            meshRunning,
+          }
+        : {}),
     });
   }
 
@@ -740,8 +757,16 @@ export function computeInboundsRuntimeSummary(
 }
 
 export function switchToServersTab(): boolean {
+  if (activateAppShellNavKey('server')) {
+    return true;
+  }
   if (typeof document === 'undefined' || !document.querySelector) {
     return false;
+  }
+  const navBtn = document.querySelector<HTMLElement>('[data-nav-key="server"]');
+  if (navBtn && typeof navBtn.click === 'function') {
+    navBtn.click();
+    return true;
   }
   const tabLink = document.querySelector<HTMLElement>(
     '.cbi-tab[data-tab="cbi-tachyon-server"] a, ' +
@@ -752,7 +777,35 @@ export function switchToServersTab(): boolean {
       'li[data-tab="server"] a',
   );
   if (tabLink && typeof tabLink.click === 'function') {
+    const parentLi =
+      typeof tabLink.closest === 'function' ? tabLink.closest('li') : null;
+    if (parentLi) {
+      parentLi.classList.add('cbi-tab-disabled');
+    }
     tabLink.click();
+    if (typeof document.querySelectorAll === 'function') {
+      document
+        .querySelectorAll<HTMLElement>('.cbi-section[id^="cbi-tachyon-"]')
+        .forEach((sec) => {
+          const isTarget = sec.id === 'cbi-tachyon-server';
+          if (typeof sec.classList?.toggle === 'function') {
+            sec.classList.toggle('cbi-tab', isTarget);
+            sec.classList.toggle('cbi-tab-disabled', !isTarget);
+          } else if (sec.classList) {
+            if (isTarget) {
+              sec.classList.add('cbi-tab');
+              sec.classList.remove('cbi-tab-disabled');
+            } else {
+              sec.classList.remove('cbi-tab');
+              sec.classList.add('cbi-tab-disabled');
+            }
+          }
+          sec.setAttribute?.('data-tab-active', isTarget ? 'true' : 'false');
+          if (sec.style) {
+            sec.style.display = isTarget ? '' : 'none';
+          }
+        });
+    }
     return true;
   }
   return false;
@@ -992,7 +1045,9 @@ export function showInboundClientsModal(
 
   if (clients.length === 0) {
     contentBody = E('div', { class: 'tachyon-inbound-clients-modal__empty' }, [
-      E('div', { style: 'font-size: 32px; margin-bottom: 8px;' }, '💤'),
+      E('div', { style: 'margin-bottom: 8px; opacity: 0.5;' }, [
+        renderUsersIcon(36),
+      ]),
       E(
         'div',
         { style: 'font-weight: 600; font-size: 13.5px; margin-bottom: 4px;' },
@@ -1164,7 +1219,7 @@ export function showInboundClientsModal(
   ]);
 
   uiObj.showModal(
-    `👥 ${tr('Подключённые клиенты', 'Connected clients')}: «${server.label}» (${server.protocolFull}${server.security ? ' • ' + server.security : ''})`,
+    `${tr('Подключённые клиенты', 'Connected clients')}: «${server.label}» (${server.protocolFull}${server.security ? ' • ' + server.security : ''})`,
     modalContainer,
   );
 }
@@ -1177,6 +1232,7 @@ export function renderCollapsibleInboundsBlock(params: {
   storageKey: string;
   showGoToServersLink: boolean;
   onRerender: () => void;
+  viewMode?: string;
 }) {
   const {
     container,
@@ -1186,9 +1242,15 @@ export function renderCollapsibleInboundsBlock(params: {
     storageKey,
     showGoToServersLink,
     onRerender,
+    viewMode = 'collapsible',
   } = params;
 
-  const isCollapsed = isCollapsedInStorage(storageKey);
+  const isCollapsed =
+    viewMode === 'expanded_cards' ||
+    viewMode === 'compact_chips' ||
+    viewMode === 'port_matrix'
+      ? false
+      : isCollapsedInStorage(storageKey);
 
   if (
     selectedServerSectionFilter &&
@@ -1262,7 +1324,7 @@ export function renderCollapsibleInboundsBlock(params: {
         id: `tachyon-inbound-card-${s.sectionId}`,
         class: `tachyon-inbound-card tachyon-inbound-chip${isSelected ? ' tachyon-inbound-card--selected tachyon-inbound-chip--selected' : ''}${!s.enabled ? ' tachyon-inbound-card--disabled' : ''}${serverError ? ' tachyon-inbound-chip--error' : ''}`,
         title: serverError
-          ? `⚠️ ${s.label}: ${serverError}`
+          ? `${s.label}: ${serverError}`
           : tr(
               `Клиенты и статистика «${s.label}» (${s.protocolFull}${s.security ? ' • ' + s.security : ''}, порт ${s.port})`,
               `Clients and statistics for "${s.label}" (${s.protocolFull}${s.security ? ' • ' + s.security : ''}, port ${s.port})`,
@@ -1310,9 +1372,11 @@ export function renderCollapsibleInboundsBlock(params: {
                     'span',
                     {
                       class: 'tachyon-inbound-chip__error-pill',
+                      style:
+                        'display: inline-flex; align-items: center; gap: 3px;',
                       title: serverError,
                     },
-                    `⚠️ ${tr('Ошибка', 'Error')}`,
+                    [renderAlertTriangleIcon(10), tr('Ошибка', 'Error')],
                   ),
                 ]
               : []),
@@ -1341,19 +1405,33 @@ export function renderCollapsibleInboundsBlock(params: {
                       `${activeConns} ${tr('соед.', 'conns')}`,
                     ),
                   ]
-                : [
-                    E(
-                      'span',
-                      {
-                        class: 'tachyon-stat-pill tachyon-stat-pill--idle',
-                        title: tr(
-                          'Нет активных соединений (режим ожидания)',
-                          'No active connections (standby mode)',
-                        ),
-                      },
-                      tr('Ожидание', 'Idle'),
-                    ),
-                  ]),
+                : s.protocol === 'tailscale'
+                  ? [
+                      E(
+                        'span',
+                        {
+                          class: 'tachyon-stat-pill tachyon-stat-pill--idle',
+                          title: tr(
+                            'Встроенный Tailscale работает',
+                            'Embedded Tailscale is running',
+                          ),
+                        },
+                        tr('Работает', 'Running'),
+                      ),
+                    ]
+                  : [
+                      E(
+                        'span',
+                        {
+                          class: 'tachyon-stat-pill tachyon-stat-pill--idle',
+                          title: tr(
+                            'Нет активных соединений (режим ожидания)',
+                            'No active connections (standby mode)',
+                          ),
+                        },
+                        tr('Ожидание', 'Idle'),
+                      ),
+                    ]),
             ...(totalDown > 0
               ? [
                   E(
@@ -1512,6 +1590,24 @@ export function renderCollapsibleInboundsBlock(params: {
           },
           `↑ ${prettyBytes(summary.totalUpload)}`,
         ),
+        E(
+          'button',
+          {
+            type: 'button',
+            class:
+              'tachyon-dual-card__badge tachyon-dual-card__badge--clickable',
+            title: tr(
+              'Сгенерировать единую ссылку подписки (URL / QR) из входящих серверов',
+              'Configure subscription URL & QR code for inbound servers',
+            ),
+            click: (ev: MouseEvent) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              openServerSubscriptionModal();
+            },
+          },
+          tr('Подписка (URL / QR)', 'Configure subscription'),
+        ),
         ...(showGoToServersLink
           ? [
               E(
@@ -1554,8 +1650,14 @@ export function renderCollapsibleInboundsBlock(params: {
                 E('div', { class: 'tachyon-inbound-error-banner__item' }, [
                   E(
                     'strong',
-                    {},
-                    `⚠️ ${s.label} (${s.protocolShort} :${s.port}): `,
+                    {
+                      style:
+                        'display: inline-flex; align-items: center; gap: 4px;',
+                    },
+                    [
+                      renderAlertTriangleIcon(12),
+                      `${s.label} (${s.protocolShort} :${s.port}): `,
+                    ],
                   ),
                   E('span', {}, sectionErrors[s.sectionId] || ''),
                 ]),
@@ -1565,7 +1667,25 @@ export function renderCollapsibleInboundsBlock(params: {
         : []),
       ...(isCollapsed
         ? []
-        : [E('div', { class: 'tachyon-inbounds-chip-grid' }, chipNodes)]),
+        : [
+            E(
+              'div',
+              {
+                class: [
+                  'tachyon-inbounds-chip-grid',
+                  viewMode === 'compact_chips'
+                    ? 'tachyon-inbounds-chip-grid--compact'
+                    : '',
+                  viewMode === 'port_matrix'
+                    ? 'tachyon-inbounds-chip-grid--matrix'
+                    : '',
+                ]
+                  .filter(Boolean)
+                  .join(' '),
+              },
+              chipNodes,
+            ),
+          ]),
     ],
   );
 
@@ -1616,6 +1736,7 @@ export function renderInboundServersDashboardWidget(options?: {
     storageKey: COLLAPSE_STORAGE_KEY_DASHBOARD,
     showGoToServersLink: true,
     onRerender: () => renderInboundServersDashboardWidget(options),
+    viewMode: getWidgetViewMode('inbounds') || 'collapsible',
   });
 }
 
@@ -1702,6 +1823,22 @@ function stopServerTabPolling() {
   if (!serverTabPollTimer) return;
   clearInterval(serverTabPollTimer);
   serverTabPollTimer = null;
+}
+
+export function openServerInfoModalForSection(sectionId: string): boolean {
+  if (registeredServerController?.showServerInfoModal) {
+    registeredServerController.showServerInfoModal(sectionId);
+    return true;
+  }
+  return false;
+}
+
+export function openServerSubscriptionModal(): boolean {
+  if (registeredServerController?.showSubscriptionModal) {
+    registeredServerController.showSubscriptionModal();
+    return true;
+  }
+  return false;
 }
 
 export function registerServerSectionController(

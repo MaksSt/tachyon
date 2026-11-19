@@ -156,6 +156,14 @@ function notify_updates_cli() {
     return runtime.notify_updates_cli();
 }
 
+function notify_auto_update_cli(component, old_ver, new_ver) {
+    return runtime.notify_auto_update_cli(component, old_ver, new_ver);
+}
+
+function notify_auto_update_failed_cli(component, old_ver, error_msg) {
+    return runtime.notify_auto_update_failed_cli(component, old_ver, error_msg);
+}
+
 function process_updates(token, admin_ids) {
     // Idle poll guard invariant:
     // if (!res || !res.ok || !res.result) return false;
@@ -175,7 +183,7 @@ function dispatch_command(token, chat_id, text, msg_id) {
 
 // ─── CLI Entrypoint ──────────────────────────────────────────────────────────
 
-if (length(ARGV) > 0) {
+if ((sourcepath(1) == null || sourcepath(1) == "") && length(ARGV) > 0) {
     let mode = (ARGV[0] == "" || ARGV[0] == null) ? ARGV[1] : ARGV[0];
     if (!mode) mode = "";
 
@@ -191,6 +199,20 @@ if (length(ARGV) > 0) {
         exit(diagnose());
     else if (mode == "notify-updates")
         exit(notify_updates_cli());
+    else if (mode == "notify-auto-update") {
+        let start_arg = (ARGV[0] == "" || ARGV[0] == null) ? 2 : 1;
+        let comp = ARGV[start_arg];
+        let old_v = ARGV[start_arg + 1];
+        let new_v = ARGV[start_arg + 2];
+        exit(notify_auto_update_cli(comp, old_v, new_v));
+    }
+    else if (mode == "notify-auto-update-failed") {
+        let start_arg = (ARGV[0] == "" || ARGV[0] == null) ? 2 : 1;
+        let comp = ARGV[start_arg];
+        let old_v = ARGV[start_arg + 1];
+        let err_v = ARGV[start_arg + 2];
+        exit(notify_auto_update_failed_cli(comp, old_v, err_v));
+    }
     else if (mode == "send-smart") {
         let start_arg = (ARGV[0] == "" || ARGV[0] == null) ? 2 : 1;
         let entries = null;
@@ -240,6 +262,8 @@ return {
     diagnose,
     send_api,
     notify_updates_cli,
+    notify_auto_update_cli,
+    notify_auto_update_failed_cli,
     process_updates,
     dispatch_command,
     rendering,

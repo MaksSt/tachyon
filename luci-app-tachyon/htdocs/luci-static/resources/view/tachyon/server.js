@@ -14,9 +14,27 @@ const ROUTING_SECTION_ACTIONS = [
   "proxy",
   "outbound",
   "vpn",
-  "byedpi",
-  "zapret",
-  "zapret2",
+  "awg",
+  "warp",
+  "anytls",
+  "snell",
+  "mieru",
+  "naive",
+  "sudoku",
+  "masque",
+  "openvpn",
+  "openconnect",
+  "fptn",
+  "desync",
+  "shadowtls",
+  "trusttunnel",
+  "tewfai",
+  "csqtt",
+  "mtproto",
+  "chain",
+  "tailscale",
+  "wdtt",
+  "group",
 ];
 const callNetworkInterfaceDump = rpc.declare({
   object: "network.interface",
@@ -436,8 +454,9 @@ const PORT_PROTOCOLS = [
   "tewfai",
   "masque",
   "openconnect",
+  "wdtt",
+  "mtproto",
 ];
-const EXTENDED_PORT_PROTOCOLS = ["mtproto"];
 const PASSWORD_PROTOCOLS = [
   "shadowsocks",
   "socks",
@@ -453,6 +472,7 @@ const PASSWORD_PROTOCOLS = [
   "mieru",
   "trusttunnel",
   "masque",
+  "wdtt",
 ];
 
 const BASE_PROTOCOL_LABELS = {
@@ -477,8 +497,7 @@ const CORE_SERVER_PROTOCOL_LABELS = {
   tewfai: "TewFai",
   masque: "MASQUE",
   openconnect: "OpenConnect",
-};
-const EXTENDED_PROTOCOL_LABELS = {
+  wdtt: "CSQTT / WDTT v3",
   mtproto: "MTProto",
 };
 const CUSTOM_PROTOCOL_LABELS = {
@@ -490,7 +509,6 @@ const TAILSCALE_PROTOCOL_LABELS = {
 const PROTOCOL_LABELS = {
   ...BASE_PROTOCOL_LABELS,
   ...CORE_SERVER_PROTOCOL_LABELS,
-  ...EXTENDED_PROTOCOL_LABELS,
   ...CUSTOM_PROTOCOL_LABELS,
   ...TAILSCALE_PROTOCOL_LABELS,
 };
@@ -518,6 +536,7 @@ const SECURITY_BY_PROTOCOL = {
   tewfai: ["tls"],
   masque: ["tls"],
   openconnect: ["tls"],
+  wdtt: ["none"],
 };
 
 function getSecurityLabel(security) {
@@ -561,7 +580,7 @@ function injectServerStyles() {
 .fkp-server-info-modal__details-col{display:flex;flex-direction:column;gap:14px;flex:1 1 0;min-width:0;max-width:100%;box-sizing:border-box !important;overflow:hidden}
 .fkp-server-info-modal__details-grid{display:flex;flex-direction:column;gap:10px;background:rgba(128,128,128,0.06);padding:14px 16px;border:1px solid rgba(128,128,128,0.16);box-sizing:border-box !important;border-radius:8px;width:100% !important;max-width:100% !important}
 .fkp-server-info-modal__detail-item{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;width:100% !important;max-width:100% !important;box-sizing:border-box}
-.fkp-server-info-modal__detail-label{font-size:11px;opacity:0.65;text-transform:uppercase;letter-spacing:0.05em;font-weight:700;flex:0 0 auto}
+.fkp-server-info-modal__detail-label{font-size:11px;opacity:0.65;letter-spacing:0.05em;font-weight: 600;flex:0 0 auto}
 .fkp-server-info-modal__detail-value{font-size:13px;font-weight:500;text-align:right;max-width:100%;overflow-wrap:anywhere;word-break:break-word}
 .fkp-server-info-modal__detail-value--title{font-weight:600;font-size:14px}
 .fkp-server-info-modal__detail-value--mono{font-family:var(--font-mono,monospace);font-size:12px;background:rgba(128,128,128,0.12);padding:2px 8px;border-radius:6px;border:1px solid rgba(128,128,128,0.15);word-break:break-all;overflow-wrap:anywhere;box-sizing:border-box}
@@ -610,34 +629,21 @@ function addOptionValue(option, value, label) {
 }
 
 function normalizeServerCapabilities(capabilities) {
-  const singBoxExtended = Boolean(capabilities?.singBoxExtended);
-  const singBoxTachyonCore = Boolean(capabilities?.singBoxTachyonCore);
-
   return {
-    singBoxExtended,
-    singBoxTachyonCore,
-    singBoxTailscale: capabilities?.singBoxTailscale !== false,
-    // Server-side (inbound) XHTTP is only implemented in tachyon-core;
-    // sing-box-lx and sing-box-extended only include v2rayxhttp.Client
-    // (outbound) and fail `sing-box check` with
-    // `create server transport: xhttp: unknown transport type: xhttp`.
-    singBoxXhttp: singBoxTachyonCore,
+    tailscaleAvailable: capabilities?.tachyonCoreTailscale !== false,
   };
 }
 
 function getDefaultProtocolForCapabilities(capabilities) {
-  return normalizeServerCapabilities(capabilities).singBoxTailscale
+  return normalizeServerCapabilities(capabilities).tailscaleAvailable
     ? DEFAULT_SERVER_PROTOCOL
     : FALLBACK_SERVER_PROTOCOL;
 }
 
-function populateProtocolValues(option, capabilities) {
-  const normalized = normalizeServerCapabilities(capabilities);
-
+function populateProtocolValues(option, _capabilities) {
   resetOptionValues(option);
 
-  // Tailscale is offered unconditionally: the native tailscaled mode does not
-  // depend on the sing-box build, only on the installable Tailscale component.
+  // Tailscale is built into tachyon-core.
   Object.entries(TAILSCALE_PROTOCOL_LABELS).forEach(([value, label]) => {
     addOptionValue(option, value, label);
   });
@@ -646,29 +652,16 @@ function populateProtocolValues(option, capabilities) {
     addOptionValue(option, value, label);
   });
 
-  if (normalized.singBoxExtended || normalized.singBoxTachyonCore) {
-    Object.entries(CORE_SERVER_PROTOCOL_LABELS).forEach(([value, label]) => {
-      addOptionValue(option, value, label);
-    });
-  } else {
-    addOptionValue(option, "tuic", "TUIC");
-    addOptionValue(option, "shadowtls", "ShadowTLS");
-    addOptionValue(option, "http", "HTTP");
-    addOptionValue(option, "mixed", "Mixed (SOCKS/HTTP)");
-  }
-
-  if (normalized.singBoxExtended) {
-    Object.entries(EXTENDED_PROTOCOL_LABELS).forEach(([value, label]) => {
-      addOptionValue(option, value, label);
-    });
-  }
+  Object.entries(CORE_SERVER_PROTOCOL_LABELS).forEach(([value, label]) => {
+    addOptionValue(option, value, label);
+  });
 
   Object.entries(CUSTOM_PROTOCOL_LABELS).forEach(([value, label]) => {
     addOptionValue(option, value, label);
   });
 }
 
-function populateTransportValues(option, supportsXhttp) {
+function populateTransportValues(option) {
   resetOptionValues(option);
 
   addOptionValue(option, "tcp", "TCP");
@@ -676,10 +669,7 @@ function populateTransportValues(option, supportsXhttp) {
   addOptionValue(option, "grpc", "gRPC");
   addOptionValue(option, "http", "HTTP");
   addOptionValue(option, "httpupgrade", "HTTPUpgrade");
-
-  if (supportsXhttp) {
-    addOptionValue(option, "xhttp", "XHTTP");
-  }
+  addOptionValue(option, "xhttp", "XHTTP");
 }
 
 function applyServerCapabilities(sectionRef, capabilities) {
@@ -698,7 +688,7 @@ function applyServerCapabilities(sectionRef, capabilities) {
   }
 
   if (options.transport) {
-    populateTransportValues(options.transport, normalized.singBoxXhttp);
+    populateTransportValues(options.transport);
   }
 }
 
@@ -765,7 +755,8 @@ function getEffectiveSecurity(sectionId) {
     protocol === "shadowtls" ||
     protocol === "http" ||
     protocol === "mixed" ||
-    protocol === "mieru"
+    protocol === "mieru" ||
+    protocol === "wdtt"
   ) {
     return "none";
   }
@@ -873,15 +864,41 @@ function isPrivateOrReservedIp(value) {
     return true;
   }
 
-  return (
-    normalized === "::" ||
-    normalized === "::1" ||
-    normalized.startsWith("fe80") ||
-    normalized.startsWith("fc") ||
-    normalized.startsWith("fd") ||
-    normalized.startsWith("ff") ||
-    normalized.startsWith("2001:db8")
-  );
+  const cidr = `${normalized}/128`;
+  const range = main.parseCidrRange(cidr);
+  if (!range) {
+    return true;
+  }
+
+  const mappedPrefix = main.parseCidrRange("::ffff:0:0/96");
+  if (
+    mappedPrefix &&
+    range.start >= mappedPrefix.start &&
+    range.start <= mappedPrefix.end
+  ) {
+    const v4 = range.start & 0xffffffffn;
+    const mappedIpv4 = [
+      Number((v4 >> 24n) & 0xffn),
+      Number((v4 >> 16n) & 0xffn),
+      Number((v4 >> 8n) & 0xffn),
+      Number(v4 & 0xffn),
+    ].join(".");
+    return isPrivateOrReservedIpv4(mappedIpv4);
+  }
+
+  const reservedIpv6Prefixes = [
+    "::/128",
+    "::1/128",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "2001:db8::/32",
+    "3fff::/20",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+  ];
+  return reservedIpv6Prefixes.some((prefix) => main.cidrsOverlap(cidr, prefix));
 }
 
 function getInterfaceIpAddresses(networkInterface) {
@@ -1322,14 +1339,18 @@ function ensureProtocolDefaults(sectionId, protocol, forceProtocolDefaults) {
     defaultPort = "51820";
   } else if (protocol === "hysteria2") {
     defaultPort = "443";
-  } else if (protocol === "tuic" || protocol === "mieru") {
+  } else if (protocol === "tuic") {
     defaultPort = "8443";
+  } else if (protocol === "mieru") {
+    defaultPort = "2012-2022";
   } else if (protocol === "shadowsocks") {
     defaultPort = "8388";
   } else if (protocol === "socks") {
     defaultPort = "1080";
   } else if (protocol === "http" || protocol === "mixed") {
     defaultPort = "8080";
+  } else if (protocol === "wdtt") {
+    defaultPort = "46000";
   }
   setDefault(sectionId, "listen_port", defaultPort);
 
@@ -1448,6 +1469,8 @@ function ensureProtocolDefaults(sectionId, protocol, forceProtocolDefaults) {
       defaultTailscaleHostname(sectionId),
     );
     setDefault(sectionId, "tailscale_advertise_exit_node", "1");
+    setDefault(sectionId, "tailscale_accept_dns", "1");
+    setDefault(sectionId, "tailscale_accept_default_resolvers", "1");
   }
 
   if (protocol === "hysteria2") {
@@ -1505,6 +1528,7 @@ function ensureProtocolDefaults(sectionId, protocol, forceProtocolDefaults) {
     setDefault(sectionId, "tewfai_password", generatePassword());
     setDefault(sectionId, "tewfai_inbound_transport", "tcp");
     setDefault(sectionId, "tewfai_inner_cipher", "aes-256-gcm");
+    setDefault(sectionId, "tewfai_morph_profile", "auto");
     setDefault(sectionId, "tewfai_pqc_enabled", "1");
     setDefault(sectionId, "tewfai_handover_enabled", "1");
     setDefault(sectionId, "tewfai_fec_enabled", "0");
@@ -1534,6 +1558,16 @@ function ensureProtocolDefaults(sectionId, protocol, forceProtocolDefaults) {
     setDefault(sectionId, "openconnect_mtu", "1400");
     setDefault(sectionId, "openconnect_ip", "0");
     setDefault(sectionId, "tls_server_name", terminatingSni);
+  }
+
+  if (protocol === "wdtt") {
+    setDefault(sectionId, "security", "none");
+    setDefault(sectionId, "server_username", "user1");
+    setDefault(sectionId, "server_password", generatePassword());
+    setDefault(sectionId, "wdtt_mode", "csqtt");
+    setDefault(sectionId, "wdtt_obfs", "audio");
+    setDefault(sectionId, "wdtt_network", "10.66.0.1/16");
+    setDefault(sectionId, "wdtt_mtu", "1350");
   }
 }
 
@@ -1684,10 +1718,12 @@ function getServerPort(sectionId) {
     return `${routerNetworkEnvCache.recommended_ports[protocol]}`;
   }
   if (protocol === "awg") return "51820";
-  if (protocol === "tuic" || protocol === "mieru") return "8443";
+  if (protocol === "mieru") return "2012-2022";
+  if (protocol === "tuic") return "8443";
   if (protocol === "shadowsocks") return "8388";
   if (protocol === "socks") return "1080";
   if (protocol === "http" || protocol === "mixed") return "8080";
+  if (protocol === "wdtt") return "46000";
   return "443";
 }
 
@@ -1789,7 +1825,7 @@ function buildVmessLink(sectionId, identity, options = {}) {
   const payload = {
     v: "2",
     ps: identity.name || sectionId,
-    add: host,
+    add: normalizeHost(host),
     port,
     id: identity.uuid,
     aid: uci.get(UCI_PACKAGE, sectionId, "vmess_alter_id") || "0",
@@ -1848,6 +1884,11 @@ function normalizeSha256(value) {
   return /^[0-9a-f]{64}$/.test(normalized) ? normalized : "";
 }
 
+function normalizeMd5(value) {
+  const normalized = `${value || ""}`.trim().replace(/:/g, "").toLowerCase();
+  return /^[0-9a-f]{32}$/.test(normalized) ? normalized : "";
+}
+
 function shouldUseGeneratedTlsCertificatePin(sectionId) {
   const certificatePath = `${
     uci.get(UCI_PACKAGE, sectionId, "tls_certificate_path") ||
@@ -1857,9 +1898,9 @@ function shouldUseGeneratedTlsCertificatePin(sectionId) {
   return !/^\/etc\/(acme|letsencrypt|ssl\/certs)\//.test(certificatePath);
 }
 
-function loadGeneratedTlsCertificatePin(sectionId) {
-  if (!shouldUseGeneratedTlsCertificatePin(sectionId)) {
-    return Promise.resolve("");
+function loadTlsCertificateFingerprints(sectionId, includeCustomCert = false) {
+  if (!includeCustomCert && !shouldUseGeneratedTlsCertificatePin(sectionId)) {
+    return Promise.resolve({ sha256: "", md5: "" });
   }
 
   return fs
@@ -1874,15 +1915,24 @@ function loadGeneratedTlsCertificatePin(sectionId) {
         throw new Error(data.message || "");
       }
 
-      return normalizeSha256(data.sha256);
+      return {
+        sha256: normalizeSha256(data.sha256),
+        md5: normalizeMd5(data.md5),
+      };
     })
     .catch((error) => {
       console.warn(
-        error?.message || "Failed to read generated TLS certificate pin",
+        error?.message || "Failed to read TLS certificate fingerprints",
         error,
       );
-      return "";
+      return { sha256: "", md5: "" };
     });
+}
+
+function loadGeneratedTlsCertificatePin(sectionId) {
+  return loadTlsCertificateFingerprints(sectionId, false).then(
+    (fps) => fps.sha256,
+  );
 }
 
 function buildHysteria2Link(sectionId, identity, options = {}) {
@@ -2032,7 +2082,7 @@ function buildFptnPayload(sectionId, identity, options = {}) {
         name: serverName,
         host: host,
         port: port,
-        md5_fingerprint: "",
+        md5_fingerprint: normalizeMd5(options.tlsCertificateMd5),
       },
     ],
     censored_zone_servers: [],
@@ -2074,7 +2124,9 @@ function buildMieruLink(sectionId, identity, options = {}) {
   const uriHost = formatHostForUri(host);
   const rawPort =
     uci.get(UCI_PACKAGE, sectionId, "listen_port") ||
-    (typeof getServerPort === "function" ? getServerPort(sectionId) : "8443");
+    (typeof getServerPort === "function"
+      ? getServerPort(sectionId)
+      : "2012-2022");
   const port = `${rawPort}`
     .trim()
     .split(/[\s,]+/)
@@ -2162,6 +2214,11 @@ function buildTewfaiLink(sectionId, identity, options = {}) {
   if (innerCipher) {
     params.inner_cipher = innerCipher;
   }
+  const morphProfile =
+    uci.get(UCI_PACKAGE, sectionId, "tewfai_morph_profile") || "";
+  if (morphProfile) {
+    params.morph_profile = morphProfile;
+  }
   if (uci.get(UCI_PACKAGE, sectionId, "tewfai_pqc_enabled") === "1") {
     params.pqc = "1";
   }
@@ -2171,6 +2228,9 @@ function buildTewfaiLink(sectionId, identity, options = {}) {
   if (uci.get(UCI_PACKAGE, sectionId, "tewfai_fec_enabled") === "1") {
     params.fec = "1";
   }
+  if (uci.get(UCI_PACKAGE, sectionId, "tewfai_desync_enabled") === "1") {
+    params.desync = "1";
+  }
   if (uci.get(UCI_PACKAGE, sectionId, "tewfai_shaper_enabled") === "1") {
     params.shaper = "1";
     const shaperProfile =
@@ -2178,6 +2238,10 @@ function buildTewfaiLink(sectionId, identity, options = {}) {
     if (shaperProfile) {
       params.shaper_profile = shaperProfile;
     }
+  }
+  const tewfaiMtu = uci.get(UCI_PACKAGE, sectionId, "tewfai_mtu") || "";
+  if (tewfaiMtu) {
+    params.mtu = tewfaiMtu;
   }
   const query = encodeQuery(params);
   return `tewfai://${cred}@${uriHost}:${port}${query ? `?${query}` : ""}#${encodeURIComponent(identity.name || sectionId)}`;
@@ -2259,6 +2323,63 @@ function buildOpenconnectLink(sectionId, identity, options = {}) {
   return `openconnect://${auth}${uriHost}:${port}${query ? `?${query}` : ""}#${encodeURIComponent(identity.name || sectionId)}`;
 }
 
+function buildWdttLink(sectionId, identity, options = {}) {
+  const pwd = identity.password || "";
+  if (!pwd) return "";
+  const host = getPublicHost(sectionId, options);
+  const port = parseInt(
+    uci.get(UCI_PACKAGE, sectionId, "listen_port") ||
+      (typeof getServerPort === "function"
+        ? getServerPort(sectionId)
+        : "46000"),
+    10,
+  );
+  const mode = String(uci.get(UCI_PACKAGE, sectionId, "wdtt_mode") || "csqtt")
+    .trim()
+    .toLowerCase();
+  const obfs = String(uci.get(UCI_PACKAGE, sectionId, "wdtt_obfs") || "audio")
+    .trim()
+    .toLowerCase();
+  const label = encodeURIComponent(identity.name || sectionId);
+
+  if (mode === "wg" || mode === "raw") {
+    const payload = {
+      v: 1,
+      ip: host,
+      dtls: port,
+      pass: pwd,
+      vpn: mode,
+    };
+    const rawPort = parseInt(
+      uci.get(UCI_PACKAGE, sectionId, "wdtt_raw_port") || "0",
+      10,
+    );
+    if (rawPort > 0) {
+      payload.raw = rawPort;
+    }
+    if (obfs && obfs !== "audio") {
+      payload.obfs = obfs;
+    }
+    return `wdtt://${base64UrlEncode(JSON.stringify(payload))}#${label}`;
+  }
+
+  const effMode = mode === "csqtt_v1" ? "csqtt_v1" : "csqtt";
+  const params = {
+    v: effMode === "csqtt_v1" ? "1" : "2",
+    host,
+    peer: String(port),
+    password: pwd,
+  };
+  if (effMode === "csqtt_v1") {
+    params.mode = "csqtt_v1";
+  }
+  if (obfs) {
+    params.obfs = obfs;
+  }
+  const query = encodeQuery(params);
+  return `csqtt://connect${query ? `?${query}` : ""}#${label}`;
+}
+
 function buildAwgClientConfig(sectionId, targetVersion, options = {}) {
   const host = getPublicHost(sectionId, options);
   const port =
@@ -2302,10 +2423,20 @@ function buildAwgClientConfig(sectionId, targetVersion, options = {}) {
     const jc = uci.get(UCI_PACKAGE, sectionId, "awg_jc") || "4";
     const jmin = uci.get(UCI_PACKAGE, sectionId, "awg_jmin") || "40";
     const jmax = uci.get(UCI_PACKAGE, sectionId, "awg_jmax") || "70";
-    const s1 = uci.get(UCI_PACKAGE, sectionId, "awg_s1") || "0";
-    const s2 = uci.get(UCI_PACKAGE, sectionId, "awg_s2") || "0";
-    const s3 = uci.get(UCI_PACKAGE, sectionId, "awg_s3") || "0";
-    const s4 = uci.get(UCI_PACKAGE, sectionId, "awg_s4") || "0";
+    let s1 = uci.get(UCI_PACKAGE, sectionId, "awg_s1") || "0";
+    let s2 = uci.get(UCI_PACKAGE, sectionId, "awg_s2") || "0";
+    let s3 = uci.get(UCI_PACKAGE, sectionId, "awg_s3") || "0";
+    let s4 = uci.get(UCI_PACKAGE, sectionId, "awg_s4") || "0";
+    const hpk =
+      effectiveVer === "3.0" || effectiveVer === "3.1"
+        ? uci.get(UCI_PACKAGE, sectionId, "awg_header_protection_key") || ""
+        : "";
+    if (hpk) {
+      if ((parseInt(s1, 10) || 0) < 12) s1 = "20";
+      if ((parseInt(s2, 10) || 0) < 12) s2 = "20";
+      if ((parseInt(s3, 10) || 0) < 12) s3 = "20";
+      if ((parseInt(s4, 10) || 0) < 12) s4 = "20";
+    }
     const h1 = uci.get(UCI_PACKAGE, sectionId, "awg_h1") || "1";
     const h2 = uci.get(UCI_PACKAGE, sectionId, "awg_h2") || "2";
     const h3 = uci.get(UCI_PACKAGE, sectionId, "awg_h3") || "3";
@@ -2332,8 +2463,6 @@ function buildAwgClientConfig(sectionId, targetVersion, options = {}) {
     if (itime) conf += `Itime = ${itime}\n`;
 
     if (effectiveVer === "3.0" || effectiveVer === "3.1") {
-      const hpk =
-        uci.get(UCI_PACKAGE, sectionId, "awg_header_protection_key") || "";
       const cpa =
         uci.get(UCI_PACKAGE, sectionId, "awg_content_padding_addition") || "";
       if (hpk) conf += `HeaderProtectionKey = ${hpk}\n`;
@@ -2356,7 +2485,8 @@ function buildAwgClientConfig(sectionId, targetVersion, options = {}) {
     }
   }
 
-  conf += `\n[Peer]\nPublicKey = ${serverPublicKey}\nEndpoint = ${host}:${port}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = ${keepalive}\n`;
+  const endpointHost = formatHostForUri(host);
+  conf += `\n[Peer]\nPublicKey = ${serverPublicKey}\nEndpoint = ${endpointHost}:${port}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = ${keepalive}\n`;
   if (presharedKey) conf += `PresharedKey = ${presharedKey}\n`;
 
   return conf;
@@ -2438,6 +2568,8 @@ function buildClientLink(sectionId, options = {}) {
       return buildMasqueLink(sectionId, identity, options);
     case "openconnect":
       return buildOpenconnectLink(sectionId, identity, options);
+    case "wdtt":
+      return buildWdttLink(sectionId, identity, options);
     case "awg":
       return buildAwgClientConfig(sectionId, options.awgVersion, options);
     case "vless":
@@ -2449,14 +2581,15 @@ function buildClientLink(sectionId, options = {}) {
 function buildClientLinkContext(sectionId) {
   const protocol = getProtocol(sectionId);
   const security = getEffectiveSecurity(sectionId);
+  const fptnCertificatePinExpected = protocol === "fptn" && security === "tls";
   const certificatePinExpected =
-    [
+    fptnCertificatePinExpected ||
+    ([
       "hysteria2",
       "tuic",
       "anytls",
       "naive",
       "trojan",
-      "fptn",
       "vless",
       "vmess",
       "trusttunnel",
@@ -2464,24 +2597,30 @@ function buildClientLinkContext(sectionId) {
       "masque",
       "openconnect",
     ].includes(protocol) &&
-    security === "tls" &&
-    shouldUseGeneratedTlsCertificatePin(sectionId);
+      security === "tls" &&
+      shouldUseGeneratedTlsCertificatePin(sectionId));
 
   if (!certificatePinExpected) {
     return Promise.resolve({
       link: buildClientLink(sectionId),
       certificatePinExpected,
       tlsCertificateSha256: "",
+      tlsCertificateMd5: "",
     });
   }
 
-  return loadGeneratedTlsCertificatePin(sectionId).then(
-    (tlsCertificateSha256) => ({
-      link: buildClientLink(sectionId, { tlsCertificateSha256 }),
-      certificatePinExpected,
+  return loadTlsCertificateFingerprints(
+    sectionId,
+    fptnCertificatePinExpected,
+  ).then(({ sha256: tlsCertificateSha256, md5: tlsCertificateMd5 }) => ({
+    link: buildClientLink(sectionId, {
       tlsCertificateSha256,
+      tlsCertificateMd5,
     }),
-  );
+    certificatePinExpected,
+    tlsCertificateSha256,
+    tlsCertificateMd5,
+  }));
 }
 
 function svgEl(tag, attrs = {}, children = []) {
@@ -2641,11 +2780,13 @@ function renderInfoClientLink(sectionId, linkContext = {}) {
   let activeAwgVersion =
     uci.get(UCI_PACKAGE, sectionId, "awg_version") || "2.0";
 
+  const tlsCertificateMd5 = linkContext.tlsCertificateMd5 || "";
   const computeLink = (hostOverride) =>
     protocol === "awg"
       ? buildAwgClientConfig(sectionId, activeAwgVersion, { hostOverride })
       : buildClientLink(sectionId, {
           tlsCertificateSha256: linkContext.tlsCertificateSha256 || "",
+          tlsCertificateMd5,
           hostOverride,
         });
 
@@ -2675,7 +2816,10 @@ function renderInfoClientLink(sectionId, linkContext = {}) {
   const qrUri =
     protocol === "fptn"
       ? qrSvgDataUri(
-          buildFptnLink(sectionId, identity, { hostOverride: activeHost }),
+          buildFptnLink(sectionId, identity, {
+            hostOverride: activeHost,
+            tlsCertificateMd5,
+          }),
         )
       : qrSvgDataUri(currentLink || "");
 
@@ -2683,9 +2827,12 @@ function renderInfoClientLink(sectionId, linkContext = {}) {
     security && security !== "none" ? ` + ${getSecurityLabel(security)}` : "";
   const protocolText = `${getProtocolLabel(protocol)}${securitySuffix}`;
   const certificatePinWarning =
-    protocol === "hysteria2" &&
-    linkContext.certificatePinExpected &&
-    !linkContext.tlsCertificateSha256
+    (protocol === "hysteria2" &&
+      linkContext.certificatePinExpected &&
+      !linkContext.tlsCertificateSha256) ||
+    (protocol === "fptn" &&
+      linkContext.certificatePinExpected &&
+      !tlsCertificateMd5)
       ? E(
           "div",
           { class: "fkp-server-info-modal__warning alert-message warning" },
@@ -2727,7 +2874,10 @@ function renderInfoClientLink(sectionId, linkContext = {}) {
           btnLink.className = "btn cbi-button cbi-button-action";
           btnToken.className = "btn cbi-button cbi-button-neutral";
           qrImg.src = qrSvgDataUri(
-            buildFptnLink(sectionId, identity, { hostOverride: activeHost }),
+            buildFptnLink(sectionId, identity, {
+              hostOverride: activeHost,
+              tlsCertificateMd5,
+            }),
           );
         },
       },
@@ -2746,7 +2896,10 @@ function renderInfoClientLink(sectionId, linkContext = {}) {
           btnToken.className = "btn cbi-button cbi-button-action";
           btnLink.className = "btn cbi-button cbi-button-neutral";
           qrImg.src = qrSvgDataUri(
-            buildFptnToken(sectionId, identity, { hostOverride: activeHost }),
+            buildFptnToken(sectionId, identity, {
+              hostOverride: activeHost,
+              tlsCertificateMd5,
+            }),
           );
         },
       },
@@ -2867,9 +3020,11 @@ function renderInfoClientLink(sectionId, linkContext = {}) {
   if (protocol === "fptn") {
     let fptnToken = buildFptnToken(sectionId, identity, {
       hostOverride: activeHost,
+      tlsCertificateMd5,
     });
     let fptnLink = buildFptnLink(sectionId, identity, {
       hostOverride: activeHost,
+      tlsCertificateMd5,
     });
 
     linkSection.appendChild(
@@ -2954,8 +3109,12 @@ function renderInfoClientLink(sectionId, linkContext = {}) {
     onHostChange = (nextHost) => {
       fptnToken = buildFptnToken(sectionId, identity, {
         hostOverride: nextHost,
+        tlsCertificateMd5,
       });
-      fptnLink = buildFptnLink(sectionId, identity, { hostOverride: nextHost });
+      fptnLink = buildFptnLink(sectionId, identity, {
+        hostOverride: nextHost,
+        tlsCertificateMd5,
+      });
       tokenTextarea.value = fptnToken;
       linkTextarea.value = fptnLink;
       const newQr = qrSvgDataUri(fptnQrMode === "token" ? fptnToken : fptnLink);
@@ -3347,26 +3506,48 @@ function validateRequiredText(_sectionId, value) {
 }
 
 function isRoutingSectionAction(action) {
+  if (!action) return true;
   return ROUTING_SECTION_ACTIONS.indexOf(`${action || ""}`) !== -1;
 }
 
 function loadRoutingSectionChoices(option) {
-  const sections = option.map?.data?.state?.values?.[UCI_PACKAGE] ?? {};
+  const sectionsMap = option.map?.data?.state?.values?.[UCI_PACKAGE] ?? {};
+  const uciSectionsList =
+    typeof uci !== "undefined" && typeof uci.sections === "function"
+      ? uci.sections(UCI_PACKAGE, "section") || []
+      : [];
 
   option.keylist = [];
   option.vallist = [];
+  const seen = new Set();
 
-  for (const sectionName in sections) {
-    const section = sections[sectionName];
-
+  const addSectionChoice = (sectionName, section) => {
+    if (!sectionName || seen.has(sectionName)) return;
     if (
-      section[".type"] === "section" &&
+      section &&
+      (section[".type"] === "section" || !section[".type"]) &&
       section.enabled !== "0" &&
       isRoutingSectionAction(section.action)
     ) {
+      seen.add(sectionName);
+      const label = section.label || section.name || sectionName;
+      const actionTag = section.action ? ` (${section.action})` : "";
       option.keylist.push(sectionName);
-      option.vallist.push(section.label || sectionName);
+      option.vallist.push(
+        label === sectionName
+          ? `${label}${actionTag}`
+          : `${label} [${sectionName}]${actionTag}`,
+      );
     }
+  };
+
+  for (const s of uciSectionsList) {
+    if (s && s[".name"]) {
+      addSectionChoice(s[".name"], s);
+    }
+  }
+  for (const sectionName in sectionsMap) {
+    addSectionChoice(sectionName, sectionsMap[sectionName]);
   }
 
   return Promise.resolve();
@@ -3697,20 +3878,31 @@ function populateListenAddressChoices(option, env) {
     addOptionValue(option, lanIp, `${_("Local (LAN)")} — ${lanIp}`);
   }
 
+  const lanIpv6 = normalizeHost(env?.lan_ipv6);
+  if (lanIpv6) {
+    addOptionValue(option, lanIpv6, `${_("Local (LAN IPv6)")} — ${lanIpv6}`);
+  }
+
+  const wanIps = [];
   if (Array.isArray(env?.wan_ips)) {
-    for (const rawIp of env.wan_ips) {
-      const wanIp = normalizeHost(rawIp);
-      if (wanIp) {
-        addOptionValue(
-          option,
-          wanIp,
-          `${_("External (WAN interface)")} — ${wanIp}`,
-        );
-      }
+    wanIps.push(...env.wan_ips);
+  }
+  if (env?.wan_ipv6) {
+    wanIps.push(env.wan_ipv6);
+  }
+  for (const rawIp of wanIps) {
+    const wanIp = normalizeHost(rawIp);
+    if (wanIp) {
+      addOptionValue(
+        option,
+        wanIp,
+        `${_("External (WAN interface)")} — ${wanIp}`,
+      );
     }
   }
 
   addOptionValue(option, "127.0.0.1", `${_("Localhost")} (127.0.0.1)`);
+  addOptionValue(option, "::1", `${_("Localhost (IPv6)")} (::1)`);
 }
 
 function populatePublicHostChoices(option, env) {
@@ -3836,6 +4028,14 @@ function syncProtocolWidgetValues(sectionId, _protocol) {
     "tewfai_uuid",
     "tewfai_password",
     "tewfai_inbound_transport",
+    "wdtt_mode",
+    "wdtt_obfs",
+    "wdtt_raw_port",
+    "wdtt_network",
+    "wdtt_ipv4_pool",
+    "wdtt_raw_ipv4_pool",
+    "wdtt_client_dns",
+    "wdtt_mtu",
     "masque_ipv4_pool",
     "masque_ipv6_pool",
     "masque_mtu",
@@ -3869,6 +4069,15 @@ function syncProtocolWidgetValues(sectionId, _protocol) {
     "tailscale_control_url",
     "tailscale_hostname",
     "tailscale_advertise_exit_node",
+    "tailscale_advertise_routes",
+    "tailscale_accept_routes",
+    "tailscale_ephemeral",
+    "tailscale_accept_dns",
+    "tailscale_accept_default_resolvers",
+    "tailscale_exit_node",
+    "tailscale_exit_node_allow_lan_access",
+    "tailscale_relay_server_port",
+    "tailscale_relay_server_static_endpoints",
     "mtproto_secret",
     "mtproto_faketls",
     "mtproto_padding",
@@ -4167,7 +4376,12 @@ function autoConfigureServer(sectionId) {
   clearServerValidationMessage();
 
   setWidgetValue(sectionId, "enabled", "1");
-  setWidgetValue(sectionId, "routing_mode", "rules");
+  const existingRoutingMode = getCurrentOptionValue(
+    sectionId,
+    "routing_mode",
+    "rules",
+  );
+  setWidgetValue(sectionId, "routing_mode", existingRoutingMode || "rules");
   setWidgetValue(sectionId, "open_firewall_port", "1");
   setWidgetValue(sectionId, "listen", "0.0.0.0");
 
@@ -4209,7 +4423,7 @@ function autoConfigureServer(sectionId) {
     } else if (protocol === "http" || protocol === "mixed") {
       chosenPort = "8080";
     } else if (protocol === "mieru") {
-      chosenPort = recPorts.mieru ? `${recPorts.mieru}` : "2012";
+      chosenPort = recPorts.mieru ? `${recPorts.mieru}` : "2012-2022";
     } else if (protocol === "trusttunnel") {
       chosenPort = recPorts.trusttunnel ? `${recPorts.trusttunnel}` : "9443";
     } else if (protocol === "tewfai") {
@@ -4218,6 +4432,8 @@ function autoConfigureServer(sectionId) {
       chosenPort = recPorts.masque ? `${recPorts.masque}` : "11443";
     } else if (protocol === "openconnect") {
       chosenPort = recPorts.openconnect ? `${recPorts.openconnect}` : "12443";
+    } else if (protocol === "wdtt") {
+      chosenPort = recPorts.wdtt ? `${recPorts.wdtt}` : "46000";
     }
 
     const serverSections = uci.sections(UCI_PACKAGE, "server") || [];
@@ -4225,13 +4441,51 @@ function autoConfigureServer(sectionId) {
     for (const s of serverSections) {
       if (s[".name"] === sectionId) continue;
       const p = uci.get(UCI_PACKAGE, s[".name"], "listen_port");
-      if (p) usedPorts.add(parseInt(p, 10));
+      if (!p) continue;
+      const tokens = `${p}`.split(/[\s,]+/).filter(Boolean);
+      for (const tok of tokens) {
+        const rm = tok.match(/^([0-9]+)[-:]([0-9]+)$/);
+        if (rm) {
+          const lo = parseInt(rm[1], 10);
+          const hi = Math.min(parseInt(rm[2], 10), lo + 200);
+          for (let k = lo; k <= hi; k += 1) usedPorts.add(k);
+        } else {
+          const single = parseInt(tok, 10);
+          if (single) usedPorts.add(single);
+        }
+      }
     }
-    let pNum = parseInt(chosenPort, 10) || 443;
-    while (usedPorts.has(pNum) && pNum < 65535) {
-      pNum = pNum === 443 ? 8443 : pNum + 1;
+    if (protocol === "mieru") {
+      let basePort = 2012;
+      const rangeMatch = `${chosenPort}`.match(/^([0-9]+)[-:]([0-9]+)$/);
+      if (rangeMatch) {
+        basePort = parseInt(rangeMatch[1], 10) || 2012;
+      } else if (/^[0-9]+$/.test(`${chosenPort}`)) {
+        const parsedBase = parseInt(chosenPort, 10);
+        if (parsedBase && parsedBase !== 8443 && parsedBase !== 443) {
+          basePort = parsedBase;
+        }
+      }
+      const rangeIntersects = (lo, hi) => {
+        for (let p = lo; p <= hi; p += 1) {
+          if (usedPorts.has(p)) return true;
+        }
+        return false;
+      };
+      while (
+        rangeIntersects(basePort, basePort + 10) &&
+        basePort + 10 < 65535
+      ) {
+        basePort += 20;
+      }
+      chosenPort = `${basePort}-${basePort + 10}`;
+    } else {
+      let pNum = parseInt(chosenPort, 10) || 443;
+      while (usedPorts.has(pNum) && pNum < 65535) {
+        pNum = pNum === 443 ? 8443 : pNum + 1;
+      }
+      chosenPort = `${pNum}`;
     }
-    chosenPort = `${pNum}`;
 
     if (protocol !== "tailscale" && protocol !== "json_inbound") {
       setWidgetValue(sectionId, "listen_port", chosenPort);
@@ -4372,8 +4626,20 @@ function autoConfigureServer(sectionId) {
       setWidgetValue(sectionId, "awg_jmax", "70");
       setWidgetValue(sectionId, "awg_s1", `${randomIntInRange(15, 45)}`);
       setWidgetValue(sectionId, "awg_s2", `${randomIntInRange(15, 45)}`);
-      setWidgetValue(sectionId, "awg_s3", "0");
-      setWidgetValue(sectionId, "awg_s4", "0");
+      setWidgetValue(
+        sectionId,
+        "awg_s3",
+        awgVer === "3.0" || awgVer === "3.1"
+          ? `${randomIntInRange(15, 45)}`
+          : "0",
+      );
+      setWidgetValue(
+        sectionId,
+        "awg_s4",
+        awgVer === "3.0" || awgVer === "3.1"
+          ? `${randomIntInRange(15, 45)}`
+          : "0",
+      );
       setWidgetValue(sectionId, "awg_h1", h1);
       setWidgetValue(sectionId, "awg_h2", h2);
       setWidgetValue(sectionId, "awg_h3", h3);
@@ -4566,6 +4832,7 @@ function autoConfigureServer(sectionId) {
         tewfaiTr === "quic" ? "quic" : "tcp",
       );
       setWidgetValue(sectionId, "tewfai_inner_cipher", innerCipher);
+      setWidgetValue(sectionId, "tewfai_morph_profile", "auto");
       setWidgetValue(sectionId, "tewfai_pqc_enabled", "1");
       setWidgetValue(sectionId, "tewfai_handover_enabled", "1");
       setWidgetValue(sectionId, "tewfai_fec_enabled", "0");
@@ -4700,6 +4967,19 @@ function autoConfigureServer(sectionId) {
       setWidgetValue(sectionId, "mtproto_tolerate_time_skewness", "3s");
       setWidgetValue(sectionId, "mtproto_idle_timeout", "5m");
       setWidgetValue(sectionId, "mtproto_handshake_timeout", "10s");
+    } else if (protocol === "wdtt") {
+      setWidgetValue(sectionId, "security", "none");
+      syncSecurityChoices(sectionId);
+      setWidgetValue(
+        sectionId,
+        "server_username",
+        getServerName(sectionId) || "user1",
+      );
+      setWidgetValue(sectionId, "server_password", generatePassword());
+      setWidgetValue(sectionId, "wdtt_mode", "csqtt");
+      setWidgetValue(sectionId, "wdtt_obfs", "audio");
+      setWidgetValue(sectionId, "wdtt_network", "10.66.0.1/16");
+      setWidgetValue(sectionId, "wdtt_mtu", "1350");
     } else if (protocol === "tailscale") {
       setWidgetValue(
         sectionId,
@@ -4712,8 +4992,11 @@ function autoConfigureServer(sectionId) {
         defaultTailscaleHostname(sectionId),
       );
       setWidgetValue(sectionId, "tailscale_advertise_exit_node", "1");
+      setWidgetValue(sectionId, "tailscale_accept_dns", "1");
+      setWidgetValue(sectionId, "tailscale_accept_default_resolvers", "1");
+      setWidgetValue(sectionId, "tailscale_ephemeral", "0");
+      setWidgetValue(sectionId, "tailscale_exit_node_allow_lan_access", "0");
       setWidgetValue(sectionId, "tailscale_auto_firewall", "1");
-      setWidgetValue(sectionId, "tailscale_mode", "singbox");
     } else if (protocol === "json_inbound") {
       const sampleInbound = {
         type: "vless",
@@ -4820,13 +5103,8 @@ function addStreamDepends(option) {
   STREAM_PROTOCOLS.forEach((protocol) => option.depends("protocol", protocol));
 }
 
-function addPortProtocolDepends(option, singBoxExtended) {
+function addPortProtocolDepends(option) {
   PORT_PROTOCOLS.forEach((protocol) => option.depends("protocol", protocol));
-  if (singBoxExtended) {
-    EXTENDED_PORT_PROTOCOLS.forEach((protocol) =>
-      option.depends("protocol", protocol),
-    );
-  }
 }
 
 function addTlsDepends(option) {
@@ -5030,7 +5308,20 @@ function configureServerSection(sectionRef, options = {}) {
 
     let saveTasks;
     try {
-      saveTasks = targetMap.save(beforeUciSave, true);
+      if (typeof targetMap.checkDepends === "function") {
+        targetMap.checkDepends();
+      }
+      if (
+        typeof targetMap.parse === "function" &&
+        targetMap.data &&
+        typeof targetMap.data.save === "function"
+      ) {
+        saveTasks = Promise.resolve(targetMap.parse())
+          .then(beforeUciSave)
+          .then(() => targetMap.data.save());
+      } else {
+        saveTasks = targetMap.save(beforeUciSave, true);
+      }
     } catch (e) {
       if (origCallDelete) {
         uci.callDelete = origCallDelete;
@@ -5041,9 +5332,15 @@ function configureServerSection(sectionRef, options = {}) {
     let curr = targetMap;
     while (curr.parent) {
       curr = curr.parent;
+      const parentMap = curr;
       saveTasks = saveTasks
-        .then(curr.load.bind(curr))
-        .then(curr.reset.bind(curr));
+        .then(() =>
+          typeof parentMap.load === "function" ? parentMap.load() : null,
+        )
+        .then(() =>
+          typeof parentMap.reset === "function" ? parentMap.reset() : null,
+        )
+        .catch(() => null);
     }
 
     return saveTasks
@@ -5071,8 +5368,6 @@ function configureServerSection(sectionRef, options = {}) {
 function createServerContent(section, options = {}) {
   injectServerStyles();
   const capabilities = normalizeServerCapabilities(options);
-  const singBoxXhttp = capabilities.singBoxXhttp;
-  const singBoxTailscale = capabilities.singBoxTailscale;
   section.serverCapabilityOptions = {};
   section.serverCapabilities = capabilities;
 
@@ -5160,36 +5455,7 @@ function createServerContent(section, options = {}) {
   o.rmempty = false;
   o.modalonly = true;
   o.validate = function (sectionId, value) {
-    const normalized = normalizeServerCapabilities(
-      section.serverCapabilities || capabilities,
-    );
-    if (normalized.singBoxTachyonCore && value === "mtproto") {
-      return _("MTProto is not implemented in tachyon-core yet");
-    }
     return validateRequired.call(this, sectionId, value);
-  };
-  const originalProtocolRenderWidget = o.renderWidget;
-  o.renderWidget = function (sectionId, optionIndex, cfgvalue) {
-    const node = originalProtocolRenderWidget.apply(this, arguments);
-    const normalized = normalizeServerCapabilities(
-      section.serverCapabilities || capabilities,
-    );
-    if (normalized.singBoxTachyonCore) {
-      Promise.resolve(node).then((elem) => {
-        if (!elem) return;
-        const disabledItems = elem.querySelectorAll
-          ? elem.querySelectorAll(
-              '[data-value="mtproto"], option[value="mtproto"]',
-            )
-          : [];
-        disabledItems.forEach((opt) => {
-          opt.disabled = true;
-          opt.setAttribute("disabled", "disabled");
-          opt.classList.add("disabled");
-        });
-      });
-    }
-    return node;
   };
   o.onchange = function (_ev, sectionId, value) {
     ensureProtocolDefaults(sectionId, value, true);
@@ -5327,7 +5593,7 @@ function createServerContent(section, options = {}) {
     form.TextValue,
     "inbound_json",
     _("Inbound JSON"),
-    _("Enter a complete sing-box inbound object"),
+    _("Enter a complete Tachyon Core inbound object"),
   );
   o.depends("protocol", "json_inbound");
   o.rows = 10;
@@ -5519,7 +5785,7 @@ function createServerContent(section, options = {}) {
 
   o = section.option(form.ListValue, "transport", _("Transport"));
   section.serverCapabilityOptions.transport = o;
-  populateTransportValues(o, singBoxXhttp);
+  populateTransportValues(o);
   o.default = "tcp";
   o.rmempty = false;
   o.modalonly = true;
@@ -5763,6 +6029,21 @@ function createServerContent(section, options = {}) {
   o.depends("protocol", "tewfai");
 
   o = section.option(
+    form.ListValue,
+    "tewfai_morph_profile",
+    _("Morph Profile"),
+  );
+  o.value("auto", _("Auto / Adaptive Transformer"));
+  o.value("browsing", _("Browsing"));
+  o.value("video", _("Video"));
+  o.value("webrtc", "WebRTC");
+  o.value("bulk", _("Bulk"));
+  o.default = "auto";
+  o.rmempty = true;
+  o.modalonly = true;
+  o.depends("protocol", "tewfai");
+
+  o = section.option(
     form.Flag,
     "tewfai_pqc_enabled",
     _("Post-Quantum (PQC ML-KEM)"),
@@ -5774,7 +6055,7 @@ function createServerContent(section, options = {}) {
   o = section.option(
     form.Flag,
     "tewfai_handover_enabled",
-    _("Seamless Handover"),
+    _("Connection Handover"),
   );
   o.default = "1";
   o.modalonly = true;
@@ -5812,6 +6093,63 @@ function createServerContent(section, options = {}) {
   o.placeholder = "1400";
   o.validate = validateOptionalPort;
   o.depends("protocol", "tewfai");
+
+  o = section.option(form.ListValue, "wdtt_mode", _("CSQTT / WDTT Mode"));
+  o.value("csqtt", "csqtt (v2/v3)");
+  o.value("csqtt_v1", "csqtt_v1");
+  o.value("wg", "wg");
+  o.value("raw", "raw");
+  o.value("all", "all");
+  o.default = "csqtt";
+  o.modalonly = true;
+  o.depends("protocol", "wdtt");
+
+  o = section.option(form.ListValue, "wdtt_obfs", _("Framing Profile (obfs)"));
+  o.value("audio", "audio");
+  o.value("video", "video");
+  o.value("unified", "unified");
+  o.default = "audio";
+  o.modalonly = true;
+  o.depends("protocol", "wdtt");
+
+  o = section.option(form.Value, "wdtt_raw_port", _("Raw UDP Port (optional)"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.validate = validateOptionalPort;
+  o.depends("protocol", "wdtt");
+
+  o = section.option(form.Value, "wdtt_network", _("Tunnel Network (CIDR)"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "10.66.0.1/16";
+  o.depends("protocol", "wdtt");
+
+  o = section.option(form.Value, "wdtt_ipv4_pool", _("IPv4 Pool (optional)"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("protocol", "wdtt");
+
+  o = section.option(
+    form.Value,
+    "wdtt_raw_ipv4_pool",
+    _("Raw IPv4 Pool (optional)"),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.depends("protocol", "wdtt");
+
+  o = section.option(form.Value, "wdtt_client_dns", _("Client DNS (optional)"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "1.1.1.1";
+  o.depends("protocol", "wdtt");
+
+  o = section.option(form.Value, "wdtt_mtu", _("MTU"));
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "1350";
+  o.validate = validateOptionalPort;
+  o.depends("protocol", "wdtt");
 
   o = section.option(form.Value, "masque_ipv4_pool", _("IPv4 pool (CIDR)"));
   o.modalonly = true;
@@ -6168,17 +6506,17 @@ function createServerContent(section, options = {}) {
   o = section.option(
     form.Value,
     "tailscale_auth_key",
-    _("Tailscale auth key"),
+    _("Tailscale auth key (optional)"),
     _(
-      "Reusable or ephemeral pre-authentication key to join your Tailnet (e.g. tskey-auth-...).",
+      "Optional reusable or ephemeral pre-authentication key to join your Tailnet (e.g. tskey-auth-...). If omitted, an interactive login URL is printed in the service logs.",
     ) +
       ' <a href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">' +
       _("Generate in Tailscale Admin Console") +
       "</a>",
   );
   o.modalonly = true;
-  o.rmempty = false;
-  o.validate = validateRequired;
+  o.rmempty = true;
+  o.placeholder = "tskey-auth-...";
   addTailscaleDepends(o);
 
   o = section.option(
@@ -6233,15 +6571,98 @@ function createServerContent(section, options = {}) {
   o.rmempty = true;
   addTailscaleDepends(o);
 
-  o = section.option(form.ListValue, "tailscale_mode", _("Tailscale mode"));
-  o.value("singbox", _("sing-box endpoint (userspace, default)"));
-  o.value(
-    "native",
-    _("Native tailscaled (tailnet reachable from LAN without client)"),
+  o = section.option(
+    form.Flag,
+    "tailscale_ephemeral",
+    _("Ephemeral node"),
+    _(
+      "Register as an ephemeral node that is automatically removed from the tailnet when the service stops.",
+    ),
   );
-  o.default = "singbox";
+  o.default = "0";
+  o.modalonly = true;
+  o.rmempty = true;
+  addTailscaleDepends(o);
+
+  o = section.option(
+    form.Flag,
+    "tailscale_accept_dns",
+    _("Accept Tailscale DNS (MagicDNS)"),
+    _("Use DNS configuration advertised by the tailnet (MagicDNS)."),
+  );
+  o.default = "1";
   o.modalonly = true;
   o.rmempty = false;
+  addTailscaleDepends(o);
+
+  o = section.option(
+    form.Flag,
+    "tailscale_accept_default_resolvers",
+    _("Accept default DNS resolvers"),
+    _(
+      "Accept fallback DNS resolvers distributed by the tailnet when Tailscale DNS is enabled.",
+    ),
+  );
+  o.default = "1";
+  o.modalonly = true;
+  o.rmempty = false;
+  o.depends({
+    protocol: "tailscale",
+    tailscale_accept_dns: "1",
+  });
+
+  o = section.option(
+    form.Value,
+    "tailscale_exit_node",
+    _("Exit node"),
+    _(
+      "Optional tailnet peer hostname or Tailscale IP to route outbound endpoint traffic through.",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "100.64.0.10";
+  o.validate = validateOptionalHost;
+  addTailscaleDepends(o);
+
+  o = section.option(
+    form.Flag,
+    "tailscale_exit_node_allow_lan_access",
+    _("Allow LAN access when using exit node"),
+    _(
+      "Allow direct access to local LAN subnets while forwarding outbound traffic through an exit node.",
+    ),
+  );
+  o.default = "0";
+  o.modalonly = true;
+  o.rmempty = true;
+  addTailscaleDepends(o);
+
+  o = section.option(
+    form.Value,
+    "tailscale_relay_server_port",
+    _("Relay server UDP port"),
+    _(
+      "Optional UDP port to expose this endpoint as a Tailscale peer relay server. Not yet supported by tachyon-core (leave empty).",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "40000";
+  o.validate = validateOptionalPort;
+  addTailscaleDepends(o);
+
+  o = section.option(
+    form.DynamicList,
+    "tailscale_relay_server_static_endpoints",
+    _("Relay server static endpoints"),
+    _(
+      "Optional static host:port or IP:port endpoints advertised for the peer relay server. Not yet supported by tachyon-core (leave empty).",
+    ),
+  );
+  o.modalonly = true;
+  o.rmempty = true;
+  o.placeholder = "203.0.113.10:40000";
   addTailscaleDepends(o);
 
   o = section.option(
@@ -6249,39 +6670,13 @@ function createServerContent(section, options = {}) {
     "tailscale_auto_firewall",
     _("Auto-configure Tailscale firewall zone"),
     _(
-      "Automatically create and maintain the 'tailscale' zone in /etc/config/firewall (device tailscale0, masquerading, MSS clamping, and lan/wan forwardings).",
+      "Automatically create and maintain the 'tailscale' zone in /etc/config/firewall (device tailscale0, masquerading, MSS clamping, and lan/wan forwardings). Only needed with a system tailscale0 interface; built-in tachyon-core runs in userspace.",
     ),
   );
   o.default = "1";
   o.modalonly = true;
   o.rmempty = false;
   addTailscaleDepends(o);
-
-  o = section.option(
-    form.Flag,
-    "tailscale_masquerade",
-    _("Masquerade LAN traffic into tailnet"),
-    _(
-      "SNAT LAN sources when leaving through tailscale0 so peers can answer. Required unless every peer accepts routes.",
-    ),
-  );
-  o.default = "1";
-  o.modalonly = true;
-  o.rmempty = false;
-  o.depends({ protocol: "tailscale", tailscale_mode: "native" });
-
-  o = section.option(
-    form.Flag,
-    "tailscale_use_exit_node",
-    _("Use tailnet exit node for LAN"),
-    _(
-      "Route all non-local LAN traffic through the tailnet exit node instead of the proxy engines.",
-    ),
-  );
-  o.default = "0";
-  o.modalonly = true;
-  o.rmempty = false;
-  o.depends({ protocol: "tailscale", tailscale_mode: "native" });
 
   // AWG Server Options
   o = section.option(
@@ -6390,6 +6785,12 @@ function createServerContent(section, options = {}) {
   o.depends("protocol", "awg");
   o.onchange = function (_ev, sectionId, value) {
     if (value === "3.0" || value === "3.1") {
+      for (const sk of ["awg_s1", "awg_s2", "awg_s3", "awg_s4"]) {
+        const curS = parseInt(getCurrentOptionValue(sectionId, sk, "0"), 10);
+        if (isNaN(curS) || curS < 12) {
+          setWidgetValue(sectionId, sk, `${randomIntInRange(15, 45)}`);
+        }
+      }
       if (!getCurrentOptionValue(sectionId, "awg_header_protection_key", "")) {
         setWidgetValue(
           sectionId,
@@ -6436,6 +6837,14 @@ function createServerContent(section, options = {}) {
       uci.unset(UCI_PACKAGE, section_id, "awg_reject_after_time");
       uci.unset(UCI_PACKAGE, section_id, "awg_keepalive_timeout");
       uci.unset(UCI_PACKAGE, section_id, "awg_max_handshake_attempts");
+    }
+    if (formvalue === "3.0" || formvalue === "3.1") {
+      for (const sk of ["awg_s1", "awg_s2", "awg_s3", "awg_s4"]) {
+        const curS = parseInt(getCurrentOptionValue(section_id, sk, "0"), 10);
+        if (isNaN(curS) || curS < 12) {
+          uci.set(UCI_PACKAGE, section_id, sk, "20");
+        }
+      }
     }
     return uci.set(UCI_PACKAGE, section_id, "awg_version", formvalue);
   };
@@ -6668,6 +7077,7 @@ function subscriptionServerSupported(server) {
     "tewfai",
     "masque",
     "openconnect",
+    "wdtt",
   ].includes(subscriptionServerProtocol(server));
 }
 
@@ -6992,6 +7402,7 @@ function showSubscriptionModal(section) {
 }
 
 function configureServerSubscription(section) {
+  section.showSubscriptionModal = () => showSubscriptionModal(section);
   const description = section.description;
   section.description = E("div", {}, [
     E("div", { style: "margin-bottom:1em" }, [
@@ -6999,7 +7410,7 @@ function configureServerSubscription(section) {
         "button",
         {
           type: "button",
-          class: "cbi-button cbi-button-action",
+          class: "cbi-button cbi-button-action tachyon-server-subscription-btn",
           click: (event) => {
             event.preventDefault();
             showSubscriptionModal(section);

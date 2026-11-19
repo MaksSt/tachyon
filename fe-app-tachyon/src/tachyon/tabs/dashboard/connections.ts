@@ -1,10 +1,19 @@
 import { tr } from '../../helpers/i18n';
+import { store } from '../../services/store.service';
+import { unbracketHost } from '../../../validators/hostPort';
+import { validateIPWithZone } from '../../../validators/validateIp';
 import {
   extractServerInboundSectionId,
   getConfiguredServerInbounds,
   IServerInboundConfig,
 } from './inboundServers';
 import { IConnection } from './partials';
+
+export interface IRouterConnectionContext {
+  routerHostname?: string;
+  lanIps?: string[];
+  wanIps?: string[];
+}
 
 export interface ITopDomain {
   domain: string;
@@ -63,6 +72,48 @@ function resolveInboundClientFallbackName(
   return undefined;
 }
 
+function normalizeLookupIp(ip: string): string {
+  return unbracketHost(ip.trim()).split('%')[0];
+}
+
+function getDynamicRouterIdentity(routerContext?: IRouterConnectionContext): {
+  routerHostname: string;
+  lanIps: Set<string>;
+  wanIps: Set<string>;
+} {
+  const sysInfo = store.get()?.diagnosticsSystemInfo;
+  const globalObj = (typeof globalThis !== 'undefined' ? globalThis : {}) as {
+    L?: { env?: { hostname?: string } };
+  };
+  const routerHostname =
+    routerContext?.routerHostname?.trim() ||
+    sysInfo?.router_hostname?.trim() ||
+    globalObj.L?.env?.hostname?.trim() ||
+    tr('Роутер', 'Router');
+
+  const lanIps = new Set<string>();
+  const wanIps = new Set<string>();
+  for (const candidate of [
+    sysInfo?.lan_ip,
+    sysInfo?.lan_ipv6,
+    ...(routerContext?.lanIps || []),
+  ]) {
+    if (candidate && candidate.trim()) {
+      lanIps.add(normalizeLookupIp(candidate));
+    }
+  }
+  for (const candidate of [
+    sysInfo?.wan_ip,
+    sysInfo?.wan_ipv6,
+    ...(routerContext?.wanIps || []),
+  ]) {
+    if (candidate && candidate.trim()) {
+      wanIps.add(normalizeLookupIp(candidate));
+    }
+  }
+  return { routerHostname, lanIps, wanIps };
+}
+
 export function aggregateClientConnections(
   rawConnections: Array<{
     metadata?: { sourceIP?: string; inbound?: string; type?: string };
@@ -71,6 +122,7 @@ export function aggregateClientConnections(
     download?: number | string;
   }>,
   hostnames: Map<string, string>,
+  routerContext?: IRouterConnectionContext,
 ): IConnection[] {
   const map = new Map<string, IConnection>();
   const servers = getConfiguredServerInbounds();
@@ -78,10 +130,13 @@ export function aggregateClientConnections(
   for (const srv of servers) {
     serverById.set(srv.sectionId, srv);
   }
+  const routerIdentity = getDynamicRouterIdentity(routerContext);
 
   for (const conn of rawConnections) {
-    const ip = conn.metadata?.sourceIP;
-    if (!ip) continue;
+    const rawIp = conn.metadata?.sourceIP;
+    if (!rawIp) continue;
+    const ip = unbracketHost(rawIp.trim());
+    const lookupIp = normalizeLookupIp(ip);
 
     const up = Number(conn.upload) || 0;
     const down = Number(conn.download) || 0;
@@ -100,12 +155,14 @@ export function aggregateClientConnections(
         );
       }
     } else {
-      let name = hostnames.get(ip);
+      let name = hostnames.get(ip) ?? hostnames.get(lookupIp);
       if (!name) {
-        if (ip === '127.0.0.1') {
-          name = 'Flint-2';
-        } else if (ip === '95.165.105.233') {
+        if (lookupIp === '127.0.0.1' || lookupIp === '::1') {
+          name = routerIdentity.routerHostname;
+        } else if (routerIdentity.wanIps.has(lookupIp)) {
           name = tr('Роутер (WAN)', 'Router (WAN)');
+        } else if (routerIdentity.lanIps.has(lookupIp)) {
+          name = routerIdentity.routerHostname;
         } else {
           name = resolveInboundClientFallbackName(
             conn,
@@ -132,20 +189,27 @@ export function aggregateTopDomains(
   }>,
   limit = 6,
 ): ITopDomain[] {
-  const map = new Map<string, { count: number; traffic: number }>();
+  const map = new Map<string, { count: number; traffic: number } | null>();
 
   for (const conn of rawConnections) {
     const rawHost = conn.metadata?.host?.trim();
     if (!rawHost) continue;
-    // Skip raw IP addresses
-    if (/^[0-9.]+$/.test(rawHost) || /^[0-9a-fA-F:]+$/.test(rawHost)) continue;
+    const existing = map.get(rawHost);
+    // Cache IP addresses as well as domain totals for this snapshot.
+    if (existing === null) continue;
+    if (
+      existing === undefined &&
+      validateIPWithZone(unbracketHost(rawHost)).valid
+    ) {
+      map.set(rawHost, null);
+      continue;
+    }
 
     const up = Number(conn.upload) || 0;
     const down = Number(conn.download) || 0;
     const traffic = up + down;
 
-    if (map.has(rawHost)) {
-      const existing = map.get(rawHost)!;
+    if (existing) {
       existing.count++;
       existing.traffic += traffic;
     } else {
@@ -153,12 +217,12 @@ export function aggregateTopDomains(
     }
   }
 
-  return Array.from(map.entries())
-    .map(([domain, data]) => ({
-      domain,
-      count: data.count,
-      traffic: data.traffic,
-    }))
+  const domains: ITopDomain[] = [];
+  for (const [domain, data] of map) {
+    if (data)
+      domains.push({ domain, count: data.count, traffic: data.traffic });
+  }
+  return domains
     .sort((a, b) => b.count - a.count || b.traffic - a.traffic)
     .slice(0, limit);
 }

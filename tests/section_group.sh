@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Section group (action 'group'): one flat URLTest over the union of member
-# leaves, member route rules repointed at that URLTest, members validated, and
-# the whole action parked on steer.
+# leaves, member route rules repointed at that URLTest, members validated.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 set -eo pipefail
 
@@ -378,7 +377,60 @@ if (!awg_rule || awg_rule.outbound != "grp-out")
         (awg_rule ? awg_rule.outbound : "null") + "\n");
 ' "$group_awg_config" || fail "generated section group with manual awg member"
 
-# ─── parking: sing-box supports sections.group, steer does not ────────────────
+# ─── generator: section group with outbound_group_refs narrows member pool (#395) ──
+
+cat >"$WORK_DIR/group-pool-refs-fixture.json" <<JSON
+{
+  "settings": { ".name": "settings", ".type": "settings", "log_level": "warn" },
+  "outbound_group": [
+    { ".name": "grp_alpha_only", ".type": "outbound_group", "enabled": "1",
+      "name": "Alpha Only", "filter_mode": "include",
+      "include_regex": [ "^Alpha" ] }
+  ],
+  "section": [
+    { ".name": "alpha", ".type": "section", "enabled": "1", "action": "connection",
+      "domain_suffix": [ "alpha.example" ],
+      "selector_proxy_links": [ "$LINK_A1", "$LINK_A2" ] },
+    { ".name": "beta", ".type": "section", "enabled": "1", "action": "connection",
+      "domain_suffix": [ "beta.example" ],
+      "selector_proxy_links": [ "$LINK_B1" ] },
+    { ".name": "grp", ".type": "section", "enabled": "1", "action": "group",
+      "group_members": [ "alpha", "beta" ],
+      "outbound_group_refs": [ "grp_alpha_only" ] }
+  ]
+}
+JSON
+
+group_pool_refs_config="$WORK_DIR/group-pool-refs-config.json"
+mkdir -p "${group_pool_refs_config}.section-cache"
+ucode -L "$TACHYON_LIB" "$GENERATOR_UC" generate-config-fixture \
+  "$WORK_DIR/group-pool-refs-fixture.json" "$group_pool_refs_config" "127.0.0.1"
+
+ucode -e '
+let fs = require("fs");
+function outbound_by_tag(config, want) {
+    for (let outbound in config.outbounds || [])
+        if (outbound && outbound.tag == want)
+            return outbound;
+    return null;
+}
+function contains(values, needle) {
+    for (let value in values || [])
+        if (value == needle)
+            return true;
+    return false;
+}
+let config = json(fs.readfile(ARGV[0]));
+let group = outbound_by_tag(config, "grp-urltest-out");
+if (!group || group.type != "urltest")
+    die("group with outbound_group_refs must produce grp-urltest-out\n");
+if (!contains(group.outbounds || [], "alpha-1-out") || !contains(group.outbounds || [], "alpha-2-out"))
+    die("group urltest must retain Alpha servers matched by outbound_group_refs\n");
+if (contains(group.outbounds || [], "beta-1-out"))
+    die("group urltest must exclude beta-1-out when outbound_group_refs restricts to Alpha (#395)\n");
+' "$group_pool_refs_config" || fail "generated section group with outbound_group_refs (#395)"
+
+# ─── capability: tachyon-core supports sections.group ─────────────────────────
 
 parking="$(ucode -L "$TACHYON_LIB" -e '
 let st = require("components.engine_state");
@@ -390,20 +442,13 @@ function has(values, needle) {
     return false;
 }
 printf("feat=%s\n", st.section_feature({ ".type": "section", "action": "group" }));
-printf("singbox=%d\n", has(e.capabilities("tachyon-core"), "sections.group"));
-printf("steer=%d\n", has(e.capabilities("steer"), "sections.group"));
-let g = require("steer.generator");
-printf("steer_supported=%d\n", g.section_supported({ ".name": "grp", "action": "group" }));
+printf("core=%d\n", has(e.capabilities("tachyon-core"), "sections.group"));
 ' 2>&1)" || fail "could not read group parking metadata: $parking"
 
 grep -q '^feat=sections.group$' <<<"$parking" ||
   fail "a group section must map to the sections.group feature: $parking"
-grep -q '^singbox=1$' <<<"$parking" ||
-  fail "sing-box capabilities must include sections.group: $parking"
-grep -q '^steer=0$' <<<"$parking" ||
-  fail "steer capabilities must not include sections.group: $parking"
-grep -q '^steer_supported=0$' <<<"$parking" ||
-  fail "the steer generator must skip group sections: $parking"
+grep -q '^core=1$' <<<"$parking" ||
+  fail "tachyon-core capabilities must include sections.group: $parking"
 
 # ─── UI: action is choosable and members are pickable ─────────────────────────
 

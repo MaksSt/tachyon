@@ -17,7 +17,6 @@ let object_or_empty = common.object_or_empty;
 let array_or_empty = common.array_or_empty;
 let option = common.option;
 let list_option = common.list_option;
-let normalize_status = common.normalize_status;
 
 const CONFIG_NAME = getenv("TACHYON_CONFIG_NAME") || "tachyon";
 const LIB_DIR = getenv("TACHYON_LIB") || "/usr/lib/tachyon";
@@ -686,7 +685,7 @@ function apply_recommendation(rec, async_restart) {
     // Restart tachyon service to apply immediately.
     // When invoked via RPC/UI (async_restart), spawn the restart in the background
     // with inherited file descriptors closed so rpcd does not hang waiting for
-    // child daemons or time out while rulesets/sing-box reload.
+    // child daemons or time out while rulesets/tachyon-core reload.
     if (fs.stat(SERVICE_INIT) != null) {
         if (async_restart)
             exec.run_background({ argv: [ SERVICE_INIT, "restart" ] });

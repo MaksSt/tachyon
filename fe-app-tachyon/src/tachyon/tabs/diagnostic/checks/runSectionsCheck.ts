@@ -3,6 +3,7 @@ import { TachyonShellMethods } from '../../../methods';
 import { updateCheckStore } from './updateCheckStore';
 import { getMeta } from '../helpers/getMeta';
 import { getDashboardSections } from '../../../methods/custom/getDashboardSections';
+import { tr } from '../../../helpers/i18n';
 import { IDiagnosticsChecksItem } from '../../../services';
 
 type SectionCheckState = IDiagnosticsChecksItem['state'];
@@ -27,9 +28,9 @@ function getSubscriptionLatencyState(
 /**
  * The reason a latency test failed, when the answer carries one.
  *
- * Our own core answers with the reason beside the message. A core that does
- * not - sing-box answers with the message alone - has no reason to show,
- * and its generic message is not one: it names no cause.
+ * Our own core answers with the reason beside the message. If an answer
+ * omits a reason, there is nothing to show, and its generic message is not
+ * one: it names no cause.
  */
 function readLatencyReason(data: unknown): string {
   if (!data || typeof data !== 'object') return '';
@@ -157,8 +158,7 @@ export async function runSectionsCheck() {
 
           // The core answers a failed latency test with the reason beside the
           // message. "Not responding" on its own leaves the user with nothing
-          // to act on. A core without a reason - sing-box answers with the
-          // message alone - simply shows the message.
+          // to act on; a core without a reason simply shows the message.
           const reason = readLatencyReason(latencyGroup.data);
           return {
             state: 'error',
@@ -174,11 +174,42 @@ export async function runSectionsCheck() {
         };
       }
 
-      // Service sections (zapret/zapret2/byedpi) don't have Clash API proxies.
+      const actionLower = (section.action || '').toLowerCase();
+      if (actionLower === 'block' || actionLower === 'reject') {
+        return {
+          state: 'success',
+          latency: tr('Активно (Блокировка)', 'Active (Block)'),
+        };
+      }
+      if (actionLower === 'bypass' || actionLower === 'direct') {
+        return {
+          state: 'success',
+          latency: tr('Активно (Напрямую)', 'Active (Direct)'),
+        };
+      }
+      if (actionLower === 'dns') {
+        return {
+          state: 'success',
+          latency: tr('Активно (DNS)', 'Active (DNS)'),
+        };
+      }
+      if (actionLower === 'desync') {
+        const selectedOut = section.outbounds?.[0];
+        if (selectedOut && selectedOut.runtimeAvailable === false) {
+          return {
+            state: 'error',
+            latency: tr('Не настроено', 'Not configured'),
+          };
+        }
+        return {
+          state: 'success',
+          latency: tr('Активно (DPI)', 'Active (DPI)'),
+        };
+      }
+
+      // Service sections (e.g. fptn) don't have Clash API proxies.
       // Use the serviceStatus that was already fetched in getDashboardSections.
-      const isService =
-        ['zapret', 'zapret2', 'byedpi'].includes(section.action || '') ||
-        Boolean(section.serviceStatus);
+      const isService = Boolean(section.serviceStatus);
 
       if (isService) {
         if (section.serviceStatus) {
